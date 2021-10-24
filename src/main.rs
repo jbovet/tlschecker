@@ -26,7 +26,7 @@ fn main() {
 
     let hosts = matches.values_of("host").unwrap();
     for host in hosts {
-        match TLSValidation::from_server_name(&host) {
+        match TLSValidation::from_server_name(host) {
             Ok(tls_validation) => {
                 if tls_validation.is_expired() {
                     println!(

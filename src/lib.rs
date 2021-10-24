@@ -11,6 +11,11 @@ pub struct TLSValidation {
     validity_days: i32,
     expired_days: i32,
 }
+impl Default for TLSValidation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl TLSValidation {
     pub fn new() -> TLSValidation {
@@ -39,7 +44,7 @@ impl TLSValidation {
         let context_builder = context.build();
 
         let mut connector = Ssl::new(&context_builder).unwrap();
-        connector.set_hostname(&server_name).unwrap();
+        connector.set_hostname(server_name).unwrap();
         let remote = format!("{}:443", server_name);
         match remote.to_socket_addrs() {
             Ok(mut address) => {
