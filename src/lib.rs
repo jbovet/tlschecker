@@ -1,11 +1,13 @@
 use openssl::asn1::{Asn1Time, Asn1TimeRef};
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
+use serde::{Deserialize, Serialize};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::ops::Deref;
 use std::time::Duration;
 
 static TIMEOUT: u64 = 30;
 
+#[derive(Serialize, Deserialize)]
 pub struct TLSValidation {
     is_expired: bool,
     validity_days: i32,
