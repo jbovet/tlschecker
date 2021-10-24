@@ -1,8 +1,8 @@
+use openssl::asn1::{Asn1Time, Asn1TimeRef};
+use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::ops::Deref;
 use std::time::Duration;
-use openssl::asn1::{Asn1Time, Asn1TimeRef};
-use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
 
 static TIMEOUT: u64 = 30;
 
@@ -22,7 +22,7 @@ impl TLSValidation {
     }
 
     pub fn is_expired(&self) -> bool {
-       self.is_expired
+        self.is_expired
     }
 
     pub fn validity_days(&self) -> i32 {
@@ -44,10 +44,15 @@ impl TLSValidation {
         match remote.to_socket_addrs() {
             Ok(mut address) => {
                 let socket_addr = address.next().unwrap();
-                let tcp_stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(TIMEOUT)).unwrap();
-                tcp_stream.set_read_timeout(Some(Duration::from_secs(TIMEOUT))).unwrap();
+                let tcp_stream =
+                    TcpStream::connect_timeout(&socket_addr, Duration::from_secs(TIMEOUT)).unwrap();
+                tcp_stream
+                    .set_read_timeout(Some(Duration::from_secs(TIMEOUT)))
+                    .unwrap();
 
-                let stream = connector.connect(tcp_stream).expect("TLS handshake failed.");
+                let stream = connector
+                    .connect(tcp_stream)
+                    .expect("TLS handshake failed.");
                 let cert = stream
                     .ssl()
                     .peer_certificate()
@@ -67,9 +72,7 @@ impl TLSValidation {
                 tls_validation.validity_days = expiration_days;
                 Ok(tls_validation)
             }
-            Err(_) => {
-                Err(TLSValidationError::new("couldn't resolve host address {}"))
-            }
+            Err(_) => Err(TLSValidationError::new("couldn't resolve host address {}")),
         }
     }
 
@@ -85,6 +88,8 @@ pub struct TLSValidationError {
 
 impl TLSValidationError {
     fn new(msg: &str) -> TLSValidationError {
-        TLSValidationError { details: msg.to_string() }
+        TLSValidationError {
+            details: msg.to_string(),
+        }
     }
 }

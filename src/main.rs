@@ -1,24 +1,53 @@
-use std::env;
+use clap::{App, Arg};
 use std::process::exit;
 use tlschecker::TLSValidation;
 
 fn main() {
-    let exit_code = 0;
-    for server_name in env::args().skip(1) {
-        match TLSValidation::from_server_name(&server_name) {
+    let matches = App::new("TLS Checker")
+        .version("1.0")
+        .author("Jose Bovet Derpich. <jose.bovet@gmail.com>")
+        .about("TLS/SSL certificate expiration date from command-line checker")
+        .arg(
+            Arg::with_name("host")
+                .short("h")
+                .takes_value(true)
+                .multiple(true)
+                .required(true)
+                .help("Set hostname to check"),
+        )
+        .arg(
+            Arg::with_name("json")
+                .long("json")
+                .help("Prints json output"),
+        )
+        .get_matches();
+
+    if matches.is_present("json") {}
+
+    let hosts = matches.values_of("host").unwrap();
+    for host in hosts {
+        match TLSValidation::from_server_name(&host) {
             Ok(tls_validation) => {
                 if tls_validation.is_expired() {
-                    println!("{} SSL certificate expired {} days ago", server_name, tls_validation.expired_days());
+                    println!(
+                        "{} SSL certificate expired {} days ago",
+                        host,
+                        tls_validation.expired_days()
+                    );
                 } else {
-                    println!("{} SSL certificate will expire in {} days", server_name, tls_validation.validity_days());
+                    println!(
+                        "{} SSL certificate will expire in {} days",
+                        host,
+                        tls_validation.validity_days()
+                    );
                 }
             }
             Err(_) => {
-                println!("Couldn't resolve any address from server {} ", server_name)
+                println!("Couldn't resolve any address from server {} ", host)
             }
         }
     }
-    exit(exit_code);
+    exit(0);
 }
 
 #[cfg(test)]

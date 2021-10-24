@@ -12,6 +12,7 @@ repository = "https://github.com/jbovet/tlschecker"
 
 [dependencies]
 openssl = "0.10.36"
+clap = "2.33.3"
 
 [[bin]]
 name = "tlschecker"
