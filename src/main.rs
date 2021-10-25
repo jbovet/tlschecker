@@ -24,32 +24,18 @@ fn main() {
 
     let hosts = matches.values_of("host").unwrap();
     for host in hosts {
-        match TLSValidation::from_server_name(host) {
+        match TLSValidation::new(host).from() {
             Ok(tls_validation) => {
-                // if tls_validation.is_expired() {
-                //     println!(
-                //         "{} SSL certificate expired {} days ago",
-                //         host,
-                //         tls_validation.expired_days()
-                //     );
-                // } else {
-                //     println!(
-                //         "{} SSL certificate will expire in {} days",
-                //         host,
-                //         tls_validation.validity_days()
-                //     );
-                // }
-                // Serialize it to a JSON string.
                 if matches.is_present("json") {
                     let json = serde_json::to_string(&tls_validation).unwrap();
                     println!("{}", json);
                 } else {
                     println!(
                         "{} is_expired:{} validity_days:{} - expired_days:{}",
-                        host,
+                        tls_validation.host(),
                         tls_validation.is_expired(),
                         tls_validation.validity_days(),
-                        tls_validation.expired_days()
+                        tls_validation.expired_days(),
                     );
                 }
             }
