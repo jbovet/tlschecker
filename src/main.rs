@@ -51,7 +51,7 @@ fn main() {
 }
 
 #[cfg(test)]
-mod main {
+mod tests {
     use tlschecker::TLSValidation;
 
     #[test]
