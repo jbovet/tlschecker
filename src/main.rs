@@ -23,19 +23,22 @@ fn main() {
         .get_matches();
 
     let hosts = matches.values_of("host").unwrap();
+    let json_output = matches.is_present("json");
+
     for host in hosts {
         match TLSValidation::new(host).from() {
-            Ok(tls_validation) => {
-                if matches.is_present("json") {
-                    let json = serde_json::to_string(&tls_validation).unwrap();
+            Ok(validation_result) => {
+                //TODO implement better console output
+                if json_output {
+                    let json = serde_json::to_string(&validation_result).unwrap();
                     println!("{}", json);
                 } else {
                     println!(
-                        "{} is_expired:{} validity_days:{} - expired_days:{}",
-                        tls_validation.host(),
-                        tls_validation.is_expired(),
-                        tls_validation.validity_days(),
-                        tls_validation.expired_days(),
+                        "{} is expired={}, valid days={}, expired days={}",
+                        validation_result.host(),
+                        validation_result.is_expired(),
+                        validation_result.validity_days(),
+                        validation_result.expired_days(),
                     );
                 }
             }
@@ -49,6 +52,35 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use tlschecker::TLSValidation;
+
     #[test]
-    fn test_expired() {}
+    fn test_check_tls_for_expired_host() {
+        let host = "expired.badssl.com";
+        let mut tlsvalidation = TLSValidation::new(host);
+        let result = tlsvalidation.from();
+        match result {
+            Ok(t) => {
+                assert_eq!(t.is_expired(), true);
+                assert!(t.expired_days() > 0);
+                assert_eq!(t.validity_days(), 0);
+            }
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn test_check_tls_for_valid_host() {
+        let host = "jpbd.dev";
+        let mut tlsvalidation = TLSValidation::new(host);
+        let result = tlsvalidation.from();
+        match result {
+            Ok(t) => {
+                assert_eq!(t.is_expired(), false);
+                assert_eq!(t.expired_days(), 0);
+                assert!(t.validity_days() > 0);
+            }
+            Err(_) => {}
+        }
+    }
 }

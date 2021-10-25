@@ -86,13 +86,12 @@ impl TLSValidation {
 
                 if expiry < threshold {
                     self.set_expired(true);
-                    self.set_expired_days(expiration_days);
+                    self.set_expired_days(expiration_days.abs());
                     self.set_validity_days(0);
+                } else {
+                    self.set_validity_days(expiration_days);
+                    self.set_expired_days(0);
                 }
-
-                self.set_validity_days(expiration_days);
-                self.set_expired_days(0);
-                
                 Ok(self)
             }
             Err(_) => Err(TLSValidationError::new("couldn't resolve host address {}")),
