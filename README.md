@@ -16,7 +16,7 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -h <host>...        Set hostname to check
+    -h <host>...        Set hostname(s) to check
 ```
 
 ## How to use:
