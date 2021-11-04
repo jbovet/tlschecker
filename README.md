@@ -22,12 +22,32 @@ OPTIONS:
 ## How to use:
 ```sh
 ➜ tlschecker -h jpbd.dev expired.badssl.com
-jpbd.dev is expired=false, valid days=280, expired days=0
-expired.badssl.com is expired=true, valid days=0, expired days=238
+--------------------------------------
+Issued domain: sni.cloudflaressl.com
+Issued to: Cloudflare, Inc.
+Issued by: Cloudflare Inc ECC CA-3
+Valid from: Aug  2 00:00:00 2021 GMT
+Valid to: Aug  1 23:59:59 2022 GMT
+Days left: 270
+Expired: false
+Certificate version: 2
+Certificate algorithm: ecdsa-with-SHA256
+Certificate S/N: 2345778240388436345227316531320586380
+--------------------------------------
+Issued domain: *.badssl.com
+Issued to: None
+Issued by: COMODO RSA Domain Validation Secure Server CA
+Valid from: Apr  9 00:00:00 2015 GMT
+Valid to: Apr 12 23:59:59 2015 GMT
+Days left: -2397
+Expired: true
+Certificate version: 2
+Certificate algorithm: sha256WithRSAEncryption
+Certificate S/N: 99565320202650452861752791156765321481
+
 ```
 
 ```sh
-➜ tlschecker --json -h jpbd.dev expired.badssl.com
-{"host":"jpbd.dev","is_expired":false,"validity_days":280,"expired_days":0}
-{"host":"expired.badssl.com","is_expired":true,"validity_days":0,"expired_days":2387}
+➜ tlschecker --json  -h jpbd.dev                  
+{"issued_domain":"sni.cloudflaressl.com","issued_to":"Cloudflare, Inc.","issued_by":"Cloudflare Inc ECC CA-3","valid_from":"Aug  2 00:00:00 2021 GMT","valid_to":"Aug  1 23:59:59 2022 GMT","validity_days":270,"is_expired":false,"cert_sn":"2345778240388436345227316531320586380","cert_ver":"2","cert_alg":"ecdsa-with-SHA256"}
 ```
