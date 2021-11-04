@@ -18,7 +18,7 @@ pub struct Certificate {
     pub valid_from: String,
     pub valid_to: String,
     pub validity_days: i32,
-    pub is_cert_valid: bool,
+    pub is_expired: bool,
     pub cert_sn: String,
     pub cert_ver: String,
     pub cert_alg: String,
@@ -59,7 +59,7 @@ impl Certificate {
                     valid_from: data.valid_from,
                     valid_to: data.valid_to,
                     validity_days: data.validity_days,
-                    is_cert_valid: data.is_cert_valid,
+                    is_expired: data.is_expired,
                     cert_sn: data.cert_sn,
                     cert_ver: data.cert_ver,
                     cert_alg: data.cert_alg,
@@ -97,7 +97,7 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
         valid_from: cert_ref.not_before().to_string(),
         valid_to: cert_ref.not_after().to_string(),
         validity_days: get_validity_days(cert_ref.not_after()),
-        is_cert_valid: !has_expired(cert_ref.not_after()),
+        is_expired: has_expired(cert_ref.not_after()),
         cert_sn: cert_ref.serial_number().to_bn().unwrap().to_string(),
         cert_ver: cert_ref.version().to_string(),
         cert_alg: cert_ref.signature_algorithm().object().to_string(),
@@ -113,7 +113,7 @@ fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
         .days;
 }
 fn has_expired(not_after: &Asn1TimeRef) -> bool {
-    not_after < Asn1Time::days_from_now(0).unwrap()
+    !(not_after > Asn1Time::days_from_now(0).unwrap())
 }
 
 #[derive(Debug)]
@@ -126,5 +126,43 @@ impl TLSValidationError {
         TLSValidationError {
             details: msg.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Certificate;
+
+    #[test]
+    fn test_check_tls_for_expired_host() {
+        let host = "expired.badssl.com";
+        let cert = Certificate::from(host).unwrap();
+        println!("Expired: {}", cert.is_expired);
+        assert_eq!(cert.is_expired, true);
+        assert_eq!(cert.cert_alg, "sha256WithRSAEncryption");
+        assert_eq!(cert.issued_domain, "*.badssl.com");
+        assert_eq!(cert.issued_to, "None");
+        assert_eq!(
+            cert.issued_by,
+            "COMODO RSA Domain Validation Secure Server CA"
+        );
+        assert!(cert.validity_days < 0);
+        assert_eq!(cert.cert_sn, "99565320202650452861752791156765321481");
+        assert_eq!(cert.cert_ver, "2");
+    }
+
+    #[test]
+    fn test_check_tls_for_valid_host() {
+        let host = "jpbd.dev";
+        let cert = Certificate::from(host).unwrap();
+        println!("Expired: {}", cert.is_expired);
+        assert_eq!(cert.is_expired, false);
+        assert_eq!(cert.cert_alg, "ecdsa-with-SHA256");
+        assert_eq!(cert.issued_domain, "sni.cloudflaressl.com");
+        assert_eq!(cert.issued_to, "Cloudflare, Inc.");
+        assert_eq!(cert.issued_by, "Cloudflare Inc ECC CA-3");
+        assert!(cert.validity_days > 0);
+        assert_eq!(cert.cert_sn, "2345778240388436345227316531320586380");
+        assert_eq!(cert.cert_ver, "2");
     }
 }

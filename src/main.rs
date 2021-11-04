@@ -38,7 +38,7 @@ fn main() {
                     println!("Valid from: {}", cert.valid_from);
                     println!("Valid to: {}", cert.valid_to);
                     println!("Days left: {}", cert.validity_days);
-                    println!("Expired: {}", cert.is_cert_valid);
+                    println!("Expired: {}", cert.is_expired);
                     println!("Certificate version: {}", cert.cert_ver);
                     println!("Certificate algorithm: {}", cert.cert_alg);
                     println!("Certificate S/N: {}", cert.cert_sn);
@@ -52,41 +52,4 @@ fn main() {
         }
     }
     exit(0);
-}
-
-#[cfg(test)]
-mod tests {
-    use tlschecker::Certificate;
-
-    #[test]
-    fn test_check_tls_for_expired_host() {
-        let host = "expired.badssl.com";
-        let cert = Certificate::from(host).unwrap();
-        assert_eq!(cert.is_cert_valid, false);
-        assert_eq!(cert.cert_alg, "sha256WithRSAEncryption");
-        assert_eq!(cert.issued_domain, "*.badssl.com");
-        assert_eq!(cert.issued_to, "None");
-        assert_eq!(
-            cert.issued_by,
-            "COMODO RSA Domain Validation Secure Server CA"
-        );
-        assert!(cert.validity_days < 0);
-        assert_eq!(cert.cert_sn, "99565320202650452861752791156765321481");
-        assert_eq!(cert.cert_ver, "2");
-    }
-
-    // #[test]
-    // fn test_check_tls_for_valid_host() {
-    //     let host = "drone.tools.walmartdigital.cl";
-    //     let mut tlsvalidation = TLSValidation::new(host);
-    //     let result = tlsvalidation.from();
-    //     match result {
-    //         Ok(t) => {
-    //             assert_eq!(t.is_expired(), false);
-    //             //assert_eq!(t.expired_days(), 0);
-    //             // assert!(t.validity_days() > 0);
-    //         }
-    //         Err(_) => {}
-    //     }
-    // }
 }
