@@ -13,8 +13,8 @@ jobs:
       matrix:
         name: [
             linux,
-            windows,
-            macos
+            macos,
+            windows
         ]
 
         include:
