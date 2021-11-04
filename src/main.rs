@@ -32,6 +32,7 @@ fn main() {
                     let json = serde_json::to_string(&cert).unwrap();
                     println!("{}", json);
                 } else {
+                    println!("--------------------------------------");
                     println!("Issued domain: {}", cert.issued_domain);
                     println!("Issued to: {}", cert.issued_to);
                     println!("Issued by: {}", cert.issued_by);
