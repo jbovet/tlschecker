@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2018"
 description = "Checks TLS certificate expiration"
 authors = ["Jose Bovet Derpich <jose.bovet@gmail.com>"]
-license = "MIT"
+license = "GNU"
 readme = "README.md"
 repository = "https://github.com/jbovet/tlschecker"
 

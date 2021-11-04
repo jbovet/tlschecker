@@ -1,6 +1,6 @@
 use clap::{App, Arg};
 use std::process::exit;
-use tlschecker::TLSValidation;
+use tlschecker::Certificate;
 
 fn main() {
     let matches = App::new("TLS Checker")
@@ -26,20 +26,24 @@ fn main() {
     let json_output = matches.is_present("json");
 
     for host in hosts {
-        match TLSValidation::new(host).from() {
-            Ok(validation_result) => {
-                //TODO implement better console output
+        match Certificate::from(host) {
+            Ok(cert) => {
                 if json_output {
-                    let json = serde_json::to_string(&validation_result).unwrap();
+                    let json = serde_json::to_string(&cert).unwrap();
                     println!("{}", json);
                 } else {
-                    println!(
-                        "{} is expired={}, valid days={}, expired days={}",
-                        validation_result.host(),
-                        validation_result.is_expired(),
-                        validation_result.validity_days(),
-                        validation_result.expired_days(),
-                    );
+                    println!("Issued domain: {}", cert.issued_domain);
+                    println!("Issued to: {}", cert.issued_to);
+                    println!("Issued by: {}", cert.issued_by);
+                    println!("Valid from: {}", cert.valid_from);
+                    println!("Valid to: {}", cert.valid_to);
+                    println!("Days left: {}", cert.validity_days);
+                    println!("Expired: {}", cert.is_cert_valid);
+                    println!("Certificate version: {}", cert.cert_ver);
+                    println!("Certificate algorithm: {}", cert.cert_alg);
+                    println!("Certificate S/N: {}", cert.cert_sn);
+                    //TODO
+                    // println!("Certificate SAN's");
                 }
             }
             Err(_) => {
@@ -52,35 +56,37 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use tlschecker::TLSValidation;
+    use tlschecker::Certificate;
 
     #[test]
     fn test_check_tls_for_expired_host() {
         let host = "expired.badssl.com";
-        let mut tlsvalidation = TLSValidation::new(host);
-        let result = tlsvalidation.from();
-        match result {
-            Ok(t) => {
-                assert_eq!(t.is_expired(), true);
-                assert!(t.expired_days() > 0);
-                assert_eq!(t.validity_days(), 0);
-            }
-            Err(_) => {}
-        }
+        let cert = Certificate::from(host).unwrap();
+        assert_eq!(cert.is_cert_valid, false);
+        assert_eq!(cert.cert_alg, "sha256WithRSAEncryption");
+        assert_eq!(cert.issued_domain, "*.badssl.com");
+        assert_eq!(cert.issued_to, "None");
+        assert_eq!(
+            cert.issued_by,
+            "COMODO RSA Domain Validation Secure Server CA"
+        );
+        assert!(cert.validity_days < 0);
+        assert_eq!(cert.cert_sn, "99565320202650452861752791156765321481");
+        assert_eq!(cert.cert_ver, "2");
     }
 
-    #[test]
-    fn test_check_tls_for_valid_host() {
-        let host = "jpbd.dev";
-        let mut tlsvalidation = TLSValidation::new(host);
-        let result = tlsvalidation.from();
-        match result {
-            Ok(t) => {
-                assert_eq!(t.is_expired(), false);
-                assert_eq!(t.expired_days(), 0);
-                assert!(t.validity_days() > 0);
-            }
-            Err(_) => {}
-        }
-    }
+    // #[test]
+    // fn test_check_tls_for_valid_host() {
+    //     let host = "drone.tools.walmartdigital.cl";
+    //     let mut tlsvalidation = TLSValidation::new(host);
+    //     let result = tlsvalidation.from();
+    //     match result {
+    //         Ok(t) => {
+    //             assert_eq!(t.is_expired(), false);
+    //             //assert_eq!(t.expired_days(), 0);
+    //             // assert!(t.validity_days() > 0);
+    //         }
+    //         Err(_) => {}
+    //     }
+    // }
 }
