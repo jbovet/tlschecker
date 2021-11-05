@@ -43,8 +43,10 @@ fn main() {
                     println!("Certificate version: {}", cert.cert_ver);
                     println!("Certificate algorithm: {}", cert.cert_alg);
                     println!("Certificate S/N: {}", cert.cert_sn);
-                    //TODO
-                    // println!("Certificate SAN's");
+                    println!("Subject Alternative Names:");
+                    for san in cert.sans {
+                        println!("  DNS Name: {}", san);
+                    }
                 }
             }
             Err(_) => {

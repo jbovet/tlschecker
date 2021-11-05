@@ -22,6 +22,7 @@ pub struct Certificate {
     pub cert_sn: String,
     pub cert_ver: String,
     pub cert_alg: String,
+    pub sans: Vec<String>,
 }
 
 impl Certificate {
@@ -63,6 +64,7 @@ impl Certificate {
                     cert_sn: data.cert_sn,
                     cert_ver: data.cert_ver,
                     cert_alg: data.cert_alg,
+                    sans: data.sans,
                 };
                 Ok(certificate)
             }
@@ -90,6 +92,16 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
     for entity in organization_name_entities {
         organization_name = entity.data().as_utf8().unwrap().to_string();
     }
+
+    let mut sans = Vec::new();
+    match cert_ref.subject_alt_names() {
+        None => {}
+        Some(general_names) => {
+            for general_name in general_names {
+                sans.push(general_name.dnsname().unwrap().to_string());
+            }
+        }
+    }
     return Certificate {
         issued_domain: subject_name.data().as_utf8().unwrap().to_string(),
         issued_to: organization_name,
@@ -101,6 +113,7 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
         cert_sn: cert_ref.serial_number().to_bn().unwrap().to_string(),
         cert_ver: cert_ref.version().to_string(),
         cert_alg: cert_ref.signature_algorithm().object().to_string(),
+        sans,
     };
 }
 
@@ -132,7 +145,6 @@ impl TLSValidationError {
 #[cfg(test)]
 mod tests {
     use crate::Certificate;
-
     #[test]
     fn test_check_tls_for_expired_host() {
         let host = "expired.badssl.com";
@@ -164,5 +176,15 @@ mod tests {
         assert!(cert.validity_days > 0);
         assert_eq!(cert.cert_sn, "2345778240388436345227316531320586380");
         assert_eq!(cert.cert_ver, "2");
+        assert_eq!(cert.sans.len(), 3);
+    }
+    #[test]
+    fn test_check_tls_for_valid_host_without_sans() {
+        let host = "acme-staging-v02.api.letsencrypt.org";
+        let cert = Certificate::from(host).unwrap();
+        println!("Expired: {}", cert.is_expired);
+        assert_eq!(cert.is_expired, false);
+        assert!(cert.validity_days > 0);
+        assert_eq!(cert.sans.len(), 2);
     }
 }
