@@ -13,8 +13,7 @@ jobs:
       matrix:
         name: [
             linux,
-            macos,
-            windows
+            macos
         ]
 
         include:
@@ -22,10 +21,6 @@ jobs:
             os: ubuntu-latest
             artifact_name: target/release/tlschecker
             asset_name: tlschecker-linux
-          - name: windows
-            os: windows-latest
-            artifact_name: target/release/tlschecker.exe
-            asset_name: tlschecker-windows
           - name: macos
             os: macos-latest
             artifact_name: target/release/tlschecker
