@@ -49,8 +49,8 @@ fn main() {
                     }
                 }
             }
-            Err(_) => {
-                println!("Couldn't resolve any address from server {} ", host)
+            Err(err) => {
+                println!("Fail to check host: {} ", &err.details);
             }
         }
     }

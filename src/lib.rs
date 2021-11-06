@@ -38,7 +38,12 @@ impl Certificate {
             Ok(mut address) => {
                 let socket_addr = address.next().unwrap();
                 let tcp_stream =
-                    TcpStream::connect_timeout(&socket_addr, Duration::from_secs(TIMEOUT)).unwrap();
+                    match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(TIMEOUT)) {
+                        Ok(tcp_stream) => tcp_stream,
+                        Err(err) => {
+                            return Err(TLSValidationError::new(&err.to_string()));
+                        }
+                    };
                 tcp_stream
                     .set_read_timeout(Some(Duration::from_secs(TIMEOUT)))
                     .unwrap();
@@ -68,7 +73,7 @@ impl Certificate {
                 };
                 Ok(certificate)
             }
-            Err(_) => Err(TLSValidationError::new("couldn't resolve host address {}")),
+            Err(_) => Err(TLSValidationError::new("couldn't resolve host address.")),
         }
     }
 }
@@ -131,7 +136,7 @@ fn has_expired(not_after: &Asn1TimeRef) -> bool {
 
 #[derive(Debug)]
 pub struct TLSValidationError {
-    details: String,
+    pub details: String,
 }
 
 impl TLSValidationError {
@@ -186,5 +191,18 @@ mod tests {
         assert_eq!(cert.is_expired, false);
         assert!(cert.validity_days > 0);
         assert_eq!(cert.sans.len(), 2);
+    }
+    #[test]
+    fn test_check_resolve_invalid_host() {
+        let host = "basdomain.xyz";
+        let result = Certificate::from(host).map_err(|e| e).err();
+        assert_eq!("couldn't resolve host address.", result.unwrap().details);
+    }
+
+    #[test]
+    fn test_check_tls_connection_refused() {
+        let host = "slackware.com";
+        let result = Certificate::from(host).map_err(|e| e).err();
+        assert_eq!("Connection refused (os error 61)", result.unwrap().details);
     }
 }
