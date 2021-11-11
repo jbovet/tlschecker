@@ -1,23 +1,30 @@
 # TLSChecker
+
 Rust TLS/SSL certificate expiration date from command-line checker
 
 [![codecov](https://codecov.io/gh/jbovet/tlschecker/branch/main/graph/badge.svg?token=MN4EE3WYQ6)](https://codecov.io/gh/jbovet/tlschecker)
 
 ## Install
+
 Linux
+
 ```sh
 curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.3/tlschecker-linux
 sudo install tlschecker-linux /usr/local/bin/tlschecker-linux
 ```
+
 Osx
+
 ```sh
 curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.3/tlschecker-macos
 sudo install tlschecker-macos /usr/local/bin/tlschecker-macos
 ```
+
 ##
+
 ```sh
 ➜  tlschecker --help
-TLS Checker 1.0
+TLS Checker 0.1.3
 Jose Bovet Derpich. <jose.bovet@gmail.com>
 TLS/SSL certificate expiration date from command-line checker
 
@@ -34,6 +41,7 @@ OPTIONS:
 ```
 
 ## How to use:
+
 ```sh
 ➜ tlschecker -h jpbd.dev expired.badssl.com
 --------------------------------------
