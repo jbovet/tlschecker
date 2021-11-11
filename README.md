@@ -19,7 +19,7 @@ Osx
 ```sh
 curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.3/tlschecker-macos
 mv tlschecker-macos tlschecker
-sudo install tlschecker-macos /usr/local/bin/tlschecker
+sudo install tlschecker /usr/local/bin/tlschecker
 ```
 
 ##
