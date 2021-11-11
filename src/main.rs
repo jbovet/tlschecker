@@ -33,9 +33,18 @@ fn main() {
                     println!("{}", json);
                 } else {
                     println!("--------------------------------------");
-                    println!("Issued domain: {}", cert.issued_domain);
-                    println!("Issued to: {}", cert.issued_to);
-                    println!("Issued by: {}", cert.issued_by);
+                    println!("Issued domain: {}", cert.subject.common_name);
+                    println!("Subject Name :");
+                    println!("\tCountry or Region: {}", cert.subject.country_or_region);
+                    println!("\tState or Province: {}", cert.subject.state_or_province);
+                    println!("\tLocality: {}", cert.subject.locality);
+                    println!("\tOrganizational Unit: {}", cert.subject.organization_unit);
+                    println!("\tOrganization: {}", cert.subject.organization);
+                    println!("\tCommon Name: {}", cert.subject.common_name);
+                    println!("Issuer Name:");
+                    println!("\tCountry or Region: {}", cert.issued.country_or_region);
+                    println!("\tOrganization: {}", cert.issued.organization);
+                    println!("\tCommon Name: {}", cert.issued.common_name);
                     println!("Valid from: {}", cert.valid_from);
                     println!("Valid to: {}", cert.valid_to);
                     println!("Days left: {}", cert.validity_days);
@@ -45,7 +54,7 @@ fn main() {
                     println!("Certificate S/N: {}", cert.cert_sn);
                     println!("Subject Alternative Names:");
                     for san in cert.sans {
-                        println!("  DNS Name: {}", san);
+                        println!("\tDNS Name: {}", san);
                     }
                 }
             }

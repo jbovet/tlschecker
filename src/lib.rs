@@ -1,7 +1,7 @@
 use openssl::asn1::{Asn1Time, Asn1TimeRef};
 use openssl::nid::Nid;
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
-use openssl::x509::X509;
+use openssl::x509::{X509NameEntries, X509};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -12,9 +12,8 @@ static TIMEOUT: u64 = 30;
 
 #[derive(Serialize, Deserialize)]
 pub struct Certificate {
-    pub issued_domain: String,
-    pub issued_to: String,
-    pub issued_by: String,
+    pub subject: Subject,
+    pub issued: Issuer,
     pub valid_from: String,
     pub valid_to: String,
     pub validity_days: i32,
@@ -23,6 +22,23 @@ pub struct Certificate {
     pub cert_ver: String,
     pub cert_alg: String,
     pub sans: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Issuer {
+    pub country_or_region: String,
+    pub organization: String,
+    pub common_name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Subject {
+    pub country_or_region: String,
+    pub state_or_province: String,
+    pub locality: String,
+    pub organization_unit: String,
+    pub organization: String,
+    pub common_name: String,
 }
 
 impl Certificate {
@@ -59,9 +75,8 @@ impl Certificate {
                     .unwrap();
                 let data = get_certificate_info(&x509_ref);
                 let certificate = Certificate {
-                    issued_domain: data.issued_domain,
-                    issued_to: data.issued_to,
-                    issued_by: data.issued_by,
+                    subject: data.subject,
+                    issued: data.issued,
                     valid_from: data.valid_from,
                     valid_to: data.valid_to,
                     validity_days: data.validity_days,
@@ -78,26 +93,58 @@ impl Certificate {
     }
 }
 
-fn get_certificate_info(cert_ref: &X509) -> Certificate {
-    let subject_name = cert_ref
-        .subject_name()
-        .entries_by_nid(Nid::COMMONNAME)
-        .next()
-        .unwrap();
-    let issuer_name = cert_ref
-        .issuer_name()
-        .entries_by_nid(Nid::COMMONNAME)
-        .next()
-        .unwrap();
-    let organization_name_entities = cert_ref
-        .subject_name()
-        .entries_by_nid(Nid::ORGANIZATIONNAME);
-
-    let mut organization_name = String::from("None");
-    for entity in organization_name_entities {
-        organization_name = entity.data().as_utf8().unwrap().to_string();
+fn from_entries(mut entries: X509NameEntries) -> String {
+    match entries.next() {
+        None => "None".to_string(),
+        Some(x509_name_ref) => x509_name_ref.data().as_utf8().unwrap().to_string(),
     }
+}
 
+fn get_subject(cert_ref: &X509) -> Subject {
+    let subject_country_region =
+        from_entries(cert_ref.subject_name().entries_by_nid(Nid::COUNTRYNAME));
+    let subject_state_province = from_entries(
+        cert_ref
+            .subject_name()
+            .entries_by_nid(Nid::STATEORPROVINCENAME),
+    );
+    let subject_locality = from_entries(cert_ref.subject_name().entries_by_nid(Nid::LOCALITYNAME));
+    let subject_organization_unit = from_entries(
+        cert_ref
+            .subject_name()
+            .entries_by_nid(Nid::ORGANIZATIONALUNITNAME),
+    );
+    let subject_common_name = from_entries(cert_ref.subject_name().entries_by_nid(Nid::COMMONNAME));
+    let organization_name = from_entries(
+        cert_ref
+            .subject_name()
+            .entries_by_nid(Nid::ORGANIZATIONNAME),
+    );
+
+    Subject {
+        country_or_region: subject_country_region,
+        state_or_province: subject_state_province,
+        locality: subject_locality,
+        organization_unit: subject_organization_unit,
+        organization: organization_name,
+        common_name: subject_common_name,
+    }
+}
+
+fn get_issuer(cert_ref: &X509) -> Issuer {
+    let issuer_common_name = from_entries(cert_ref.issuer_name().entries_by_nid(Nid::COMMONNAME));
+    let issuer_organization_name =
+        from_entries(cert_ref.issuer_name().entries_by_nid(Nid::ORGANIZATIONNAME));
+    let issuer_country_region =
+        from_entries(cert_ref.issuer_name().entries_by_nid(Nid::COUNTRYNAME));
+    Issuer {
+        country_or_region: issuer_country_region,
+        organization: issuer_organization_name,
+        common_name: issuer_common_name,
+    }
+}
+
+fn get_certificate_info(cert_ref: &X509) -> Certificate {
     let mut sans = Vec::new();
     match cert_ref.subject_alt_names() {
         None => {}
@@ -108,9 +155,8 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
         }
     }
     return Certificate {
-        issued_domain: subject_name.data().as_utf8().unwrap().to_string(),
-        issued_to: organization_name,
-        issued_by: issuer_name.data().as_utf8().unwrap().to_string(),
+        subject: get_subject(cert_ref),
+        issued: get_issuer(cert_ref),
         valid_from: cert_ref.not_before().to_string(),
         valid_to: cert_ref.not_after().to_string(),
         validity_days: get_validity_days(cert_ref.not_after()),
@@ -130,6 +176,7 @@ fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
         .unwrap()
         .days;
 }
+
 fn has_expired(not_after: &Asn1TimeRef) -> bool {
     !(not_after > Asn1Time::days_from_now(0).unwrap())
 }
@@ -150,6 +197,7 @@ impl TLSValidationError {
 #[cfg(test)]
 mod tests {
     use crate::Certificate;
+
     #[test]
     fn test_check_tls_for_expired_host() {
         let host = "expired.badssl.com";
@@ -157,10 +205,10 @@ mod tests {
         println!("Expired: {}", cert.is_expired);
         assert_eq!(cert.is_expired, true);
         assert_eq!(cert.cert_alg, "sha256WithRSAEncryption");
-        assert_eq!(cert.issued_domain, "*.badssl.com");
-        assert_eq!(cert.issued_to, "None");
+        assert_eq!(cert.subject.common_name, "*.badssl.com");
+        assert_eq!(cert.subject.organization, "None");
         assert_eq!(
-            cert.issued_by,
+            cert.issued.common_name,
             "COMODO RSA Domain Validation Secure Server CA"
         );
         assert!(cert.validity_days < 0);
@@ -175,23 +223,35 @@ mod tests {
         println!("Expired: {}", cert.is_expired);
         assert_eq!(cert.is_expired, false);
         assert_eq!(cert.cert_alg, "ecdsa-with-SHA256");
-        assert_eq!(cert.issued_domain, "sni.cloudflaressl.com");
-        assert_eq!(cert.issued_to, "Cloudflare, Inc.");
-        assert_eq!(cert.issued_by, "Cloudflare Inc ECC CA-3");
+        assert_eq!(cert.subject.common_name, "sni.cloudflaressl.com");
+        assert_eq!(cert.subject.organization, "Cloudflare, Inc.");
+        assert_eq!(cert.issued.common_name, "Cloudflare Inc ECC CA-3");
         assert!(cert.validity_days > 0);
         assert_eq!(cert.cert_sn, "2345778240388436345227316531320586380");
         assert_eq!(cert.cert_ver, "2");
         assert_eq!(cert.sans.len(), 3);
     }
+
     #[test]
     fn test_check_tls_for_valid_host_without_sans() {
         let host = "acme-staging-v02.api.letsencrypt.org";
         let cert = Certificate::from(host).unwrap();
-        println!("Expired: {}", cert.is_expired);
         assert_eq!(cert.is_expired, false);
         assert!(cert.validity_days > 0);
-        assert_eq!(cert.sans.len(), 2);
+        assert!(cert.sans.len() > 0);
+
+        assert_eq!(cert.subject.country_or_region, "None");
+        assert_eq!(cert.subject.state_or_province, "None");
+        assert_eq!(cert.subject.locality, "None");
+        assert_eq!(cert.subject.organization_unit, "None");
+        assert_eq!(cert.subject.organization, "None");
+        assert_eq!(cert.subject.common_name, "acme-staging.api.letsencrypt.org");
+
+        assert_eq!(cert.issued.common_name, "R3");
+        assert_eq!(cert.issued.organization, "Let's Encrypt");
+        assert_eq!(cert.issued.country_or_region, "US");
     }
+
     #[test]
     fn test_check_resolve_invalid_host() {
         let host = "basdomain.xyz";
@@ -203,6 +263,8 @@ mod tests {
     fn test_check_tls_connection_refused() {
         let host = "slackware.com";
         let result = Certificate::from(host).map_err(|e| e).err();
-        assert_eq!("Connection refused (os error 61)", result.unwrap().details);
+        let message = result.unwrap().details;
+        assert!(message.len() > 0);
+        println!("{}", message);
     }
 }
