@@ -14,7 +14,7 @@ Osx
 curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.3/tlschecker-macos
 sudo install tlschecker-macos /usr/local/bin/tlschecker-macos
 ```
-## How to use
+##
 ```sh
 ➜  tlschecker --help
 TLS Checker 1.0
