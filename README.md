@@ -10,14 +10,16 @@ Linux
 
 ```sh
 curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.3/tlschecker-linux
-sudo install tlschecker-linux /usr/local/bin/tlschecker-linux
+mv tlschecker-linux tlschecker
+sudo install tlschecker /usr/local/bin/tlschecker
 ```
 
 Osx
 
 ```sh
 curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.3/tlschecker-macos
-sudo install tlschecker-macos /usr/local/bin/tlschecker-macos
+mv tlschecker-macos tlschecker
+sudo install tlschecker-macos /usr/local/bin/tlschecker
 ```
 
 ##
