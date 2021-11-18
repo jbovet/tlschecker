@@ -4,6 +4,14 @@ Rust TLS/SSL certificate expiration date from command-line checker
 
 [![codecov](https://codecov.io/gh/jbovet/tlschecker/branch/main/graph/badge.svg?token=MN4EE3WYQ6)](https://codecov.io/gh/jbovet/tlschecker)
 
+## Docker run
+
+[DockerHub](https://hub.docker.com/repository/docker/josebovet/tlschecker)
+
+```sh
+docker run josebovet/tlschecker:v0.1.4 -h jpbd.dev
+```
+
 ## Install
 
 Linux
