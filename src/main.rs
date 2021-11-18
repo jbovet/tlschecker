@@ -4,9 +4,9 @@ use tlschecker::Certificate;
 
 fn main() {
     let matches = App::new("TLS Checker")
-        .version("0.1.3")
-        .author("Jose Bovet Derpich. <jose.bovet@gmail.com>")
-        .about("TLS/SSL certificate expiration date from command-line checker")
+        .version(env!("CARGO_PKG_VERSION"))
+        .author(env!("CARGO_PKG_AUTHORS"))
+        .long_about(env!("CARGO_PKG_DESCRIPTION"))
         .arg(
             Arg::with_name("host")
                 .short("h")
