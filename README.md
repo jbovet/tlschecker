@@ -9,7 +9,7 @@ Rust TLS/SSL certificate expiration date from command-line checker
 Linux
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.3/tlschecker-linux
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.4/tlschecker-linux
 mv tlschecker-linux tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
@@ -17,7 +17,7 @@ sudo install tlschecker /usr/local/bin/tlschecker
 Osx
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.3/tlschecker-macos
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.4/tlschecker-macos
 mv tlschecker-macos tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
@@ -26,7 +26,7 @@ sudo install tlschecker /usr/local/bin/tlschecker
 
 ```sh
 ➜  tlschecker --help
-TLS Checker 0.1.3
+TLS Checker 0.1.4
 Jose Bovet Derpich. <jose.bovet@gmail.com>
 TLS/SSL certificate expiration date from command-line checker
 
