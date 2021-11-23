@@ -12,6 +12,7 @@ static TIMEOUT: u64 = 30;
 
 #[derive(Serialize, Deserialize)]
 pub struct Certificate {
+    pub hostname: String,
     pub subject: Subject,
     pub issued: Issuer,
     pub valid_from: String,
@@ -75,6 +76,7 @@ impl Certificate {
                     .unwrap();
                 let data = get_certificate_info(&x509_ref);
                 let certificate = Certificate {
+                    hostname: host.to_string(),
                     subject: data.subject,
                     issued: data.issued,
                     valid_from: data.valid_from,
@@ -155,6 +157,7 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
         }
     }
     return Certificate {
+        hostname: "None".to_string(),
         subject: get_subject(cert_ref),
         issued: get_issuer(cert_ref),
         valid_from: cert_ref.not_before().to_string(),
@@ -214,6 +217,7 @@ mod tests {
         assert!(cert.validity_days < 0);
         assert_eq!(cert.cert_sn, "99565320202650452861752791156765321481");
         assert_eq!(cert.cert_ver, "2");
+        assert_eq!(cert.hostname, host)
     }
 
     #[test]
@@ -230,6 +234,7 @@ mod tests {
         assert_eq!(cert.cert_sn, "2345778240388436345227316531320586380");
         assert_eq!(cert.cert_ver, "2");
         assert_eq!(cert.sans.len(), 3);
+        assert_eq!(cert.hostname, host)
     }
 
     #[test]
@@ -250,6 +255,7 @@ mod tests {
         assert_eq!(cert.issued.common_name, "R3");
         assert_eq!(cert.issued.organization, "Let's Encrypt");
         assert_eq!(cert.issued.country_or_region, "US");
+        assert_eq!(cert.hostname, host)
     }
 
     #[test]

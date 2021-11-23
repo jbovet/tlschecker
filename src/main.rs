@@ -40,6 +40,7 @@ fn main() {
     if !matches.is_present("json") {
         for cert in certificates {
             println!("--------------------------------------");
+            println!("Hostname: {}", cert.hostname);
             println!("Issued domain: {}", cert.subject.common_name);
             println!("Subject Name :");
             println!("\tCountry or Region: {}", cert.subject.country_or_region);
