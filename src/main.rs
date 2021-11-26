@@ -1,5 +1,8 @@
 use clap::{App, Arg};
 use std::process::exit;
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
 use tlschecker::Certificate;
 
 fn main() {
@@ -22,19 +25,30 @@ fn main() {
         )
         .get_matches();
 
-    let hosts = matches.values_of("host").unwrap();
-
-    let mut certificates = Vec::with_capacity(hosts.len());
-
-    for host in hosts {
-        match Certificate::from(host) {
-            Ok(cert) => {
-                certificates.push(cert);
-            }
-            Err(err) => {
-                println!("Fail to check host: {}  {} ", &host, &err.details);
-            }
+    let (sender, receiver): (Sender<Certificate>, Receiver<Certificate>) = mpsc::channel();
+    let hosts: Vec<String> = matches
+        .values_of("host")
+        .unwrap()
+        .map(String::from)
+        .collect();
+    let hosts_len = hosts.len();
+    thread::spawn(move || {
+        for host in hosts {
+            let thread_tx = sender.clone();
+            thread::spawn(move || match Certificate::from(&host) {
+                Ok(cert) => {
+                    thread_tx.send(cert).unwrap();
+                }
+                Err(err) => {
+                    println!("Fail to check host: {}  {} ", &host, &err.details);
+                }
+            });
         }
+    });
+
+    let mut certificates: Vec<Certificate> = Vec::with_capacity(hosts_len);
+    for cert in receiver {
+        certificates.push(cert);
     }
 
     if !matches.is_present("json") {
