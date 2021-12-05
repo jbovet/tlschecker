@@ -250,7 +250,10 @@ mod tests {
         assert_eq!(cert.subject.locality, "None");
         assert_eq!(cert.subject.organization_unit, "None");
         assert_eq!(cert.subject.organization, "None");
-        assert_eq!(cert.subject.common_name, "acme-staging-v02.api.letsencrypt.org");
+        assert_eq!(
+            cert.subject.common_name,
+            "acme-staging-v02.api.letsencrypt.org"
+        );
 
         assert_eq!(cert.issued.common_name, "R3");
         assert_eq!(cert.issued.organization, "Let's Encrypt");
