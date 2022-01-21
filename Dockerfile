@@ -1,4 +1,4 @@
-FROM rust:1.56 as build
+FROM rust:1.58 as build
 LABEL maintainer="jose.bovet@gmail.com"
 
 RUN cargo new --bin tlschecker

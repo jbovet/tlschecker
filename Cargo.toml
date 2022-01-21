@@ -1,6 +1,6 @@
 [package]
 name = "tlschecker"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2018"
 description = "TLS/SSL certificate expiration date from command-line checker"
 authors = ["Jose Bovet Derpich <jose.bovet@gmail.com>"]
