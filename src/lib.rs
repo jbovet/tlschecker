@@ -221,6 +221,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reason"]
     fn test_check_tls_for_valid_host() {
         let host = "jpbd.dev";
         let cert = Certificate::from(host).unwrap();
