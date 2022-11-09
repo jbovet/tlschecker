@@ -1,4 +1,4 @@
-FROM rust:1.63 as build
+FROM rust:1.65 as build
 LABEL maintainer="jose.bovet@gmail.com"
 
 RUN cargo new --bin tlschecker
@@ -18,7 +18,7 @@ RUN rm ./target/release/deps/tlschecker*
 RUN cargo build --release
 
 # base
-FROM rust:1.63-slim-buster
+FROM rust:1.65-slim-buster
 
 # copy the build artifact from the build stage
 COPY --from=build /tlschecker/target/release/tlschecker .
