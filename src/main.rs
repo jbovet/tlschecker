@@ -6,17 +6,17 @@ use std::thread;
 use tlschecker::Certificate;
 
 fn main() {
-    let matches = App::new("TLS Checker")
+    let matches = App::new("tlschecker")
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
         .long_about(env!("CARGO_PKG_DESCRIPTION"))
         .arg(
-            Arg::with_name("host")
-                .short("h")
+            Arg::with_name("addresses")
+                .short("a")
                 .takes_value(true)
                 .multiple(true)
                 .required(true)
-                .help("Set hostname to check"),
+                .help("A comma-delimited hosts list to be checked"),
         )
         .arg(
             Arg::with_name("json")
@@ -27,7 +27,7 @@ fn main() {
 
     let (sender, receiver): (Sender<Certificate>, Receiver<Certificate>) = mpsc::channel();
     let hosts: Vec<String> = matches
-        .values_of("host")
+        .values_of("addresses")
         .unwrap()
         .map(String::from)
         .collect();
