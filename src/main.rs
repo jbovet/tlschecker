@@ -23,6 +23,11 @@ fn main() {
                 .long("json")
                 .help("Prints json output"),
         )
+        .arg(
+            Arg::with_name("chain")
+                .long("chain")
+                .help("Prints the certificate chain of the peer, if present."),
+        )
         .get_matches();
 
     let (sender, receiver): (Sender<Certificate>, Receiver<Certificate>) = mpsc::channel();
@@ -77,6 +82,22 @@ fn main() {
             println!("Subject Alternative Names:");
             for san in cert.sans {
                 println!("\tDNS Name: {}", san);
+            }
+            if matches.is_present("chain") {
+                match cert.chain {
+                    Some(chains) => {
+                        println!("Additional Certificates (if supplied):");
+                        for (i, c) in chains.iter().enumerate() {
+                            println!("Chain #{:?}", i + 1);
+                            println!("\tSubject: {:?}", c.subject);
+                            println!("\tValid from: {:?}", c.valid_from);
+                            println!("\tValid until: {:?}", c.valid_to);
+                            println!("\tIssuer: {:?}", c.issuer);
+                            println!("\tSignature algorithm: {:?}", c.signature_algorithm);
+                        }
+                    }
+                    None => todo!(),
+                }
             }
         }
     } else {

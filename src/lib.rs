@@ -11,6 +11,15 @@ use std::time::Duration;
 static TIMEOUT: u64 = 30;
 
 #[derive(Serialize, Deserialize)]
+pub struct Chain {
+    pub subject: String,
+    pub issuer: String,
+    pub valid_from: String,
+    pub valid_to: String,
+    pub signature_algorithm: String,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct Certificate {
     pub hostname: String,
     pub subject: Subject,
@@ -23,6 +32,7 @@ pub struct Certificate {
     pub cert_ver: String,
     pub cert_alg: String,
     pub sans: Vec<String>,
+    pub chain: Option<Vec<Chain>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -69,6 +79,22 @@ impl Certificate {
                     .connect(tcp_stream)
                     .expect("TLS handshake failed.");
 
+                let chains = stream
+                    .ssl()
+                    .peer_cert_chain()
+                    .ok_or("peer certificate chain not found")
+                    .unwrap();
+                let mut peer_cert_chain: Vec<Chain> = Vec::new();
+                for chain in chains {
+                    peer_cert_chain.push(Chain {
+                        subject: from_entries(chain.subject_name().entries_by_nid(Nid::COMMONNAME)),
+                        valid_to: chain.not_after().to_string(),
+                        valid_from: chain.not_before().to_string(),
+                        issuer: from_entries(chain.issuer_name().entries_by_nid(Nid::COMMONNAME)),
+                        signature_algorithm: chain.signature_algorithm().object().to_string(),
+                    });
+                }
+
                 let x509_ref = stream
                     .ssl()
                     .peer_certificate()
@@ -87,6 +113,7 @@ impl Certificate {
                     cert_ver: data.cert_ver,
                     cert_alg: data.cert_alg,
                     sans: data.sans,
+                    chain: Some(peer_cert_chain),
                 };
                 Ok(certificate)
             }
@@ -168,6 +195,7 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
         cert_ver: cert_ref.version().to_string(),
         cert_alg: cert_ref.signature_algorithm().object().to_string(),
         sans,
+        chain: None,
     };
 }
 
