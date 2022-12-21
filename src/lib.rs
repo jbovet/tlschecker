@@ -249,7 +249,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reason"]
     fn test_check_tls_for_valid_host() {
         let host = "jpbd.dev";
         let cert = Certificate::from(host).unwrap();
@@ -260,10 +259,11 @@ mod tests {
         assert_eq!(cert.subject.organization, "Cloudflare, Inc.");
         assert_eq!(cert.issued.common_name, "Cloudflare Inc ECC CA-3");
         assert!(cert.validity_days > 0);
-        assert_eq!(cert.cert_sn, "2345778240388436345227316531320586380");
+        assert!(cert.cert_sn.len() > 0);
         assert_eq!(cert.cert_ver, "2");
         assert_eq!(cert.sans.len(), 3);
-        assert_eq!(cert.hostname, host)
+        assert_eq!(cert.hostname, host);
+        assert!(cert.chain.unwrap().len() > 0);
     }
 
     #[test]
@@ -284,7 +284,9 @@ mod tests {
         assert_eq!(cert.issued.common_name, "R3");
         assert_eq!(cert.issued.organization, "Let's Encrypt");
         assert_eq!(cert.issued.country_or_region, "US");
-        assert_eq!(cert.hostname, host)
+        assert_eq!(cert.hostname, host);
+
+        assert!(cert.chain.unwrap().len() > 0);
     }
 
     #[test]
