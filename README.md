@@ -34,23 +34,33 @@ sudo install tlschecker /usr/local/bin/tlschecker
 
 ```sh
 ➜  tlschecker --help
-TLS Checker 0.1.9
-Jose Bovet Derpich. <jose.bovet@gmail.com>
+tlschecker 0.1.9
+Jose Bovet Derpich <jose.bovet@gmail.com>
 TLS/SSL certificate expiration date from command-line checker
 
 USAGE:
-    tlschecker [FLAGS] -a <hosts>...
+    tlschecker [FLAGS] -a <addresses>...
 
 FLAGS:
-        --help       Prints help information
-        --json       Prints json output
-    -V, --version    Prints version information
+        --chain      
+            Prints the certificate chain of the peer, if present.
+
+    -h, --help       
+            Prints help information
+
+        --json       
+            Prints json output
+
+    -V, --version    
+            Prints version information
+
 
 OPTIONS:
-    -a <hosts>...     A comma-delimited hosts list to be checked
+    -a <addresses>...        
+            A comma-delimited hosts list to be checked
 ```
 
-## How to use:
+## How to use
 
 ```sh
 ➜ tlschecker -a jpbd.dev expired.badssl.com
@@ -101,32 +111,55 @@ Certificate S/N: 99565320202650452861752791156765321481
 Subject Alternative Names:
 	DNS Name: *.badssl.com
 	DNS Name: badssl.com
-
+	
 ```
 
 ```sh
 ➜ tlschecker --json  -a jpbd.dev
-{
-	"subject": {
-		"country_or_region": "US",
-		"state_or_province": "California",
-		"locality": "San Francisco",
-		"organization_unit": "None",
-		"organization": "Cloudflare, Inc.",
-		"common_name": "sni.cloudflaressl.com"
-	},
-	"issued": {
-		"country_or_region": "US",
-		"organization": "Cloudflare, Inc.",
-		"common_name": "Cloudflare Inc ECC CA-3"
-	},
-	"valid_from": "Aug  2 00:00:00 2021 GMT",
-	"valid_to": "Aug  1 23:59:59 2022 GMT",
-	"validity_days": 263,
-	"is_expired": false,
-	"cert_sn": "2345778240388436345227316531320586380",
-	"cert_ver": "2",
-	"cert_alg": "ecdsa-with-SHA256",
-	"sans": ["sni.cloudflaressl.com", "*.jpbd.dev", "jpbd.dev"]
-}
+[
+  {
+    "hostname": "jpbd.dev",
+    "subject": {
+      "country_or_region": "US",
+      "state_or_province": "California",
+      "locality": "San Francisco",
+      "organization_unit": "None",
+      "organization": "Cloudflare, Inc.",
+      "common_name": "sni.cloudflaressl.com"
+    },
+    "issued": {
+      "country_or_region": "US",
+      "organization": "Cloudflare, Inc.",
+      "common_name": "Cloudflare Inc ECC CA-3"
+    },
+    "valid_from": "Jul  2 00:00:00 2022 GMT",
+    "valid_to": "Jul  2 23:59:59 2023 GMT",
+    "validity_days": 193,
+    "is_expired": false,
+    "cert_sn": "20332696690017175202539153893006852358",
+    "cert_ver": "2",
+    "cert_alg": "ecdsa-with-SHA256",
+    "sans": [
+      "sni.cloudflaressl.com",
+      "jpbd.dev",
+      "*.jpbd.dev"
+    ],
+    "chain": [
+      {
+        "subject": "sni.cloudflaressl.com",
+        "issuer": "Cloudflare Inc ECC CA-3",
+        "valid_from": "Jul  2 00:00:00 2022 GMT",
+        "valid_to": "Jul  2 23:59:59 2023 GMT",
+        "signature_algorithm": "ecdsa-with-SHA256"
+      },
+      {
+        "subject": "Cloudflare Inc ECC CA-3",
+        "issuer": "Baltimore CyberTrust Root",
+        "valid_from": "Jan 27 12:48:08 2020 GMT",
+        "valid_to": "Dec 31 23:59:59 2024 GMT",
+        "signature_algorithm": "sha256WithRSAEncryption"
+      }
+    ]
+  }
+]
 ```
