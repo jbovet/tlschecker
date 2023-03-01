@@ -29,13 +29,13 @@ enum OutFormat {
 }
 
 trait Formatter {
-    fn format(&self, certificates: &Vec<Certificate>);
+    fn format(&self, certificates: &[Certificate]);
 }
 
 struct TextFormat;
 
 impl Formatter for TextFormat {
-    fn format(&self, certificates: &Vec<Certificate>) {
+    fn format(&self, certificates: &[Certificate]) {
         for cert in certificates {
             println!("--------------------------------------");
             println!("Hostname: {}", cert.hostname);
@@ -84,7 +84,7 @@ impl Formatter for TextFormat {
 struct JsonFormat;
 
 impl Formatter for JsonFormat {
-    fn format(&self, certificates: &Vec<Certificate>) {
+    fn format(&self, certificates: &[Certificate]) {
         println!("{}", serde_json::to_string_pretty(&certificates).unwrap());
     }
 }
