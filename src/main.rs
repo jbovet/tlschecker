@@ -9,7 +9,7 @@ use tlschecker::Certificate;
 #[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
-    /// A comma-delimited hosts list to be checked
+    /// A space-delimited hosts list to be checked
     addresses: Vec<String>,
 
     /// Enable verbose to see what is going on
