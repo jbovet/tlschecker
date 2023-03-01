@@ -209,7 +209,7 @@ fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
 }
 
 fn has_expired(not_after: &Asn1TimeRef) -> bool {
-    !(not_after > Asn1Time::days_from_now(0).unwrap())
+    not_after < Asn1Time::days_from_now(0).unwrap()
 }
 
 #[derive(Debug)]
@@ -227,6 +227,7 @@ impl TLSValidationError {
 
 #[cfg(test)]
 mod tests {
+
     use crate::Certificate;
 
     #[test]
