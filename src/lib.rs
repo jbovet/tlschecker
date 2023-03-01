@@ -209,7 +209,7 @@ fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
 }
 
 fn has_expired(not_after: &Asn1TimeRef) -> bool {
-    !(not_after > Asn1Time::days_from_now(0).unwrap())
+    not_after < Asn1Time::days_from_now(0).unwrap()
 }
 
 #[derive(Debug)]
@@ -227,6 +227,7 @@ impl TLSValidationError {
 
 #[cfg(test)]
 mod tests {
+
     use crate::Certificate;
 
     #[test]
@@ -259,11 +260,11 @@ mod tests {
         assert_eq!(cert.subject.organization, "Cloudflare, Inc.");
         assert_eq!(cert.issued.common_name, "Cloudflare Inc ECC CA-3");
         assert!(cert.validity_days > 0);
-        assert!(cert.cert_sn.len() > 0);
+        assert!(!cert.cert_sn.is_empty());
         assert_eq!(cert.cert_ver, "2");
         assert_eq!(cert.sans.len(), 3);
         assert_eq!(cert.hostname, host);
-        assert!(cert.chain.unwrap().len() > 0);
+        assert!(!cert.chain.unwrap().is_empty());
     }
 
     #[test]
@@ -272,36 +273,36 @@ mod tests {
         let cert = Certificate::from(host).unwrap();
         assert_eq!(cert.is_expired, false);
         assert!(cert.validity_days > 0);
-        assert!(cert.sans.len() > 0);
+        assert!(!cert.sans.is_empty());
 
         assert_eq!(cert.subject.country_or_region, "None");
         assert_eq!(cert.subject.state_or_province, "None");
         assert_eq!(cert.subject.locality, "None");
         assert_eq!(cert.subject.organization_unit, "None");
         assert_eq!(cert.subject.organization, "None");
-        assert!(cert.subject.common_name.len() > 0);
+        assert!(!cert.subject.common_name.is_empty());
 
         assert_eq!(cert.issued.common_name, "R3");
         assert_eq!(cert.issued.organization, "Let's Encrypt");
         assert_eq!(cert.issued.country_or_region, "US");
         assert_eq!(cert.hostname, host);
 
-        assert!(cert.chain.unwrap().len() > 0);
+        assert!(!cert.chain.unwrap().is_empty());
     }
 
     #[test]
     fn test_check_resolve_invalid_host() {
         let host = "basdomain.xyz";
-        let result = Certificate::from(host).map_err(|e| e).err();
+        let result = Certificate::from(host).err();
         assert_eq!("couldn't resolve host address.", result.unwrap().details);
     }
 
     #[test]
     fn test_check_tls_connection_refused() {
         let host = "slackware.com";
-        let result = Certificate::from(host).map_err(|e| e).err();
+        let result = Certificate::from(host).err();
         let message = result.unwrap().details;
-        assert!(message.len() > 0);
+        assert!(!message.is_empty());
         println!("{}", message);
     }
 }
