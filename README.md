@@ -57,7 +57,7 @@ FLAGS:
 
 OPTIONS:
     -a <addresses>...        
-            A comma-delimited hosts list to be checked
+            A space-delimited hosts list to be checked
 ```
 
 ## How to use

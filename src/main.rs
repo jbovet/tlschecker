@@ -16,7 +16,7 @@ fn main() {
                 .takes_value(true)
                 .multiple(true)
                 .required(true)
-                .help("A comma-delimited hosts list to be checked"),
+                .help("A space-delimited hosts list to be checked"),
         )
         .arg(
             Arg::with_name("json")
