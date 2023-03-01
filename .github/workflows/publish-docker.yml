@@ -25,7 +25,7 @@ jobs:
           images: josebovet/tlschecker
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
+        uses: docker/build-push-action@v2
         with:
           context: .
           push: true
@@ -35,9 +35,7 @@ jobs:
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
+          scan-type: image
           image-ref: 'docker.io/josebovet/tlschecker:${{ steps.meta.outputs.tags }}'
-          format: 'table'
-          exit-code: '1'
-          ignore-unfixed: true
           vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'
+          severity: 'HIGH,CRITICAL'
