@@ -9,7 +9,7 @@ Rust TLS/SSL certificate expiration date from command-line checker
 [DockerHub](https://hub.docker.com/repository/docker/josebovet/tlschecker)
 
 ```sh
-docker run josebovet/tlschecker:v0.1.9 -h jpbd.dev
+docker run josebovet/tlschecker:v0.1.10 jpbd.dev
 ```
 
 ## Install
@@ -17,7 +17,7 @@ docker run josebovet/tlschecker:v0.1.9 -h jpbd.dev
 Linux
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.9/tlschecker-linux
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.10/tlschecker-linux
 mv tlschecker-linux tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
@@ -25,7 +25,7 @@ sudo install tlschecker /usr/local/bin/tlschecker
 Osx
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.9/tlschecker-macos
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.10/tlschecker-macos
 mv tlschecker-macos tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
@@ -34,37 +34,41 @@ sudo install tlschecker /usr/local/bin/tlschecker
 
 ```sh
 ➜  tlschecker --help
-tlschecker 0.1.9
-Jose Bovet Derpich <jose.bovet@gmail.com>
-TLS/SSL certificate expiration date from command-line checker
+Experimental TLS/SSL certificate checker
 
-USAGE:
-    tlschecker [FLAGS] -a <addresses>...
+Usage: tlschecker [OPTIONS] [ADDRESSES]...
 
-FLAGS:
-        --chain      
-            Prints the certificate chain of the peer, if present.
+Arguments:
+  [ADDRESSES]...
+          A comma-delimited hosts list to be checked
 
-    -h, --help       
-            Prints help information
+Options:
+  -v, --verbose...
+          Enable verbose to see what is going on
 
-        --json       
-            Prints json output
+  -o <OUTPUT>
+          Enable verbose to see what is going on
 
-    -V, --version    
-            Prints version information
+          [default: text]
 
+          Possible values:
+          - json: Enable JSON in the output
+          - text: Enable Text in the output
 
-OPTIONS:
-    -a <addresses>...        
-            A comma-delimited hosts list to be checked
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ## How to use
 
 ```sh
-➜ tlschecker -a jpbd.dev expired.badssl.com
+➜ tlschecker jpbd.dev expired.badssl.com
+➜  ~ tlschecker jpbd.dev expired.badssl.com
 --------------------------------------
+Hostname: jpbd.dev
 Issued domain: sni.cloudflaressl.com
 Subject Name :
 	Country or Region: US
@@ -77,18 +81,32 @@ Issuer Name:
 	Country or Region: US
 	Organization: Cloudflare, Inc.
 	Common Name: Cloudflare Inc ECC CA-3
-Valid from: Aug  2 00:00:00 2021 GMT
-Valid to: Aug  1 23:59:59 2022 GMT
-Days left: 263
+Valid from: Jul  2 00:00:00 2022 GMT
+Valid to: Jul  2 23:59:59 2023 GMT
+Days left: 123
 Expired: false
 Certificate version: 2
 Certificate algorithm: ecdsa-with-SHA256
-Certificate S/N: 2345778240388436345227316531320586380
+Certificate S/N: 20332696690017175202539153893006852358
 Subject Alternative Names:
 	DNS Name: sni.cloudflaressl.com
-	DNS Name: *.jpbd.dev
 	DNS Name: jpbd.dev
+	DNS Name: *.jpbd.dev
+Additional Certificates (if supplied):
+Chain #1
+	Subject: "sni.cloudflaressl.com"
+	Valid from: "Jul  2 00:00:00 2022 GMT"
+	Valid until: "Jul  2 23:59:59 2023 GMT"
+	Issuer: "Cloudflare Inc ECC CA-3"
+	Signature algorithm: "ecdsa-with-SHA256"
+Chain #2
+	Subject: "Cloudflare Inc ECC CA-3"
+	Valid from: "Jan 27 12:48:08 2020 GMT"
+	Valid until: "Dec 31 23:59:59 2024 GMT"
+	Issuer: "Baltimore CyberTrust Root"
+	Signature algorithm: "sha256WithRSAEncryption"
 --------------------------------------
+Hostname: expired.badssl.com
 Issued domain: *.badssl.com
 Subject Name :
 	Country or Region: None
@@ -103,7 +121,7 @@ Issuer Name:
 	Common Name: COMODO RSA Domain Validation Secure Server CA
 Valid from: Apr  9 00:00:00 2015 GMT
 Valid to: Apr 12 23:59:59 2015 GMT
-Days left: -2404
+Days left: -2879
 Expired: true
 Certificate version: 2
 Certificate algorithm: sha256WithRSAEncryption
@@ -111,11 +129,30 @@ Certificate S/N: 99565320202650452861752791156765321481
 Subject Alternative Names:
 	DNS Name: *.badssl.com
 	DNS Name: badssl.com
-	
+Additional Certificates (if supplied):
+Chain #1
+	Subject: "*.badssl.com"
+	Valid from: "Apr  9 00:00:00 2015 GMT"
+	Valid until: "Apr 12 23:59:59 2015 GMT"
+	Issuer: "COMODO RSA Domain Validation Secure Server CA"
+	Signature algorithm: "sha256WithRSAEncryption"
+Chain #2
+	Subject: "COMODO RSA Domain Validation Secure Server CA"
+	Valid from: "Feb 12 00:00:00 2014 GMT"
+	Valid until: "Feb 11 23:59:59 2029 GMT"
+	Issuer: "COMODO RSA Certification Authority"
+	Signature algorithm: "sha384WithRSAEncryption"
+Chain #3
+	Subject: "COMODO RSA Certification Authority"
+	Valid from: "May 30 10:48:38 2000 GMT"
+	Valid until: "May 30 10:48:38 2020 GMT"
+	Issuer: "AddTrust External CA Root"
+	Signature algorithm: "sha384WithRSAEncryption"
+➜  ~
 ```
 
 ```sh
-➜ tlschecker --json  -a jpbd.dev
+➜ tlschecker jpbd.dev -o json
 [
   {
     "hostname": "jpbd.dev",
@@ -134,7 +171,7 @@ Subject Alternative Names:
     },
     "valid_from": "Jul  2 00:00:00 2022 GMT",
     "valid_to": "Jul  2 23:59:59 2023 GMT",
-    "validity_days": 193,
+    "validity_days": 123,
     "is_expired": false,
     "cert_sn": "20332696690017175202539153893006852358",
     "cert_ver": "2",
