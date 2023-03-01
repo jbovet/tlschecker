@@ -1,62 +1,41 @@
-use clap::{App, Arg};
+use clap::{Parser, ValueEnum};
 use std::process::exit;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use tlschecker::Certificate;
 
-fn main() {
-    let matches = App::new("tlschecker")
-        .version(env!("CARGO_PKG_VERSION"))
-        .author(env!("CARGO_PKG_AUTHORS"))
-        .long_about(env!("CARGO_PKG_DESCRIPTION"))
-        .arg(
-            Arg::with_name("addresses")
-                .short("a")
-                .takes_value(true)
-                .multiple(true)
-                .required(true)
-                .help("A comma-delimited hosts list to be checked"),
-        )
-        .arg(
-            Arg::with_name("json")
-                .long("json")
-                .help("Prints json output"),
-        )
-        .arg(
-            Arg::with_name("chain")
-                .long("chain")
-                .help("Prints the certificate chain of the peer, if present."),
-        )
-        .get_matches();
+/// Experimental TLS/SSL certificate checker
+#[derive(Parser)]
+#[command(author, version, about, long_about)]
+struct Args {
+    /// A comma-delimited hosts list to be checked
+    addresses: Vec<String>,
 
-    let (sender, receiver): (Sender<Certificate>, Receiver<Certificate>) = mpsc::channel();
-    let hosts: Vec<String> = matches
-        .values_of("addresses")
-        .unwrap()
-        .map(String::from)
-        .collect();
-    let hosts_len = hosts.len();
-    thread::spawn(move || {
-        for host in hosts {
-            let thread_tx = sender.clone();
-            thread::spawn(move || match Certificate::from(&host) {
-                Ok(cert) => {
-                    thread_tx.send(cert).unwrap();
-                }
-                Err(err) => {
-                    println!("Fail to check host: {}  {} ", &host, &err.details);
-                }
-            });
-        }
-    });
+    /// Enable verbose to see what is going on
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
 
-    let mut certificates: Vec<Certificate> = Vec::with_capacity(hosts_len);
-    for cert in receiver {
-        certificates.push(cert);
-    }
+    /// Enable verbose to see what is going on
+    #[arg(short, value_enum, default_value_t=OutFormat::Text)]
+    output: OutFormat,
+}
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum OutFormat {
+    /// Enable JSON in the output
+    Json,
+    /// Enable Text in the output
+    Text,
+}
 
-    if !matches.is_present("json") {
+trait Formatter {
+    fn format(&self, certificates: &Vec<Certificate>);
+}
+
+struct TextFormat;
+
+impl Formatter for TextFormat {
+    fn format(&self, certificates: &Vec<Certificate>) {
         for cert in certificates {
             println!("--------------------------------------");
             println!("Hostname: {}", cert.hostname);
@@ -80,29 +59,77 @@ fn main() {
             println!("Certificate algorithm: {}", cert.cert_alg);
             println!("Certificate S/N: {}", cert.cert_sn);
             println!("Subject Alternative Names:");
-            for san in cert.sans {
+            for san in &cert.sans {
                 println!("\tDNS Name: {}", san);
             }
-            if matches.is_present("chain") {
-                match cert.chain {
-                    Some(chains) => {
-                        println!("Additional Certificates (if supplied):");
-                        for (i, c) in chains.iter().enumerate() {
-                            println!("Chain #{:?}", i + 1);
-                            println!("\tSubject: {:?}", c.subject);
-                            println!("\tValid from: {:?}", c.valid_from);
-                            println!("\tValid until: {:?}", c.valid_to);
-                            println!("\tIssuer: {:?}", c.issuer);
-                            println!("\tSignature algorithm: {:?}", c.signature_algorithm);
-                        }
+
+            match &cert.chain {
+                Some(chains) => {
+                    println!("Additional Certificates (if supplied):");
+                    for (i, c) in chains.iter().enumerate() {
+                        println!("Chain #{:?}", i + 1);
+                        println!("\tSubject: {:?}", c.subject);
+                        println!("\tValid from: {:?}", c.valid_from);
+                        println!("\tValid until: {:?}", c.valid_to);
+                        println!("\tIssuer: {:?}", c.issuer);
+                        println!("\tSignature algorithm: {:?}", c.signature_algorithm);
                     }
-                    None => todo!(),
                 }
+                None => todo!(),
             }
         }
-    } else {
+    }
+}
+
+struct JsonFormat;
+
+impl Formatter for JsonFormat {
+    fn format(&self, certificates: &Vec<Certificate>) {
         println!("{}", serde_json::to_string_pretty(&certificates).unwrap());
     }
+}
 
+struct FormatterFactory;
+
+impl FormatterFactory {
+    fn new_formatter(s: &OutFormat) -> Box<dyn Formatter> {
+        match s {
+            OutFormat::Json => Box::new(JsonFormat {}),
+            OutFormat::Text => Box::new(TextFormat {}),
+        }
+    }
+}
+
+fn main() {
+    let cli = Args::parse();
+
+    let formatter = match cli.output {
+        OutFormat::Json => FormatterFactory::new_formatter(&OutFormat::Json),
+        OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
+    };
+
+    let (sender, receiver): (Sender<Certificate>, Receiver<Certificate>) = mpsc::channel();
+    let hosts: Vec<String> = cli.addresses.iter().map(String::from).collect();
+    let hosts_len = hosts.len();
+    thread::spawn(move || {
+        for host in hosts {
+            let thread_tx = sender.clone();
+            thread::spawn(move || match Certificate::from(&host) {
+                Ok(cert) => {
+                    thread_tx.send(cert).unwrap();
+                }
+                Err(err) => {
+                    println!("Fail to check host: {}  {} ", &host, &err.details);
+                }
+            });
+        }
+    });
+
+    let mut certificates: Vec<Certificate> = Vec::with_capacity(hosts_len);
+    for cert in receiver {
+        certificates.push(cert);
+    }
+
+    formatter.format(&certificates);
     exit(0);
 }
