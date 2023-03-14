@@ -1,6 +1,6 @@
 # TLSChecker
 
-Rust TLS/SSL certificate expiration date from command-line checker
+Experimental TLS/SSL certificate command-line checker
 
 [![codecov](https://codecov.io/gh/jbovet/tlschecker/branch/main/graph/badge.svg?token=MN4EE3WYQ6)](https://codecov.io/gh/jbovet/tlschecker)
 
