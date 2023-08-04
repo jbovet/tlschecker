@@ -1,14 +1,16 @@
 use openssl::asn1::{Asn1Time, Asn1TimeRef};
+use openssl::error::ErrorStack;
 use openssl::nid::Nid;
-use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
+use openssl::ssl::{HandshakeError, Ssl, SslContext, SslMethod, SslVerifyMode};
 use openssl::x509::{X509NameEntries, X509};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::io::Error;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::ops::Deref;
 use std::time::Duration;
 
-static TIMEOUT: u64 = 30;
+static TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize)]
 pub struct Chain {
@@ -54,71 +56,56 @@ pub struct Subject {
 
 impl Certificate {
     pub fn from(host: &str) -> Result<Certificate, TLSValidationError> {
-        let mut context = SslContext::builder(SslMethod::tls()).unwrap();
+        let mut context = SslContext::builder(SslMethod::tls())?;
         context.set_verify(SslVerifyMode::empty());
         let context_builder = context.build();
 
-        let mut connector = Ssl::new(&context_builder).unwrap();
-        connector.set_hostname(host).unwrap();
+        let mut connector = Ssl::new(&context_builder)?;
+        connector.set_hostname(host)?;
         let remote = format!("{}:443", host);
-        match remote.to_socket_addrs() {
-            Ok(mut address) => {
-                let socket_addr = address.next().unwrap();
-                let tcp_stream =
-                    match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(TIMEOUT)) {
-                        Ok(tcp_stream) => tcp_stream,
-                        Err(err) => {
-                            return Err(TLSValidationError::new(&err.to_string()));
-                        }
-                    };
-                tcp_stream
-                    .set_read_timeout(Some(Duration::from_secs(TIMEOUT)))
-                    .unwrap();
 
-                let stream = connector
-                    .connect(tcp_stream)
-                    .map_err(|e| TLSValidationError::new(&e.to_string()))?;
+        let mut address = remote.to_socket_addrs()?;
 
-                let chains = stream
-                    .ssl()
-                    .peer_cert_chain()
-                    .ok_or("peer certificate chain not found")
-                    .unwrap();
-                let mut peer_cert_chain: Vec<Chain> = Vec::new();
-                for chain in chains {
-                    peer_cert_chain.push(Chain {
-                        subject: from_entries(chain.subject_name().entries_by_nid(Nid::COMMONNAME)),
-                        valid_to: chain.not_after().to_string(),
-                        valid_from: chain.not_before().to_string(),
-                        issuer: from_entries(chain.issuer_name().entries_by_nid(Nid::COMMONNAME)),
-                        signature_algorithm: chain.signature_algorithm().object().to_string(),
-                    });
-                }
+        let socket_addr = address.next().unwrap();
+        let tcp_stream = TcpStream::connect_timeout(&socket_addr, TIMEOUT)?;
 
-                let x509_ref = stream
-                    .ssl()
-                    .peer_certificate()
-                    .ok_or("Certificate not found")
-                    .unwrap();
-                let data = get_certificate_info(&x509_ref);
-                let certificate = Certificate {
-                    hostname: host.to_string(),
-                    subject: data.subject,
-                    issued: data.issued,
-                    valid_from: data.valid_from,
-                    valid_to: data.valid_to,
-                    validity_days: data.validity_days,
-                    is_expired: data.is_expired,
-                    cert_sn: data.cert_sn,
-                    cert_ver: data.cert_ver,
-                    cert_alg: data.cert_alg,
-                    sans: data.sans,
-                    chain: Some(peer_cert_chain),
-                };
-                Ok(certificate)
-            }
-            Err(_) => Err(TLSValidationError::new("couldn't resolve host address.")),
-        }
+        tcp_stream.set_read_timeout(Some(TIMEOUT))?;
+        let stream = connector.connect(tcp_stream)?;
+
+        // `Ssl` object associated with this stream
+        let ssl = stream.ssl();
+
+        let peer_cert_chain = ssl
+            .peer_cert_chain()
+            .ok_or("Peer certificate chain not found")?
+            .iter()
+            .map(|chain| Chain {
+                subject: from_entries(chain.subject_name().entries_by_nid(Nid::COMMONNAME)),
+                valid_to: chain.not_after().to_string(),
+                valid_from: chain.not_before().to_string(),
+                issuer: from_entries(chain.issuer_name().entries_by_nid(Nid::COMMONNAME)),
+                signature_algorithm: chain.signature_algorithm().object().to_string(),
+            })
+            .collect::<Vec<Chain>>();
+
+        let x509_ref = ssl.peer_certificate().ok_or("Certificate not found")?;
+
+        let data = get_certificate_info(&x509_ref);
+        let certificate = Certificate {
+            hostname: host.to_string(),
+            subject: data.subject,
+            issued: data.issued,
+            valid_from: data.valid_from,
+            valid_to: data.valid_to,
+            validity_days: data.validity_days,
+            is_expired: data.is_expired,
+            cert_sn: data.cert_sn,
+            cert_ver: data.cert_ver,
+            cert_alg: data.cert_alg,
+            sans: data.sans,
+            chain: Some(peer_cert_chain),
+        };
+        Ok(certificate)
     }
 }
 
@@ -225,6 +212,30 @@ impl TLSValidationError {
     }
 }
 
+impl From<Error> for TLSValidationError {
+    fn from(e: Error) -> TLSValidationError {
+        return TLSValidationError::new(&e.to_string());
+    }
+}
+
+impl From<&str> for TLSValidationError {
+    fn from(e: &str) -> TLSValidationError {
+        return TLSValidationError::new(e);
+    }
+}
+
+impl From<ErrorStack> for TLSValidationError {
+    fn from(e: ErrorStack) -> TLSValidationError {
+        return TLSValidationError::new(&e.to_string());
+    }
+}
+
+impl<S> From<HandshakeError<S>> for TLSValidationError {
+    fn from(_: HandshakeError<S>) -> TLSValidationError {
+        return TLSValidationError::new("TLS handshake failed.");
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -294,7 +305,10 @@ mod tests {
     fn test_check_resolve_invalid_host() {
         let host = "basdomain.xyz";
         let result = Certificate::from(host).err();
-        assert_eq!("couldn't resolve host address.", result.unwrap().details);
+        assert_eq!(
+            "failed to lookup address information: nodename nor servname provided, or not known",
+            result.unwrap().details
+        );
     }
 
     #[test]
