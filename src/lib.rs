@@ -255,14 +255,14 @@ mod tests {
         let cert = Certificate::from(host).unwrap();
         println!("Expired: {}", cert.is_expired);
         assert_eq!(cert.is_expired, false);
-        assert_eq!(cert.cert_alg, "ecdsa-with-SHA256");
-        assert_eq!(cert.subject.common_name, "sni.cloudflaressl.com");
-        assert_eq!(cert.subject.organization, "Cloudflare, Inc.");
-        assert_eq!(cert.issued.common_name, "Cloudflare Inc ECC CA-3");
+        assert_eq!(cert.cert_alg, "ecdsa-with-SHA384");
+        assert_eq!(cert.subject.common_name, host);
+        assert_eq!(cert.subject.organization, "None");
+        assert_eq!(cert.issued.common_name, "E1");
         assert!(cert.validity_days > 0);
         assert!(!cert.cert_sn.is_empty());
         assert_eq!(cert.cert_ver, "2");
-        assert_eq!(cert.sans.len(), 3);
+        assert_eq!(cert.sans.len(), 2);
         assert_eq!(cert.hostname, host);
         assert!(!cert.chain.unwrap().is_empty());
     }
