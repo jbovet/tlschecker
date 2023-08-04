@@ -77,7 +77,7 @@ impl Certificate {
 
                 let stream = connector
                     .connect(tcp_stream)
-                    .expect("TLS handshake failed.");
+                    .map_err(|e| TLSValidationError::new(&e.to_string()))?;
 
                 let chains = stream
                     .ssl()
