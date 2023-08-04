@@ -214,25 +214,25 @@ impl TLSValidationError {
 
 impl From<Error> for TLSValidationError {
     fn from(e: Error) -> TLSValidationError {
-        return TLSValidationError::new(&e.to_string());
+        TLSValidationError::new(&e.to_string())
     }
 }
 
 impl From<&str> for TLSValidationError {
     fn from(e: &str) -> TLSValidationError {
-        return TLSValidationError::new(e);
+        TLSValidationError::new(e)
     }
 }
 
 impl From<ErrorStack> for TLSValidationError {
     fn from(e: ErrorStack) -> TLSValidationError {
-        return TLSValidationError::new(&e.to_string());
+        TLSValidationError::new(&e.to_string())
     }
 }
 
 impl<S> From<HandshakeError<S>> for TLSValidationError {
     fn from(_: HandshakeError<S>) -> TLSValidationError {
-        return TLSValidationError::new("TLS handshake failed.");
+        TLSValidationError::new("TLS handshake failed.")
     }
 }
 
