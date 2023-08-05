@@ -63,7 +63,7 @@ impl Certificate {
         let mut connector = Ssl::new(&context_builder)?;
         connector.set_hostname(host)?;
 
-        let remote = format!("{}:443", host);
+        let remote = format!("{host}:443");
         let socket_addr = remote
             .to_socket_addrs()?
             .next()
