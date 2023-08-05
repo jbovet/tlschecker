@@ -119,46 +119,36 @@ fn from_entries(mut entries: X509NameEntries) -> String {
 }
 
 fn get_subject(cert_ref: &X509) -> Subject {
-    let subject_country_region =
-        from_entries(cert_ref.subject_name().entries_by_nid(Nid::COUNTRYNAME));
-    let subject_state_province = from_entries(
-        cert_ref
-            .subject_name()
-            .entries_by_nid(Nid::STATEORPROVINCENAME),
-    );
-    let subject_locality = from_entries(cert_ref.subject_name().entries_by_nid(Nid::LOCALITYNAME));
-    let subject_organization_unit = from_entries(
-        cert_ref
-            .subject_name()
-            .entries_by_nid(Nid::ORGANIZATIONALUNITNAME),
-    );
-    let subject_common_name = from_entries(cert_ref.subject_name().entries_by_nid(Nid::COMMONNAME));
-    let organization_name = from_entries(
-        cert_ref
-            .subject_name()
-            .entries_by_nid(Nid::ORGANIZATIONNAME),
-    );
+    let subject = cert_ref.subject_name();
+
+    let country_region = from_entries(subject.entries_by_nid(Nid::COUNTRYNAME));
+    let state_province = from_entries(subject.entries_by_nid(Nid::STATEORPROVINCENAME));
+    let locality = from_entries(subject.entries_by_nid(Nid::LOCALITYNAME));
+    let organization_unit = from_entries(subject.entries_by_nid(Nid::ORGANIZATIONALUNITNAME));
+    let common_name = from_entries(subject.entries_by_nid(Nid::COMMONNAME));
+    let organization_name = from_entries(subject.entries_by_nid(Nid::ORGANIZATIONNAME));
 
     Subject {
-        country_or_region: subject_country_region,
-        state_or_province: subject_state_province,
-        locality: subject_locality,
-        organization_unit: subject_organization_unit,
+        country_or_region: country_region,
+        state_or_province: state_province,
+        locality: locality,
+        organization_unit: organization_unit,
         organization: organization_name,
-        common_name: subject_common_name,
+        common_name: common_name,
     }
 }
 
 fn get_issuer(cert_ref: &X509) -> Issuer {
-    let issuer_common_name = from_entries(cert_ref.issuer_name().entries_by_nid(Nid::COMMONNAME));
-    let issuer_organization_name =
-        from_entries(cert_ref.issuer_name().entries_by_nid(Nid::ORGANIZATIONNAME));
-    let issuer_country_region =
-        from_entries(cert_ref.issuer_name().entries_by_nid(Nid::COUNTRYNAME));
+    let issuer = cert_ref.issuer_name();
+
+    let common_name = from_entries(issuer.entries_by_nid(Nid::COMMONNAME));
+    let organization_name = from_entries(issuer.entries_by_nid(Nid::ORGANIZATIONNAME));
+    let country_region = from_entries(issuer.entries_by_nid(Nid::COUNTRYNAME));
+
     Issuer {
-        country_or_region: issuer_country_region,
-        organization: issuer_organization_name,
-        common_name: issuer_common_name,
+        country_or_region: country_region,
+        organization: organization_name,
+        common_name: common_name,
     }
 }
 
