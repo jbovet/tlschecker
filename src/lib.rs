@@ -62,11 +62,13 @@ impl Certificate {
 
         let mut connector = Ssl::new(&context_builder)?;
         connector.set_hostname(host)?;
+
         let remote = format!("{}:443", host);
+        let socket_addr = remote
+            .to_socket_addrs()?
+            .next()
+            .ok_or("Failed parse remote hostname")?;
 
-        let mut address = remote.to_socket_addrs()?;
-
-        let socket_addr = address.next().unwrap();
         let tcp_stream = TcpStream::connect_timeout(&socket_addr, TIMEOUT)?;
 
         tcp_stream.set_read_timeout(Some(TIMEOUT))?;
