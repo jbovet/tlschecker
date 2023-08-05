@@ -121,20 +121,20 @@ fn from_entries(mut entries: X509NameEntries) -> String {
 fn get_subject(cert_ref: &X509) -> Subject {
     let subject = cert_ref.subject_name();
 
-    let country_region = from_entries(subject.entries_by_nid(Nid::COUNTRYNAME));
-    let state_province = from_entries(subject.entries_by_nid(Nid::STATEORPROVINCENAME));
+    let country_or_region = from_entries(subject.entries_by_nid(Nid::COUNTRYNAME));
+    let state_or_province = from_entries(subject.entries_by_nid(Nid::STATEORPROVINCENAME));
     let locality = from_entries(subject.entries_by_nid(Nid::LOCALITYNAME));
     let organization_unit = from_entries(subject.entries_by_nid(Nid::ORGANIZATIONALUNITNAME));
     let common_name = from_entries(subject.entries_by_nid(Nid::COMMONNAME));
-    let organization_name = from_entries(subject.entries_by_nid(Nid::ORGANIZATIONNAME));
+    let organization = from_entries(subject.entries_by_nid(Nid::ORGANIZATIONNAME));
 
     Subject {
-        country_or_region: country_region,
-        state_or_province: state_province,
-        locality: locality,
-        organization_unit: organization_unit,
-        organization: organization_name,
-        common_name: common_name,
+        country_or_region,
+        state_or_province,
+        locality,
+        organization_unit,
+        organization,
+        common_name,
     }
 }
 
@@ -142,13 +142,13 @@ fn get_issuer(cert_ref: &X509) -> Issuer {
     let issuer = cert_ref.issuer_name();
 
     let common_name = from_entries(issuer.entries_by_nid(Nid::COMMONNAME));
-    let organization_name = from_entries(issuer.entries_by_nid(Nid::ORGANIZATIONNAME));
-    let country_region = from_entries(issuer.entries_by_nid(Nid::COUNTRYNAME));
+    let organization = from_entries(issuer.entries_by_nid(Nid::ORGANIZATIONNAME));
+    let country_or_region = from_entries(issuer.entries_by_nid(Nid::COUNTRYNAME));
 
     Issuer {
-        country_or_region: country_region,
-        organization: organization_name,
-        common_name: common_name,
+        country_or_region,
+        organization,
+        common_name,
     }
 }
 
