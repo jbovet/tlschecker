@@ -238,7 +238,7 @@ mod tests {
         let host = "expired.badssl.com";
         let cert = Certificate::from(host).unwrap();
         println!("Expired: {}", cert.is_expired);
-        assert_eq!(cert.is_expired, true);
+        assert!(cert.is_expired);
         assert_eq!(cert.cert_alg, "sha256WithRSAEncryption");
         assert_eq!(cert.subject.common_name, "*.badssl.com");
         assert_eq!(cert.subject.organization, "None");
@@ -257,7 +257,7 @@ mod tests {
         let host = "jpbd.dev";
         let cert = Certificate::from(host).unwrap();
         println!("Expired: {}", cert.is_expired);
-        assert_eq!(cert.is_expired, false);
+        assert!(!cert.is_expired);
         assert_eq!(cert.cert_alg, "ecdsa-with-SHA384");
         assert_eq!(cert.subject.common_name, host);
         assert_eq!(cert.subject.organization, "None");
@@ -274,7 +274,7 @@ mod tests {
     fn test_check_tls_for_valid_host_without_sans() {
         let host = "acme-staging-v02.api.letsencrypt.org";
         let cert = Certificate::from(host).unwrap();
-        assert_eq!(cert.is_expired, false);
+        assert!(!cert.is_expired);
         assert!(cert.validity_days > 0);
         assert!(!cert.sans.is_empty());
 
