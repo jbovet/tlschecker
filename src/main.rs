@@ -1,5 +1,4 @@
 use clap::{Parser, ValueEnum};
-use std::process::exit;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
@@ -13,12 +12,12 @@ struct Args {
     addresses: Vec<String>,
 
     /// Enable verbose to see what is going on
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    verbose: u8,
-
-    /// Enable verbose to see what is going on
     #[arg(short, value_enum, default_value_t=OutFormat::Text)]
     output: OutFormat,
+
+    /// Exits with code 0 even when certificate expired is detected
+    #[arg(long, default_value_t = 0)]
+    exit_code: i32,
 }
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum OutFormat {
@@ -102,11 +101,8 @@ impl FormatterFactory {
 
 fn main() {
     let cli = Args::parse();
-
-    let formatter = match cli.output {
-        OutFormat::Json => FormatterFactory::new_formatter(&OutFormat::Json),
-        OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
-    };
+    let exit_code = cli.exit_code;
+    let mut failed_result = false;
 
     let (sender, receiver): (Sender<Certificate>, Receiver<Certificate>) = mpsc::channel();
     let hosts: Vec<String> = cli.addresses.iter().map(String::from).collect();
@@ -126,10 +122,32 @@ fn main() {
     });
 
     let mut certificates: Vec<Certificate> = Vec::with_capacity(hosts_len);
+
     for cert in receiver {
         certificates.push(cert);
     }
 
+    let expired_certs = &certificates
+        .clone()
+        .into_iter()
+        .filter(|c| c.is_expired)
+        .collect::<Vec<_>>();
+
+    let formatter = match cli.output {
+        OutFormat::Json => FormatterFactory::new_formatter(&OutFormat::Json),
+        OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
+    };
     formatter.format(&certificates);
-    exit(0);
+
+    if !expired_certs.is_empty() {
+        failed_result = true;
+    }
+
+    exit(exit_code, failed_result);
+}
+
+fn exit(exit_code: i32, failed_result: bool) {
+    if exit_code != 0 && failed_result {
+        std::process::exit(exit_code)
+    }
 }

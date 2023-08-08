@@ -12,7 +12,7 @@ use std::time::Duration;
 
 static TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Chain {
     pub subject: String,
     pub issuer: String,
@@ -21,7 +21,7 @@ pub struct Chain {
     pub signature_algorithm: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Certificate {
     pub hostname: String,
     pub subject: Subject,
@@ -37,14 +37,14 @@ pub struct Certificate {
     pub chain: Option<Vec<Chain>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Issuer {
     pub country_or_region: String,
     pub organization: String,
     pub common_name: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Subject {
     pub country_or_region: String,
     pub state_or_province: String,
