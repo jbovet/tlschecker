@@ -297,10 +297,10 @@ mod tests {
     fn test_check_resolve_invalid_host() {
         let host = "basdomain.xyz";
         let result = Certificate::from(host).err();
-        assert_eq!(
-            "failed to lookup address information: nodename nor servname provided, or not known",
-            result.unwrap().details
-        );
+        assert!(result
+            .unwrap()
+            .details
+            .contains("failed to lookup address information"));
     }
 
     #[test]
