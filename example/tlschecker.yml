@@ -1,0 +1,29 @@
+# apiVersion: batch/v1
+# kind: Job
+# metadata:
+#   name: tlschecker
+# spec:
+#   template:
+#     spec:
+#       containers:
+#         - name: tlschecker
+#           image: josebovet/tlschecker:v0.1.13
+#           args: ["expired.badssl.com", "-o", "json", "--exit-code", "1"]
+#       restartPolicy: Never
+# ---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tlschecker
+spec:
+  schedule: "0 0 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: tlschecker
+              image: josebovet/tlschecker:v0.1.13
+              imagePullPolicy: IfNotPresent
+              args: ["expired.badssl.com", "-o", "json", "--exit-code", "1"]
+          restartPolicy: OnFailure
