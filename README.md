@@ -9,7 +9,7 @@ Experimental TLS/SSL certificate command-line checker
 [DockerHub](https://hub.docker.com/repository/docker/josebovet/tlschecker)
 
 ```sh
-docker run josebovet/tlschecker:v0.1.12 jpbd.dev
+docker run josebovet/tlschecker:v0.1.13 jpbd.dev
 ```
 
 ## Install
@@ -17,7 +17,7 @@ docker run josebovet/tlschecker:v0.1.12 jpbd.dev
 Linux
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.12/tlschecker-linux
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.13/tlschecker-linux
 mv tlschecker-linux tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
@@ -25,7 +25,7 @@ sudo install tlschecker /usr/local/bin/tlschecker
 Osx
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.12/tlschecker-macos
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.13/tlschecker-macos
 mv tlschecker-macos tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
@@ -43,9 +43,6 @@ Arguments:
           A space-delimited hosts list to be checked
 
 Options:
-  -v, --verbose...
-          Enable verbose to see what is going on
-
   -o <OUTPUT>
           Enable verbose to see what is going on
 
@@ -54,6 +51,11 @@ Options:
           Possible values:
           - json: Enable JSON in the output
           - text: Enable Text in the output
+
+      --exit-code <EXIT_CODE>
+          Exits with code 0 even when certificate expired is detected
+
+          [default: 0]
 
   -h, --help
           Print help (see a summary with '-h')

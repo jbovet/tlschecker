@@ -1,6 +1,6 @@
 [package]
 name = "tlschecker"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2018"
 description = "Experimental TLS/SSL certificate checker from command line"
 authors = ["Jose Bovet Derpich <jose.bovet@gmail.com>"]
