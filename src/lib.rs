@@ -1,14 +1,15 @@
+use std::fmt::Debug;
+use std::io::Error;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::ops::Deref;
+use std::time::Duration;
+
 use openssl::asn1::{Asn1Time, Asn1TimeRef};
 use openssl::error::ErrorStack;
 use openssl::nid::Nid;
 use openssl::ssl::{HandshakeError, Ssl, SslContext, SslMethod, SslVerifyMode};
 use openssl::x509::{X509NameEntries, X509};
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
-use std::io::Error;
-use std::net::{TcpStream, ToSocketAddrs};
-use std::ops::Deref;
-use std::time::Duration;
 
 static TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -29,6 +30,7 @@ pub struct Certificate {
     pub valid_from: String,
     pub valid_to: String,
     pub validity_days: i32,
+    pub validity_hours: i32,
     pub is_expired: bool,
     pub cert_sn: String,
     pub cert_ver: String,
@@ -100,6 +102,7 @@ impl Certificate {
             valid_from: data.valid_from,
             valid_to: data.valid_to,
             validity_days: data.validity_days,
+            validity_hours: data.validity_hours,
             is_expired: data.is_expired,
             cert_sn: data.cert_sn,
             cert_ver: data.cert_ver,
@@ -169,6 +172,7 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
         valid_from: cert_ref.not_before().to_string(),
         valid_to: cert_ref.not_after().to_string(),
         validity_days: get_validity_days(cert_ref.not_after()),
+        validity_hours: get_validity_in_hours(cert_ref.not_after()),
         is_expired: has_expired(cert_ref.not_after()),
         cert_sn: cert_ref.serial_number().to_bn().unwrap().to_string(),
         cert_ver: cert_ref.version().to_string(),
@@ -176,6 +180,10 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
         sans,
         chain: None,
     };
+}
+
+fn get_validity_in_hours(not_after: &Asn1TimeRef) -> i32 {
+    get_validity_days(not_after) * 24
 }
 
 fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
@@ -230,7 +238,6 @@ impl<S> From<HandshakeError<S>> for TLSValidationError {
 
 #[cfg(test)]
 mod tests {
-
     use crate::Certificate;
 
     #[test]
