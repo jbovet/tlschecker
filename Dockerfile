@@ -18,7 +18,7 @@ RUN rm ./target/release/deps/tlschecker*
 RUN cargo build --release
 
 # base
-FROM rust:1.71.1-slim-buster
+FROM rust:1.71.1-bullseye
 
 # copy the build artifact from the build stage
 COPY --from=build /tlschecker/target/release/tlschecker .
