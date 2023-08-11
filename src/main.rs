@@ -14,6 +14,7 @@ use tlschecker::Certificate;
 #[command(author, version, about, long_about)]
 struct Args {
     /// A space-delimited hosts list to be checked
+    #[clap(value_parser, required = true)]
     addresses: Vec<String>,
 
     /// Enable verbose to see what is going on
