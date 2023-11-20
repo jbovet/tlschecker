@@ -26,6 +26,14 @@ struct Args {
     exit_code: i32,
 }
 
+/// Output format
+/// Json, Text, Summary
+/// Default is Summary
+/// Json: Output as JSON format
+/// Text: Output as text format
+/// Summary: Output as summary format
+/// Summary format is a table with the following columns:
+/// Host, Expired, Status, Days before expired, Hours before expired
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum OutFormat {
     /// Enable JSON in the output
@@ -36,16 +44,21 @@ enum OutFormat {
     Summary,
 }
 
+/// Output Formatter trait
 trait Formatter {
     fn format(&self, certificates: &[Certificate]);
 }
 
+/// Text format
 struct TextFormat;
 
+/// JSON format
 struct JsonFormat;
 
+/// Summary format
 struct SummaryFormat;
 
+/// Implement Formatter trait for TextFormat
 impl Formatter for TextFormat {
     fn format(&self, certificates: &[Certificate]) {
         for cert in certificates {
@@ -94,6 +107,7 @@ impl Formatter for TextFormat {
     }
 }
 
+/// Implement Formatter trait for SummaryFormat
 impl Formatter for SummaryFormat {
     fn format(&self, certificates: &[Certificate]) {
         let mut table = Table::new();
@@ -143,14 +157,20 @@ impl Formatter for SummaryFormat {
     }
 }
 
+/// Implement Formatter trait for JsonFormat
 impl Formatter for JsonFormat {
     fn format(&self, certificates: &[Certificate]) {
-        println!("{}", serde_json::to_string_pretty(&certificates).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&certificates)
+                .expect("Failed to format certificates as JSON")
+        );
     }
 }
-
+/// FormatterFactory
 struct FormatterFactory;
 
+/// FormatterFactory implementation
 impl FormatterFactory {
     fn new_formatter(s: &OutFormat) -> Box<dyn Formatter> {
         match s {
@@ -161,6 +181,7 @@ impl FormatterFactory {
     }
 }
 
+/// Main function
 fn main() {
     let cli = Args::parse();
     let exit_code = cli.exit_code;

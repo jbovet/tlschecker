@@ -11,8 +11,10 @@ use openssl::ssl::{HandshakeError, Ssl, SslContext, SslMethod, SslVerifyMode};
 use openssl::x509::{X509NameEntries, X509};
 use serde::{Deserialize, Serialize};
 
+/// Timeout for TLS connection
 static TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Certificate Chain
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Chain {
     pub subject: String,
@@ -22,6 +24,7 @@ pub struct Chain {
     pub signature_algorithm: String,
 }
 
+/// Certificate
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Certificate {
     pub hostname: String,
@@ -38,7 +41,7 @@ pub struct Certificate {
     pub sans: Vec<String>,
     pub chain: Option<Vec<Chain>>,
 }
-
+/// Issuer
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Issuer {
     pub country_or_region: String,
@@ -46,6 +49,7 @@ pub struct Issuer {
     pub common_name: String,
 }
 
+/// Subject
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Subject {
     pub country_or_region: String,
@@ -56,6 +60,7 @@ pub struct Subject {
     pub common_name: String,
 }
 
+/// Certificate trait
 impl Certificate {
     pub fn from(host: &str) -> Result<Certificate, TLSValidationError> {
         let mut context = SslContext::builder(SslMethod::tls())?;
@@ -113,14 +118,18 @@ impl Certificate {
         Ok(certificate)
     }
 }
-
+/// get x509 name entries
 fn from_entries(mut entries: X509NameEntries) -> String {
     match entries.next() {
         None => "None".to_string(),
-        Some(x509_name_ref) => x509_name_ref.data().as_utf8().unwrap().to_string(),
+        Some(x509_name_ref) => x509_name_ref
+            .data()
+            .as_utf8()
+            .expect("Failed to convert data to UTF-8")
+            .to_string(),
     }
 }
-
+/// get subject from certificate
 fn get_subject(cert_ref: &X509) -> Subject {
     let subject = cert_ref.subject_name();
 
@@ -141,6 +150,7 @@ fn get_subject(cert_ref: &X509) -> Subject {
     }
 }
 
+/// get issuer from certificate
 fn get_issuer(cert_ref: &X509) -> Issuer {
     let issuer = cert_ref.issuer_name();
 
@@ -155,6 +165,7 @@ fn get_issuer(cert_ref: &X509) -> Issuer {
     }
 }
 
+/// get certificate info
 fn get_certificate_info(cert_ref: &X509) -> Certificate {
     let mut sans = Vec::new();
     match cert_ref.subject_alt_names() {
@@ -182,10 +193,12 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
     };
 }
 
+/// get validity in hours
 fn get_validity_in_hours(not_after: &Asn1TimeRef) -> i32 {
     get_validity_days(not_after) * 24
 }
 
+/// get validity in days
 fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
     return Asn1Time::days_from_now(0)
         .unwrap()
@@ -195,6 +208,7 @@ fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
         .days;
 }
 
+/// check if certificate has expired
 fn has_expired(not_after: &Asn1TimeRef) -> bool {
     not_after < Asn1Time::days_from_now(0).unwrap()
 }

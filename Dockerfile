@@ -1,4 +1,4 @@
-FROM rust:1.71.1 as build
+FROM rust:1.74 as build
 LABEL maintainer="jose.bovet@gmail.com"
 
 RUN cargo new --bin tlschecker
@@ -18,7 +18,7 @@ RUN rm ./target/release/deps/tlschecker*
 RUN cargo build --release
 
 # base
-FROM rust:1.71.1-bullseye
+FROM rust:1.74-bullseye
 
 # copy the build artifact from the build stage
 COPY --from=build /tlschecker/target/release/tlschecker .
