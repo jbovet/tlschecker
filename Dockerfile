@@ -1,4 +1,4 @@
-FROM rust:1.74 as build
+FROM rust:bookworm as build
 LABEL maintainer="jose.bovet@gmail.com"
 
 RUN cargo new --bin tlschecker
@@ -18,7 +18,11 @@ RUN rm ./target/release/deps/tlschecker*
 RUN cargo build --release
 
 # base
-FROM rust:1.74-bullseye
+FROM debian:bookworm-slim
+
+# install libssl
+RUN apt update && apt upgrade -y && \
+    apt install pkg-config libssl-dev -y
 
 # copy the build artifact from the build stage
 COPY --from=build /tlschecker/target/release/tlschecker .
