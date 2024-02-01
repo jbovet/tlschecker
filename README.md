@@ -34,48 +34,15 @@ sudo install tlschecker /usr/local/bin/tlschecker
 
 ```sh
 ➜  tlschecker --help
-Experimental TLS/SSL certificate checker
-
-Usage: tlschecker [OPTIONS] [ADDRESSES]...
-
-Arguments:
-  [ADDRESSES]...
-          A space-delimited hosts list to be checked
-
-Options:
-  -o <OUTPUT>
-          Enable verbose to see what is going on
-
-          [default: summary]
-
-          Possible values:
-          - json:    Enable JSON in the output
-          - text:    Enable Text in the output
-          - summary: Summary by default
-
-      --exit-code <EXIT_CODE>
-          Exits with code 0 even when certificate expired is detected
-
-          [default: 0]
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
 ```
+![](/img/1-1.png)
 
 ## Examples
 
 ```sh
 ➜ tlschecker jpbd.dev expired.badssl.com
-┌────────────────────┬─────────┬────────┬─────────────────────┬──────────────────────┐
-│ Host               ┆ Expired ┆ Status ┆ Days before expired ┆ Hours before expired │
-╞════════════════════╪═════════╪════════╪═════════════════════╪══════════════════════╡
-│ jpbd.dev           ┆  false  ┆   OK   ┆          79         ┆         1896         │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ expired.badssl.com ┆   true  ┆  ERROR ┆        -3041        ┆        -72984        │
-└────────────────────┴─────────┴────────┴─────────────────────┴──────────────────────┘
 ```
+![](/img/1-2.png)
 
 ```sh
 ➜ tlschecker jpbd.dev -o json

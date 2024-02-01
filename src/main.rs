@@ -117,39 +117,50 @@ impl Formatter for SummaryFormat {
             .load_preset(UTF8_FULL)
             .set_header(vec![
                 "Host",
+                "Issuer",
                 "Expired",
-                "Status",
                 "Days before expired",
                 "Hours before expired",
+                "Status",
             ]);
 
         for cert in certificates {
             let custom_cell = match cert.validity_days {
-                days if days <= 0 => Cell::new("ERROR")
+                days if days <= 0 => Cell::new("Error")
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Red)
                     .set_alignment(CellAlignment::Center),
-                days if days <= 15 => Cell::new("WARNING")
+                days if days <= 15 => Cell::new("Warning")
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Yellow)
                     .set_alignment(CellAlignment::Center),
-                _ => Cell::new("OK")
+                _ => Cell::new("Ok")
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Green)
                     .set_alignment(CellAlignment::Center),
             };
 
+            let expired_cell = match cert.is_expired {
+                true => Cell::new("Yes")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Red)
+                    .set_alignment(CellAlignment::Center),
+                false => Cell::new("No")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Green)
+                    .set_alignment(CellAlignment::Center),
+            };
             table.add_row(vec![
                 Cell::new(&cert.hostname)
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Green),
-                Cell::new(cert.is_expired)
+                Cell::new(&cert.issued.organization)
                     .add_attribute(Attribute::Bold)
-                    .fg(Color::Blue)
-                    .set_alignment(CellAlignment::Center),
-                custom_cell,
+                    .fg(Color::Blue),
+                expired_cell,
                 Cell::new(cert.validity_days).set_alignment(CellAlignment::Center),
                 Cell::new(cert.validity_hours).set_alignment(CellAlignment::Center),
+                custom_cell,
             ]);
         }
         println!("{table}");
