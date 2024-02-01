@@ -192,11 +192,9 @@ fn main() {
     let hosts_len = hosts.len();
     thread::spawn(move || {
         for host in hosts {
-            println!("Checking host: {}", &host);
             let thread_tx = sender.clone();
             let handle = thread::spawn(move || match Certificate::from(&host) {
                 Ok(cert) => {
-                    println!("sending host: {}", &host);
                     thread_tx.send(cert).unwrap();
                 }
                 Err(err) => {
@@ -210,7 +208,6 @@ fn main() {
     let mut certificates: Vec<Certificate> = Vec::with_capacity(hosts_len);
 
     for cert in receiver {
-        println!("Received certificate from {}", cert.hostname);
         certificates.push(cert);
     }
 
