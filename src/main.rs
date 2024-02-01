@@ -1,5 +1,4 @@
-use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::sync_channel;
 use std::thread;
 
 use clap::{Parser, ValueEnum};
@@ -187,26 +186,31 @@ fn main() {
     let exit_code = cli.exit_code;
     let mut failed_result = false;
 
-    let (sender, receiver): (Sender<Certificate>, Receiver<Certificate>) = mpsc::channel();
     let hosts: Vec<String> = cli.addresses.iter().map(String::from).collect();
+    let size = hosts.len();
+    let (sender, receiver) = sync_channel(size);
     let hosts_len = hosts.len();
     thread::spawn(move || {
         for host in hosts {
+            println!("Checking host: {}", &host);
             let thread_tx = sender.clone();
-            thread::spawn(move || match Certificate::from(&host) {
+            let handle = thread::spawn(move || match Certificate::from(&host) {
                 Ok(cert) => {
+                    println!("sending host: {}", &host);
                     thread_tx.send(cert).unwrap();
                 }
                 Err(err) => {
                     println!("Fail to check host: {}  {} ", &host, &err.details);
                 }
             });
+            handle.join().unwrap();
         }
     });
 
     let mut certificates: Vec<Certificate> = Vec::with_capacity(hosts_len);
 
     for cert in receiver {
+        println!("Received certificate from {}", cert.hostname);
         certificates.push(cert);
     }
 
