@@ -24,6 +24,19 @@ pub struct Chain {
     pub signature_algorithm: String,
 }
 
+/// TLS Struct
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TLS {
+    pub cipher: Cipher,
+    pub certificate: Certificate,
+}
+/// Cipher Struct
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Cipher {
+    pub name: String,
+    pub version: String,
+}
+
 /// Certificate
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Certificate {
@@ -60,9 +73,9 @@ pub struct Subject {
     pub common_name: String,
 }
 
-/// Certificate trait
-impl Certificate {
-    pub fn from(host: &str) -> Result<Certificate, TLSValidationError> {
+/// TLS trait
+impl TLS {
+    pub fn from(host: &str) -> Result<TLS, TLSValidationError> {
         let mut context = SslContext::builder(SslMethod::tls())?;
         context.set_verify(SslVerifyMode::empty());
         let context_builder = context.build();
@@ -83,6 +96,11 @@ impl Certificate {
 
         // `Ssl` object associated with this stream
         let ssl = stream.ssl();
+
+        let cipher = Cipher {
+            name: ssl.current_cipher().unwrap().name().to_string(),
+            version: ssl.current_cipher().unwrap().version().to_string(),
+        };
 
         let peer_cert_chain = ssl
             .peer_cert_chain()
@@ -115,9 +133,13 @@ impl Certificate {
             sans: data.sans,
             chain: Some(peer_cert_chain),
         };
-        Ok(certificate)
+        Ok(TLS {
+            cipher,
+            certificate,
+        })
     }
 }
+
 /// get x509 name entries
 fn from_entries(mut entries: X509NameEntries) -> String {
     match entries.next() {
@@ -252,72 +274,82 @@ impl<S> From<HandshakeError<S>> for TLSValidationError {
 
 #[cfg(test)]
 mod tests {
-    use crate::Certificate;
+    use crate::TLS;
 
     #[test]
     fn test_check_tls_for_expired_host() {
         let host = "expired.badssl.com";
-        let cert = Certificate::from(host).unwrap();
-        println!("Expired: {}", cert.is_expired);
-        assert!(cert.is_expired);
-        assert_eq!(cert.cert_alg, "sha256WithRSAEncryption");
-        assert_eq!(cert.subject.common_name, "*.badssl.com");
-        assert_eq!(cert.subject.organization, "None");
+        let tls_result: TLS = TLS::from(host).unwrap();
+
+        println!("Expired: {}", tls_result.certificate.is_expired);
+        assert!(tls_result.certificate.is_expired);
+        assert_eq!(tls_result.certificate.cert_alg, "sha256WithRSAEncryption");
+        assert_eq!(tls_result.certificate.subject.common_name, "*.badssl.com");
+        assert_eq!(tls_result.certificate.subject.organization, "None");
         assert_eq!(
-            cert.issued.common_name,
+            tls_result.certificate.issued.common_name,
             "COMODO RSA Domain Validation Secure Server CA"
         );
-        assert!(cert.validity_days < 0);
-        assert_eq!(cert.cert_sn, "99565320202650452861752791156765321481");
-        assert_eq!(cert.cert_ver, "2");
-        assert_eq!(cert.hostname, host)
+        assert!(tls_result.certificate.validity_days < 0);
+        assert_eq!(
+            tls_result.certificate.cert_sn,
+            "99565320202650452861752791156765321481"
+        );
+        assert_eq!(tls_result.certificate.cert_ver, "2");
+        assert_eq!(tls_result.certificate.hostname, host);
+
+        assert_eq!(tls_result.cipher.name, "ECDHE-RSA-AES128-GCM-SHA256");
+        assert_eq!(tls_result.cipher.version, "TLSv1.2");
     }
 
     #[test]
     fn test_check_tls_for_valid_host() {
         let host = "jpbd.dev";
-        let cert = Certificate::from(host).unwrap();
-        println!("Expired: {}", cert.is_expired);
-        assert!(!cert.is_expired);
-        assert_eq!(cert.cert_alg, "ecdsa-with-SHA384");
-        assert_eq!(cert.subject.common_name, host);
-        assert_eq!(cert.subject.organization, "None");
-        assert_eq!(cert.issued.common_name, "E1");
-        assert!(cert.validity_days > 0);
-        assert!(!cert.cert_sn.is_empty());
-        assert_eq!(cert.cert_ver, "2");
-        assert_eq!(cert.sans.len(), 2);
-        assert_eq!(cert.hostname, host);
-        assert!(!cert.chain.unwrap().is_empty());
+        let tls_result = TLS::from(host).unwrap();
+        println!("Expired: {}", tls_result.certificate.is_expired);
+        assert!(!tls_result.certificate.is_expired);
+        assert_eq!(tls_result.certificate.cert_alg, "ecdsa-with-SHA384");
+        assert_eq!(tls_result.certificate.subject.common_name, host);
+        assert_eq!(tls_result.certificate.subject.organization, "None");
+        assert_eq!(tls_result.certificate.issued.common_name, "E1");
+        assert!(tls_result.certificate.validity_days > 0);
+        assert!(!tls_result.certificate.cert_sn.is_empty());
+        assert_eq!(tls_result.certificate.cert_ver, "2");
+        assert_eq!(tls_result.certificate.sans.len(), 2);
+        assert_eq!(tls_result.certificate.hostname, host);
+        assert!(!tls_result.certificate.chain.unwrap().is_empty());
+
+        assert_eq!(tls_result.cipher.name, "TLS_AES_256_GCM_SHA384");
+        assert_eq!(tls_result.cipher.version, "TLSv1.3");
     }
 
     #[test]
     fn test_check_tls_for_valid_host_without_sans() {
         let host = "acme-staging-v02.api.letsencrypt.org";
-        let cert = Certificate::from(host).unwrap();
-        assert!(!cert.is_expired);
-        assert!(cert.validity_days > 0);
-        assert!(!cert.sans.is_empty());
+        let tls_result = TLS::from(host).unwrap();
+        assert!(!tls_result.certificate.is_expired);
+        assert!(tls_result.certificate.validity_days > 0);
+        assert!(!tls_result.certificate.sans.is_empty());
 
-        assert_eq!(cert.subject.country_or_region, "None");
-        assert_eq!(cert.subject.state_or_province, "None");
-        assert_eq!(cert.subject.locality, "None");
-        assert_eq!(cert.subject.organization_unit, "None");
-        assert_eq!(cert.subject.organization, "None");
-        assert!(!cert.subject.common_name.is_empty());
+        assert_eq!(tls_result.certificate.subject.country_or_region, "None");
+        assert_eq!(tls_result.certificate.subject.state_or_province, "None");
+        assert_eq!(tls_result.certificate.subject.locality, "None");
+        assert_eq!(tls_result.certificate.subject.organization_unit, "None");
+        assert_eq!(tls_result.certificate.subject.organization, "None");
+        assert!(!tls_result.certificate.subject.common_name.is_empty());
 
-        assert_eq!(cert.issued.common_name, "R3");
-        assert_eq!(cert.issued.organization, "Let's Encrypt");
-        assert_eq!(cert.issued.country_or_region, "US");
-        assert_eq!(cert.hostname, host);
+        assert_eq!(tls_result.certificate.issued.common_name, "R3");
+        assert_eq!(tls_result.certificate.issued.organization, "Let's Encrypt");
+        assert_eq!(tls_result.certificate.issued.country_or_region, "US");
+        assert_eq!(tls_result.certificate.hostname, host);
 
-        assert!(!cert.chain.unwrap().is_empty());
+        assert!(!tls_result.certificate.chain.unwrap().is_empty());
     }
 
     #[test]
     fn test_check_resolve_invalid_host() {
         let host = "basdomain.xyz";
-        let result = Certificate::from(host).err();
+        let result = TLS::from(host).err();
         assert!(result
             .unwrap()
             .details
@@ -327,7 +359,7 @@ mod tests {
     #[test]
     fn test_check_tls_connection_refused() {
         let host = "slackware.com";
-        let result = Certificate::from(host).err();
+        let result = TLS::from(host).err();
         let message = result.unwrap().details;
         assert!(!message.is_empty());
         println!("{}", message);
