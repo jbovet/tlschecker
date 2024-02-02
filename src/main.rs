@@ -6,7 +6,7 @@ use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 
-use tlschecker::Certificate;
+use tlschecker::TLS;
 
 /// Experimental TLS/SSL certificate checker
 #[derive(Parser)]
@@ -45,7 +45,7 @@ enum OutFormat {
 
 /// Output Formatter trait
 trait Formatter {
-    fn format(&self, certificates: &[Certificate]);
+    fn format(&self, tls: &[TLS]);
 }
 
 /// Text format
@@ -59,7 +59,12 @@ struct SummaryFormat;
 
 /// Implement Formatter trait for TextFormat
 impl Formatter for TextFormat {
-    fn format(&self, certificates: &[Certificate]) {
+    fn format(&self, tls: &[TLS]) {
+        let certificates = tls
+            .iter()
+            .map(|c| c.certificate.clone())
+            .collect::<Vec<_>>();
+        
         for cert in certificates {
             println!("--------------------------------------");
             println!("Hostname: {}", cert.hostname);
@@ -108,7 +113,7 @@ impl Formatter for TextFormat {
 
 /// Implement Formatter trait for SummaryFormat
 impl Formatter for SummaryFormat {
-    fn format(&self, certificates: &[Certificate]) {
+    fn format(&self, tls: &[TLS]) {
         let mut table = Table::new();
 
         table
@@ -117,6 +122,8 @@ impl Formatter for SummaryFormat {
             .load_preset(UTF8_FULL)
             .set_header(vec![
                 "Host",
+                "Cipher Suite",
+                "Protocol",
                 "Issuer",
                 "Expired",
                 "Days before expired",
@@ -124,8 +131,8 @@ impl Formatter for SummaryFormat {
                 "Status",
             ]);
 
-        for cert in certificates {
-            let custom_cell = match cert.validity_days {
+        for rs in tls {
+            let custom_cell: Cell = match rs.certificate.validity_days {
                 days if days <= 0 => Cell::new("Error")
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Red)
@@ -140,7 +147,7 @@ impl Formatter for SummaryFormat {
                     .set_alignment(CellAlignment::Center),
             };
 
-            let expired_cell = match cert.is_expired {
+            let expired_cell = match rs.certificate.is_expired {
                 true => Cell::new("Yes")
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Red)
@@ -151,15 +158,21 @@ impl Formatter for SummaryFormat {
                     .set_alignment(CellAlignment::Center),
             };
             table.add_row(vec![
-                Cell::new(&cert.hostname)
+                Cell::new(&rs.certificate.hostname)
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Green),
-                Cell::new(&cert.issued.organization)
+                Cell::new(&rs.cipher.name)
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Green),
+                Cell::new(&rs.cipher.version)
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Green),
+                Cell::new(&rs.certificate.issued.organization)
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Blue),
                 expired_cell,
-                Cell::new(cert.validity_days).set_alignment(CellAlignment::Center),
-                Cell::new(cert.validity_hours).set_alignment(CellAlignment::Center),
+                Cell::new(rs.certificate.validity_days).set_alignment(CellAlignment::Center),
+                Cell::new(rs.certificate.validity_hours).set_alignment(CellAlignment::Center),
                 custom_cell,
             ]);
         }
@@ -169,11 +182,10 @@ impl Formatter for SummaryFormat {
 
 /// Implement Formatter trait for JsonFormat
 impl Formatter for JsonFormat {
-    fn format(&self, certificates: &[Certificate]) {
+    fn format(&self, tls: &[TLS]) {
         println!(
             "{}",
-            serde_json::to_string_pretty(&certificates)
-                .expect("Failed to format certificates as JSON")
+            serde_json::to_string_pretty(&tls).expect("Failed to format certificates as JSON")
         );
     }
 }
@@ -204,7 +216,7 @@ fn main() {
     thread::spawn(move || {
         for host in hosts {
             let thread_tx = sender.clone();
-            let handle = thread::spawn(move || match Certificate::from(&host) {
+            let handle = thread::spawn(move || match TLS::from(&host) {
                 Ok(cert) => {
                     thread_tx.send(cert).unwrap();
                 }
@@ -216,16 +228,16 @@ fn main() {
         }
     });
 
-    let mut certificates: Vec<Certificate> = Vec::with_capacity(hosts_len);
+    let mut results: Vec<TLS> = Vec::with_capacity(hosts_len);
 
-    for cert in receiver {
-        certificates.push(cert);
+    for tls_result in receiver {
+        results.push(tls_result);
     }
 
-    let expired_certs = &certificates
+    let expired_certs = &results
         .clone()
         .into_iter()
-        .filter(|c| c.is_expired)
+        .filter(|c| c.certificate.is_expired)
         .collect::<Vec<_>>();
 
     if !expired_certs.is_empty() {
@@ -238,7 +250,7 @@ fn main() {
         OutFormat::Summary => FormatterFactory::new_formatter(&OutFormat::Summary),
     };
 
-    formatter.format(&certificates);
+    formatter.format(&results);
 
     exit(exit_code, failed_result);
 }
