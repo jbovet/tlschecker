@@ -133,15 +133,15 @@ impl Formatter for SummaryFormat {
 
         for rs in tls {
             let custom_cell: Cell = match rs.certificate.validity_days {
-                days if days <= 0 => Cell::new("Error")
+                days if days <= 15 => Cell::new("Critical")
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Red)
                     .set_alignment(CellAlignment::Center),
-                days if days <= 15 => Cell::new("Warning")
+                days if days <= 30 => Cell::new("Warning")
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Yellow)
                     .set_alignment(CellAlignment::Center),
-                _ => Cell::new("Ok")
+                _ => Cell::new("Healthy")
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Green)
                     .set_alignment(CellAlignment::Center),
