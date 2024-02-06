@@ -1,5 +1,6 @@
 use std::sync::mpsc::sync_channel;
 use std::thread;
+mod metrics;
 
 use clap::{Parser, ValueEnum};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
@@ -23,6 +24,15 @@ struct Args {
     /// Exits with code 0 even when certificate expired is detected
     #[arg(long, default_value_t = 0)]
     exit_code: i32,
+
+    /// Enable prometheus push gateway metrics
+    #[arg(long)]
+    prometheus: bool,
+
+    /// Prometheus push gateway address
+    /// Default is http://localhost:9091
+    #[arg(long, default_value = "http://localhost:9091")]
+    prometheus_address: String,
 }
 
 /// Output format
@@ -64,7 +74,7 @@ impl Formatter for TextFormat {
             .iter()
             .map(|c| c.certificate.clone())
             .collect::<Vec<_>>();
-        
+
         for cert in certificates {
             println!("--------------------------------------");
             println!("Hostname: {}", cert.hostname);
@@ -209,6 +219,8 @@ fn main() {
     let exit_code = cli.exit_code;
     let mut failed_result = false;
 
+    //
+
     let hosts: Vec<String> = cli.addresses.iter().map(String::from).collect();
     let size = hosts.len();
     let (sender, receiver) = sync_channel(size);
@@ -249,8 +261,11 @@ fn main() {
         OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
         OutFormat::Summary => FormatterFactory::new_formatter(&OutFormat::Summary),
     };
-
     formatter.format(&results);
+
+    if cli.prometheus {
+        metrics::prom::prometheus_metrics(results, cli.prometheus_address);
+    }
 
     exit(exit_code, failed_result);
 }
