@@ -1,11 +1,9 @@
 use lazy_static::lazy_static;
-use prometheus::{labels, register_counter, register_gauge, Counter, Gauge};
+use prometheus::{labels, register_gauge, Gauge};
 
 use tlschecker::TLS;
 
 lazy_static! {
-    static ref TLSCHECKER_CERTIFICATES_TOTAL: Counter =
-        register_counter!("tlschecker_certificates_total", "certificates count").unwrap();
     static ref TLSCHECKER_DAYS_BEFORE_EXPIRED: Gauge =
         register_gauge!("tlschecker_days_before_expired", "days before expiration").unwrap();
     static ref TLSCHECKER_HOURS_BEFORE_EXPIRED: Gauge =
@@ -17,7 +15,6 @@ lazy_static! {
 /// * `prometheus_address` - String of prometheus address
 pub fn prometheus_metrics(results: Vec<TLS>, prometheus_address: String) {
     for tls in results.iter() {
-        TLSCHECKER_CERTIFICATES_TOTAL.inc();
         TLSCHECKER_DAYS_BEFORE_EXPIRED.set(f64::from(tls.certificate.validity_days.to_owned()));
         TLSCHECKER_HOURS_BEFORE_EXPIRED.set(f64::from(tls.certificate.validity_hours.to_owned()));
         let metric_families = prometheus::gather();
