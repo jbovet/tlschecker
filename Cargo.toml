@@ -12,13 +12,13 @@ repository = "https://github.com/jbovet/tlschecker"
 
 [dependencies]
 prometheus = { version = "0.13.3", features = ["process", "push"] }
-openssl = "0.10.63"
-clap = { version = "4.4.18", features = ["derive"] }
-serde_json = "1.0.113"
-serde = { version = "1.0.196", features = ["derive"] }
+openssl = "0.10.64"
+clap = { version = "4.5.3", features = ["derive"] }
+serde_json = "1.0.114"
+serde = { version = "1.0.197", features = ["derive"] }
 comfy-table = "7.1.0"
-strum = "0.26.1"
-strum_macros = "0.26.1"
+strum = "0.26.2"
+strum_macros = "0.26.2"
 lazy_static = "1.4.0"
 
 [[bin]]
