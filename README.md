@@ -9,7 +9,7 @@ Experimental TLS/SSL certificate command-line checker
 [DockerHub](https://hub.docker.com/repository/docker/josebovet/tlschecker)
 
 ```sh
-docker run josebovet/tlschecker:v0.1.14 jpbd.dev
+docker run josebovet/tlschecker:v1.0.0 jpbd.dev
 ```
 
 ## Install
@@ -17,7 +17,7 @@ docker run josebovet/tlschecker:v0.1.14 jpbd.dev
 Linux
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.14/tlschecker-linux
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v1.0.0/tlschecker-linux
 mv tlschecker-linux tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
@@ -25,7 +25,7 @@ sudo install tlschecker /usr/local/bin/tlschecker
 Osx
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v0.1.14/tlschecker-macos
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v1.0.0/tlschecker-macos
 mv tlschecker-macos tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
