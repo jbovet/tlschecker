@@ -3,7 +3,7 @@ name: Publish
 on:
   push:
     tags:
-      - '*'
+    - '*'
 
 jobs:
   publish:
@@ -11,20 +11,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        name: [
-            linux,
-            macos
-        ]
+        name: [linux, macos]
 
         include:
-          - name: linux
-            os: ubuntu-latest
-            artifact_name: target/release/tlschecker
-            asset_name: tlschecker-linux
-          - name: macos
-            os: macos-latest
-            artifact_name: target/release/tlschecker
-            asset_name: tlschecker-macos
+        - name: linux
+          os: ubuntu-latest
+          artifact_name: target/release/tlschecker
+          asset_name: tlschecker-linux
+        - name: macos
+          os: macos-latest
+          artifact_name: target/release/tlschecker
+          asset_name: tlschecker-macos
 
     steps:
     - uses: actions/checkout@v1
@@ -38,7 +35,7 @@ jobs:
       run: cargo build --release --locked
 
     - name: Upload binaries to release
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.asset_name }}
         path: ${{ matrix.artifact_name }}
