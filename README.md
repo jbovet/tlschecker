@@ -25,7 +25,7 @@ Linux
 ```sh
 curl -LO https://github.com/jbovet/tlschecker/releases/download/v1.0.0/tlschecker-linux.zip
 unzip tlschecker-linux.zip
-mv tlschecker-linux tlschecker
+chmod 755 tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
 
@@ -34,7 +34,7 @@ Osx
 ```sh
 curl -LO https://github.com/jbovet/tlschecker/releases/download/v1.0.0/tlschecker-macos.zip
 unzip tlschecker-macos.zip
-mv tlschecker-macos tlschecker
+chmod 755 tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
 
