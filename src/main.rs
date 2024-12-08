@@ -8,6 +8,7 @@ use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 
 use tlschecker::TLS;
+use url::Url;
 
 /// Experimental TLS/SSL certificate checker
 #[derive(Parser)]
@@ -218,10 +219,18 @@ fn main() {
     let cli = Args::parse();
     let exit_code = cli.exit_code;
     let mut failed_result = false;
+    //remove schema from the host
+    let hosts: Vec<String> = cli
+        .addresses
+        .iter()
+        .map(|address| {
+            Url::parse(&address)
+                .ok()
+                .and_then(|url| url.host_str().map(String::from))
+                .unwrap_or_else(|| address.clone())
+        })
+        .collect();
 
-    //
-
-    let hosts: Vec<String> = cli.addresses.iter().map(String::from).collect();
     let size = hosts.len();
     let (sender, receiver) = sync_channel(size);
     let hosts_len = hosts.len();
