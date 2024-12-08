@@ -198,7 +198,7 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
             }
         }
     }
-    return Certificate {
+    Certificate {
         hostname: "None".to_string(),
         subject: get_subject(cert_ref),
         issued: get_issuer(cert_ref),
@@ -212,7 +212,7 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
         cert_alg: cert_ref.signature_algorithm().object().to_string(),
         sans,
         chain: None,
-    };
+    }
 }
 
 /// get validity in hours
@@ -222,12 +222,12 @@ fn get_validity_in_hours(not_after: &Asn1TimeRef) -> i32 {
 
 /// get validity in days
 fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
-    return Asn1Time::days_from_now(0)
+    Asn1Time::days_from_now(0)
         .unwrap()
         .deref()
         .diff(not_after)
         .unwrap()
-        .days;
+        .days
 }
 
 /// check if certificate has expired
@@ -308,7 +308,7 @@ mod tests {
         let tls_result = TLS::from(host).unwrap();
         println!("Expired: {}", tls_result.certificate.is_expired);
         assert!(!tls_result.certificate.is_expired);
-        assert!(tls_result.certificate.cert_alg.len() > 0);
+        assert!(!tls_result.certificate.cert_alg.is_empty());
         assert_eq!(tls_result.certificate.subject.common_name, host);
         assert_eq!(tls_result.certificate.subject.organization, "None");
         assert_eq!(tls_result.certificate.issued.common_name, "WE1");
@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(tls_result.certificate.subject.organization, "None");
         assert!(!tls_result.certificate.subject.common_name.is_empty());
 
-        assert!(tls_result.certificate.issued.common_name.len() > 0); //R10-R11
+        assert!(!tls_result.certificate.issued.common_name.is_empty()); //R10-R11
         assert_eq!(tls_result.certificate.issued.organization, "Let's Encrypt");
         assert_eq!(tls_result.certificate.issued.country_or_region, "US");
         assert_eq!(tls_result.certificate.hostname, host);
