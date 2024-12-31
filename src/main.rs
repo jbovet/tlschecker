@@ -125,8 +125,11 @@ impl Formatter for TextFormat {
 /// Implement Formatter trait for SummaryFormat
 impl Formatter for SummaryFormat {
     fn format(&self, tls: &[TLS]) {
-        let mut table = Table::new();
+        if tls.is_empty() {
+            return;
+        }
 
+        let mut table = Table::new();
         table
             .set_content_arrangement(ContentArrangement::Dynamic)
             .apply_modifier(UTF8_ROUND_CORNERS)
@@ -224,7 +227,7 @@ fn main() {
         .addresses
         .iter()
         .map(|address| {
-            Url::parse(&address)
+            Url::parse(address)
                 .ok()
                 .and_then(|url| url.host_str().map(String::from))
                 .unwrap_or_else(|| address.clone())
@@ -242,7 +245,7 @@ fn main() {
                     thread_tx.send(cert).unwrap();
                 }
                 Err(err) => {
-                    println!("Fail to check host: {}  {} ", &host, &err.details);
+                    eprintln!("Fail to check host: {}  {} ", &host, &err.details);
                 }
             });
             handle.join().unwrap();
