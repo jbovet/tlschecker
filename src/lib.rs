@@ -28,7 +28,7 @@ pub struct Chain {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TLS {
     pub cipher: Cipher,
-    pub certificate: Certificate,
+    pub certificate: CertificateInfo,
 }
 /// Cipher Struct
 #[derive(Serialize, Deserialize, Clone)]
@@ -39,7 +39,7 @@ pub struct Cipher {
 
 /// Certificate
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Certificate {
+pub struct CertificateInfo {
     pub hostname: String,
     pub subject: Subject,
     pub issued: Issuer,
@@ -118,7 +118,7 @@ impl TLS {
         let x509_ref = ssl.peer_certificate().ok_or("Certificate not found")?;
 
         let data = get_certificate_info(&x509_ref);
-        let certificate = Certificate {
+        let certificate = CertificateInfo {
             hostname: host.to_string(),
             subject: data.subject,
             issued: data.issued,
@@ -188,7 +188,7 @@ fn get_issuer(cert_ref: &X509) -> Issuer {
 }
 
 /// get certificate info
-fn get_certificate_info(cert_ref: &X509) -> Certificate {
+fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
     let mut sans = Vec::new();
     match cert_ref.subject_alt_names() {
         None => {}
@@ -198,7 +198,7 @@ fn get_certificate_info(cert_ref: &X509) -> Certificate {
             }
         }
     }
-    Certificate {
+    CertificateInfo {
         hostname: "None".to_string(),
         subject: get_subject(cert_ref),
         issued: get_issuer(cert_ref),
