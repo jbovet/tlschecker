@@ -12,7 +12,7 @@ repository = "https://github.com/jbovet/tlschecker"
 
 [dependencies]
 prometheus = { version = "0.14.0", features = ["process", "push"] }
-openssl = "0.10.71"
+openssl = "0.10.72"
 clap = { version = "4.5.31", features = ["derive"] }
 serde_json = "1.0.140"
 serde = { version = "1.0.218", features = ["derive"] }
