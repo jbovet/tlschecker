@@ -101,7 +101,7 @@ pub fn find_issuer_cert<'a>(cert: &X509Ref, chain: &'a [X509]) -> Option<&'a X50
         // Compare the issuer name of our certificate with the subject name of the potential issuer
         if cert_issuer
             .try_cmp(potential_subject)
-            .map_or(false, |ordering| ordering == std::cmp::Ordering::Equal)
+            .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
         {
             return Some(potential_issuer);
         }
@@ -226,7 +226,7 @@ pub fn check_ocsp_status(
         match basic_resp.find_status(&check_cert_id) {
             Some(status) => {
                 // Check validity of the OCSP response
-                if let Err(_) = status.check_validity(300, None) {
+                if status.check_validity(300, None).is_err() {
                     continue;
                 }
 
