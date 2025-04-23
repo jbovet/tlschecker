@@ -7,6 +7,7 @@ use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 
+use tlschecker::RevocationStatus; // Import the new RevocationStatus enum
 use tlschecker::TLS;
 use url::Url;
 
@@ -34,6 +35,10 @@ struct Args {
     /// Default is http://localhost:9091
     #[arg(long, default_value = "http://localhost:9091")]
     prometheus_address: String,
+
+    /// Enable certificate revocation checking
+    #[arg(long)]
+    check_revocation: bool,
 }
 
 /// Output format
@@ -99,6 +104,18 @@ impl Formatter for TextFormat {
             println!("Certificate version: {}", cert.cert_ver);
             println!("Certificate algorithm: {}", cert.cert_alg);
             println!("Certificate S/N: {}", cert.cert_sn);
+
+            // Add revocation status information
+            println!(
+                "Revocation Status: {}",
+                match cert.revocation_status {
+                    RevocationStatus::Good => "Good (Not Revoked)".to_string(),
+                    RevocationStatus::Revoked(reason) => format!("Revoked ({})", reason),
+                    RevocationStatus::Unknown => "Unknown (Could not determine)".to_string(),
+                    RevocationStatus::NotChecked => "Not Checked".to_string(),
+                }
+            );
+
             println!("Subject Alternative Names:");
             for san in &cert.sans {
                 println!("\tDNS Name: {}", san);
@@ -140,6 +157,7 @@ impl Formatter for SummaryFormat {
                 "Protocol",
                 "Issuer",
                 "Expired",
+                "Revocation",
                 "Days before expired",
                 "Hours before expired",
                 "Status",
@@ -171,6 +189,27 @@ impl Formatter for SummaryFormat {
                     .fg(Color::Green)
                     .set_alignment(CellAlignment::Center),
             };
+
+            // Add revocation status cell
+            let revocation_cell = match &rs.certificate.revocation_status {
+                RevocationStatus::Good => Cell::new("Valid")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Green)
+                    .set_alignment(CellAlignment::Center),
+                RevocationStatus::Revoked(_) => Cell::new("Revoked")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Red)
+                    .set_alignment(CellAlignment::Center),
+                RevocationStatus::Unknown => Cell::new("Unknown")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Yellow)
+                    .set_alignment(CellAlignment::Center),
+                RevocationStatus::NotChecked => Cell::new("Not Checked")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::DarkGrey)
+                    .set_alignment(CellAlignment::Center),
+            };
+
             table.add_row(vec![
                 Cell::new(&rs.certificate.hostname)
                     .add_attribute(Attribute::Bold)
@@ -185,6 +224,7 @@ impl Formatter for SummaryFormat {
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Blue),
                 expired_cell,
+                revocation_cell,
                 Cell::new(rs.certificate.validity_days).set_alignment(CellAlignment::Center),
                 Cell::new(rs.certificate.validity_hours).set_alignment(CellAlignment::Center),
                 custom_cell,
@@ -238,13 +278,16 @@ fn main() {
     let size = hosts_and_ports.len();
     let (sender, receiver) = sync_channel(size);
     let hosts_len = hosts_and_ports.len();
+    let check_revocation = cli.check_revocation;
+
     thread::spawn(move || {
         for host_port in hosts_and_ports {
             let thread_tx = sender.clone();
+            let check_revocation = check_revocation;
             let handle = thread::spawn(move || {
                 let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
 
-                match TLS::from(&host_port.host, host_port.port) {
+                match TLS::from(&host_port.host, host_port.port, check_revocation) {
                     Ok(cert) => {
                         thread_tx.send(cert).unwrap();
                     }
@@ -299,7 +342,18 @@ fn main() {
         .filter(|c| c.certificate.is_expired)
         .collect::<Vec<_>>();
 
-    if !expired_certs.is_empty() {
+    let revoked_certs = &results
+        .clone()
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c.certificate.revocation_status,
+                RevocationStatus::Revoked(_)
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if !expired_certs.is_empty() || !revoked_certs.is_empty() {
         failed_result = true;
     }
 
