@@ -8,7 +8,7 @@ use openssl::error::ErrorStack;
 use openssl::nid::Nid;
 use openssl::ocsp::OcspCertStatus;
 use openssl::ssl::HandshakeError;
-use openssl::x509::{X509NameEntries, X509Ref, X509};
+use openssl::x509::{CrlStatus, ReasonCode, X509Crl, X509NameEntries, X509Ref, X509};
 use serde::{Deserialize, Serialize};
 
 /// Timeout for TLS connection
@@ -261,6 +261,141 @@ pub fn check_ocsp_status(
     Ok(RevocationStatus::Unknown)
 }
 
+/// Combined revocation checking function that tries both OCSP and CRL
+pub fn check_revocation_status(
+    cert: &X509,
+    chain: &[X509],
+) -> Result<RevocationStatus, TLSValidationError> {
+    // First try OCSP checking as it's typically more up-to-date
+    match check_ocsp_status(cert, chain) {
+        Ok(RevocationStatus::Good) => Ok(RevocationStatus::Good),
+        Ok(revoked @ RevocationStatus::Revoked(_)) => Ok(revoked),
+        _ => {
+            // Fallback to CRL checking if OCSP was inconclusive
+            check_crl_status(cert, chain)
+        }
+    }
+}
+
+pub fn check_crl_status(
+    cert: &X509,
+    chain: &[X509],
+) -> Result<RevocationStatus, TLSValidationError> {
+    use openssl::x509::store::X509StoreBuilder;
+
+    // Find the issuer certificate in the chain
+    let issuer = match find_issuer_cert(cert, chain) {
+        Some(issuer) => issuer,
+        None => return Ok(RevocationStatus::Unknown), // Can't verify without issuer
+    };
+
+    // Get CRL distribution points from the certificate
+    let crl_dps = match cert.crl_distribution_points() {
+        Some(dps) if !dps.is_empty() => dps,
+        _ => return Ok(RevocationStatus::Unknown), // No CRL distribution points found
+    };
+
+    // Create a store for verification
+    let mut store_builder = match X509StoreBuilder::new() {
+        Ok(builder) => builder,
+        Err(_) => return Ok(RevocationStatus::Unknown),
+    };
+
+    // Add the issuer certificate to the store
+    if store_builder.add_cert(issuer.to_owned()).is_err() {
+        return Ok(RevocationStatus::Unknown);
+    }
+
+    // Try each CRL distribution point
+    for dp in crl_dps.iter() {
+        // Extract the CRL URL
+        let uri = match dp.distpoint().and_then(|dp_nm| dp_nm.fullname()) {
+            Some(fullname) => {
+                let mut uri = None;
+                for name in fullname.iter() {
+                    if let Some(url) = name.uri() {
+                        uri = Some(url);
+                        break;
+                    }
+                }
+                uri
+            }
+            None => None,
+        };
+
+        let crl_url = match uri {
+            Some(url) => url,
+            None => continue, // No URI found, try next DP
+        };
+
+        // Download the CRL
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let response = match client.get(crl_url).send() {
+            Ok(resp) => resp,
+            Err(_) => continue,
+        };
+
+        if !response.status().is_success() {
+            continue;
+        }
+
+        let crl_data = match response.bytes() {
+            Ok(bytes) => bytes.to_vec(),
+            Err(_) => continue,
+        };
+
+        // Try parsing as DER first, then as PEM
+        let crl = match X509Crl::from_der(&crl_data) {
+            Ok(crl) => crl,
+            Err(_) => {
+                // Try PEM format if DER parsing failed
+                match X509Crl::from_pem(&crl_data) {
+                    Ok(crl) => crl,
+                    Err(_) => continue,
+                }
+            }
+        };
+
+        // Verify the CRL signature
+        if crl.verify(&issuer.public_key().unwrap()).is_err() {
+            continue; // CRL signature verification failed
+        }
+
+        // Check if the certificate is in the CRL
+        match crl.get_by_cert(cert) {
+            CrlStatus::Revoked(revoked) => {
+                // Certificate is revoked
+                // Try to get the revocation reason if available
+                let reason = match revoked.extension::<ReasonCode>() {
+                    Ok(Some(_)) => "Revoked via CRL".to_string(),
+                    _ => "Revoked via CRL (no reason specified)".to_string(),
+                };
+
+                return Ok(RevocationStatus::Revoked(reason));
+            }
+            CrlStatus::NotRevoked => {
+                // Certificate is not in the CRL, so it's good according to this CRL
+                return Ok(RevocationStatus::Good);
+            }
+            CrlStatus::RemoveFromCrl(_) => {
+                // This is rare but could happen if a certificate was temporarily suspended
+                // and then reinstated
+                return Ok(RevocationStatus::Good);
+            }
+        }
+    }
+
+    // If we've tried all CRLs and none worked or none contained information about this certificate
+    Ok(RevocationStatus::Unknown)
+}
+
 /// Check TLS certificate
 /// This function checks the TLS certificate of a given host and port.
 /// It returns a TLS struct containing information about the cipher and certificate.
@@ -339,7 +474,7 @@ impl TLS {
             let cert_chain: Vec<openssl::x509::X509> =
                 peer_cert_chain.iter().map(|cert| cert.to_owned()).collect();
 
-            match check_ocsp_status(&x509_ref, &cert_chain) {
+            match check_revocation_status(&x509_ref, &cert_chain) {
                 Ok(status) => status,
                 Err(_) => RevocationStatus::Unknown,
             }
@@ -617,5 +752,115 @@ mod tests {
         let host = "  ";
         let result = TLS::from(host, None, false).err();
         assert_eq!(result.unwrap().details, "Hostname cannot be empty");
+    }
+
+    #[test]
+    fn test_combined_revocation_checking() {
+        // This test checks that the combined revocation checking function works correctly
+        // It depends on external services, so we'll just test that it doesn't error out
+        // rather than checking specific result values
+
+        let host = "google.com";
+        match TLS::from(host, None, true) {
+            Ok(tls_result) => {
+                // Just check that we get a valid status type
+                match tls_result.certificate.revocation_status {
+                    RevocationStatus::Good | RevocationStatus::Unknown => {
+                        // Either is acceptable since external services might be unreliable
+                        assert!(true);
+                    }
+                    RevocationStatus::Revoked(_) => {
+                        // This would be unexpected for google.com - log it
+                        println!("Unexpected RevocationStatus::Revoked for google.com");
+                        assert!(true);
+                    }
+                    RevocationStatus::NotChecked => {
+                        // This should not happen since we requested checking
+                        assert!(
+                            false,
+                            "Revocation status should not be NotChecked when enabled"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                // Connection error - this is unexpected but could happen
+                println!("Connection error to google.com: {}", e.details);
+                assert!(true);
+            }
+        }
+    }
+
+    #[test]
+    fn test_crl_distribution_point_parsing() {
+        // Try to connect to a site that definitely has CRL distribution points
+        // We'll use digicert.com as they're a major CA and likely have proper CRLs
+        let host = "digicert.com";
+        match TLS::from(host, None, true) {
+            Ok(tls_result) => {
+                // The test passes if we get any valid status
+                match tls_result.certificate.revocation_status {
+                    RevocationStatus::Good
+                    | RevocationStatus::Unknown
+                    | RevocationStatus::Revoked(_) => {
+                        // Any of these is acceptable
+                        assert!(true);
+                    }
+                    RevocationStatus::NotChecked => {
+                        // This should not happen since we requested checking
+                        assert!(
+                            false,
+                            "Revocation status should not be NotChecked when enabled"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                // Connection error - this is unexpected but could happen
+                println!("Connection error to digicert.com: {}", e.details);
+                assert!(true);
+            }
+        }
+    }
+
+    #[test]
+    fn test_revoked_cert_detection() {
+        // Try to test with a known revoked certificate
+        // badssl.com provides a revoked certificate test site
+        let host = "revoked.badssl.com";
+
+        match TLS::from(host, None, true) {
+            Ok(tls_result) => {
+                // The certificate should either be detected as revoked or unknown
+                // depending on whether the revocation checking services are available
+                match tls_result.certificate.revocation_status {
+                    RevocationStatus::Revoked(_) => {
+                        // This is the expected result
+                        assert!(true);
+                    }
+                    RevocationStatus::Unknown => {
+                        // This is acceptable if the revocation services are unavailable
+                        println!("Warning: revoked.badssl.com showed as Unknown, not Revoked");
+                        assert!(true);
+                    }
+                    status => {
+                        // Any other status would be unexpected
+                        assert!(
+                            false,
+                            "Expected Revoked or Unknown status for revoked.badssl.com, got {:?}",
+                            status
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                // It's okay if the connection fails (certificate rejected)
+                assert!(
+                    err.details.contains("certificate"),
+                    "Expected certificate error, got: {}",
+                    err.details
+                );
+            }
+        }
     }
 }

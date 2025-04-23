@@ -65,7 +65,7 @@ You can specify the port in three ways:
 
 ### Certificate Revocation Checking
 
-TLSChecker now supports certificate revocation checking via OCSP (Online Certificate Status Protocol). This feature allows you to verify if a certificate has been revoked by its issuing Certificate Authority.
+TLSChecker supports comprehensive certificate revocation checking via both OCSP (Online Certificate Status Protocol) and CRL (Certificate Revocation List). These features allow you to verify if a certificate has been revoked by its issuing Certificate Authority.
 
 To enable revocation checking, use the `--check-revocation` flag:
 
@@ -73,8 +73,16 @@ To enable revocation checking, use the `--check-revocation` flag:
 ➜ tlschecker --check-revocation jpbd.dev
 ```
 
+#### How Revocation Checking Works
+
+When you enable revocation checking, TLSChecker will:
+
+1. First check certificate status via OCSP, which provides real-time revocation information
+2. If OCSP doesn't provide a definitive answer, fall back to CRL checking
+3. Report the certificate as revoked if either method indicates revocation
+
 The revocation status will be displayed in the output:
-- **Valid**: Certificate is not revoked
+- **Valid**: Certificate is not revoked (confirmed by OCSP or CRL)
 - **Revoked**: Certificate has been revoked (with reason if available)
 - **Unknown**: Revocation status couldn't be determined
 - **Not Checked**: Revocation status was not checked (default when not using the flag)
@@ -84,9 +92,21 @@ Example with a revoked certificate:
 ➜ tlschecker --check-revocation revoked.badssl.com
 ```
 
-Note: Revocation checking requires contacting OCSP responders, which adds some latency to the checks.
+#### Revocation Checking Methods
 
-### Prometheus Integration with Revocation Metrics
+**OCSP (Online Certificate Status Protocol)**:
+- Real-time check with the certificate authority
+- Faster and more up-to-date than CRLs
+- May not be supported by all certificate authorities
+
+**CRL (Certificate Revocation List)**:
+- Downloads and checks the CA's published list of revoked certificates
+- More widely supported than OCSP
+- Lists may be larger and less frequently updated
+
+Note: Revocation checking requires network connections to OCSP responders and CRL distribution points, which adds some latency to the checks.
+
+#### Prometheus Integration with Revocation Metrics
 
 When using Prometheus integration, the revocation status is included in the metrics:
 
@@ -94,7 +114,8 @@ When using Prometheus integration, the revocation status is included in the metr
 tlschecker --prometheus --prometheus-address http://localhost:9091 --check-revocation example.com
 ```
 
-A new metric `tlschecker_revocation_status` is exported with the following values:
+A `tlschecker_revocation_status` metric is exported with the following values:
+
 - 0 = Not checked
 - 1 = Good (not revoked)
 - 2 = Unknown
