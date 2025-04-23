@@ -216,36 +216,71 @@ impl FormatterFactory {
         }
     }
 }
+/// Struct to hold parsed host and port
+struct HostPort {
+    host: String,
+    port: Option<u16>,
+}
 
 /// Main function
 fn main() {
     let cli = Args::parse();
     let exit_code = cli.exit_code;
     let mut failed_result = false;
-    //remove schema from the host
-    let hosts: Vec<String> = cli
+
+    // Parse hosts and ports
+    let hosts_and_ports: Vec<HostPort> = cli
         .addresses
         .iter()
-        .map(|address| {
-            Url::parse(address)
-                .ok()
-                .and_then(|url| url.host_str().map(String::from))
-                .unwrap_or_else(|| address.clone())
-        })
+        .map(|address| parse_host_port(address))
         .collect();
 
-    let size = hosts.len();
+    let size = hosts_and_ports.len();
     let (sender, receiver) = sync_channel(size);
-    let hosts_len = hosts.len();
+    let hosts_len = hosts_and_ports.len();
     thread::spawn(move || {
-        for host in hosts {
+        for host_port in hosts_and_ports {
             let thread_tx = sender.clone();
-            let handle = thread::spawn(move || match TLS::from(&host) {
-                Ok(cert) => {
-                    thread_tx.send(cert).unwrap();
-                }
-                Err(err) => {
-                    eprintln!("Fail to check host: {}  {} ", &host, &err.details);
+            let handle = thread::spawn(move || {
+                let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
+
+                match TLS::from(&host_port.host, host_port.port) {
+                    Ok(cert) => {
+                        thread_tx.send(cert).unwrap();
+                    }
+                    Err(err) => {
+                        if err.details.contains("failed to lookup address information") {
+                            eprintln!(
+                                "ERROR: Cannot resolve hostname: {}{}",
+                                host_port.host, port_display
+                            );
+                            eprintln!("  - Check that the hostname is spelled correctly");
+                            eprintln!("  - Verify your network and DNS configuration");
+                            eprintln!("  - Try using an IP address instead if DNS resolution is not available");
+                        } else if err.details.contains("connection refused") {
+                            eprintln!(
+                                "ERROR: Connection refused for host: {}{}",
+                                host_port.host, port_display
+                            );
+                            eprintln!(
+                                "  - Verify the host is running a TLS service on port {}",
+                                host_port.port.unwrap_or(443)
+                            );
+                            eprintln!("  - Check if a firewall might be blocking the connection");
+                        } else if err.details.contains("certificate") {
+                            eprintln!(
+                                "ERROR: Certificate issue with host: {}{}",
+                                host_port.host, port_display
+                            );
+                            eprintln!("  - Error details: {}", &err.details);
+                        } else {
+                            eprintln!(
+                                "ERROR: Failed to check host: {}{}",
+                                host_port.host, port_display
+                            );
+                            eprintln!("  - Error details: {}", &err.details);
+                        }
+                    }
                 }
             });
             handle.join().unwrap();
@@ -282,8 +317,51 @@ fn main() {
     exit(exit_code, failed_result);
 }
 
+/// Exit function to handle exit codes
 fn exit(exit_code: i32, failed_result: bool) {
     if exit_code != 0 && failed_result {
         std::process::exit(exit_code)
+    }
+}
+
+// Function to parse a hostname with an optional port
+fn parse_host_port(address: &str) -> HostPort {
+    // Try to fix common user mistakes by adding https:// if missing a scheme
+    let address_with_scheme = if !address.contains("://") {
+        format!("https://{}", address)
+    } else {
+        address.to_string()
+    };
+
+    // Check if this might be a URL
+    if let Ok(url) = Url::parse(&address_with_scheme) {
+        // If it's a valid URL, extract host and port
+        if let Some(host_str) = url.host_str() {
+            return HostPort {
+                host: host_str.to_string(),
+                port: url.port(),
+            };
+        }
+    }
+
+    // Not a valid URL, check if it has a port specification (hostname:port)
+    // This handles cases like "example.com:8443"
+    if let Some((host, port_str)) = address.split_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            // Make sure we don't include IPv6 brackets in the hostname
+            let clean_host = host.trim_start_matches('[').trim_end_matches(']');
+            return HostPort {
+                host: clean_host.to_string(),
+                port: Some(port),
+            };
+        }
+    }
+
+    // No port specified, just a hostname
+    // For IPv6 addresses, clean up any brackets
+    let clean_address = address.trim_start_matches('[').trim_end_matches(']');
+    HostPort {
+        host: clean_address.to_string(),
+        port: None,
     }
 }

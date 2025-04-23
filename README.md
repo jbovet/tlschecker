@@ -47,11 +47,42 @@ sudo install tlschecker /usr/local/bin/tlschecker
 
 ## Examples
 
+Basic usage:
 ```sh
 ➜ tlschecker jpbd.dev expired.badssl.com
 ```
 ![](/img/1-2.png)
 
+Using custom ports:
+```sh
+➜ tlschecker example.com:8443 secure-service.internal:9443
+```
+
+You can specify the port in three ways:
+1. Using hostname:port format: `example.com:8443`
+2. Using a full URL: `https://example.com:8443`
+3. Using the default port (443) by just specifying the hostname: `example.com`
+
+### Troubleshooting Connection Issues
+
+If you encounter connection problems, here are some common error messages and solutions:
+
+1. **"Cannot resolve hostname"**
+   - Check that the hostname is spelled correctly
+   - Verify your network and DNS configuration
+   - Try using an IP address instead if DNS resolution is not available
+
+2. **"Connection refused"**
+   - Verify the host is running a TLS service on the specified port
+   - Check if a firewall might be blocking the connection
+   - Confirm the service is publicly accessible
+
+3. **"TLS handshake failed"**
+   - The server might be using an unsupported TLS version
+   - There might be an issue with the server's certificate configuration
+   - Your network might be intercepting the TLS connection
+
+JSON output:
 ```sh
 ➜ tlschecker jpbd.dev -o json
 [
@@ -116,6 +147,7 @@ sudo install tlschecker /usr/local/bin/tlschecker
 ]
 ```
 
+Text output:
 ```sh
 ➜ tlschecker jpbd.dev -o text
 --------------------------------------
