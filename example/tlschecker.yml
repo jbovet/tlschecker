@@ -7,7 +7,7 @@
 #     spec:
 #       containers:
 #         - name: tlschecker
-#           image: josebovet/tlschecker:v1.0.0
+#           image: josebovet/tlschecker:v1.1.0
 #           args: ["expired.badssl.com", "-o", "json", "--exit-code", "1"]
 #       restartPolicy: Never
 # ---
@@ -23,7 +23,7 @@ spec:
         spec:
           containers:
           - name: tlschecker
-            image: josebovet/tlschecker:v1.0.0
+            image: josebovet/tlschecker:v1.1.0
             imagePullPolicy: IfNotPresent
-            args: ["expired.badssl.com", "-o", "json", "--exit-code", "1"]
+            args: [ "expired.badssl.com", "-o", "json", "--exit-code", "1" ]
           restartPolicy: OnFailure
