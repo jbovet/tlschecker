@@ -17,10 +17,10 @@ static TIMEOUT: Duration = Duration::from_secs(30);
 /// Revocation Status
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum RevocationStatus {
-    Good,
+    Good,            // Certificate is valid
     Revoked(String), // Reason for revocation if available
-    Unknown,
-    NotChecked,
+    Unknown,         // OCSP responder is unavailable or unknown
+    NotChecked,      // Revocation status not checked
 }
 
 /// Revocation Status trait
@@ -109,6 +109,15 @@ pub fn find_issuer_cert<'a>(cert: &X509Ref, chain: &'a [X509]) -> Option<&'a X50
     None
 }
 
+/// Check OCSP status
+/// This function checks the OCSP status of a given certificate against a chain of certificates.
+/// It returns a RevocationStatus indicating whether the certificate is good, revoked, or unknown.
+/// It uses the OCSP responder URLs from the certificate to perform the check.
+/// If the issuer certificate is not found in the chain, it returns Unknown.
+/// If the OCSP responder is unavailable or the response is not successful, it returns Unknown.
+/// If the OCSP response indicates that the certificate is revoked, it returns Revoked with the reason.
+/// If the OCSP response indicates that the certificate is good, it returns Good.
+/// If the OCSP response is not valid, it returns Unknown.
 pub fn check_ocsp_status(
     cert: &X509,
     chain: &[X509],
@@ -252,7 +261,13 @@ pub fn check_ocsp_status(
     Ok(RevocationStatus::Unknown)
 }
 
-/// Step 4: Modify the TLS::from function to include revocation checking
+/// Check TLS certificate
+/// This function checks the TLS certificate of a given host and port.
+/// It returns a TLS struct containing information about the cipher and certificate.
+/// If the connection fails, it returns a TLSValidationError.
+/// If the hostname is empty, it returns a TLSValidationError.
+/// If the OCSP status check fails, it returns a TLSValidationError.
+/// If the OCSP status is not checked, it returns a TLSValidationError.
 impl TLS {
     pub fn from(
         host: &str,
@@ -359,7 +374,7 @@ impl TLS {
     }
 }
 
-/// get x509 name entries
+/// Get x509 name entries
 fn from_entries(mut entries: X509NameEntries) -> String {
     match entries.next() {
         None => "None".to_string(),
@@ -370,7 +385,7 @@ fn from_entries(mut entries: X509NameEntries) -> String {
             .to_string(),
     }
 }
-/// get subject from certificate
+/// Get subject from certificate
 fn get_subject(cert_ref: &X509) -> Subject {
     let subject = cert_ref.subject_name();
 
@@ -391,7 +406,7 @@ fn get_subject(cert_ref: &X509) -> Subject {
     }
 }
 
-/// get issuer from certificate
+/// Get issuer from certificate
 fn get_issuer(cert_ref: &X509) -> Issuer {
     let issuer = cert_ref.issuer_name();
 
@@ -406,7 +421,7 @@ fn get_issuer(cert_ref: &X509) -> Issuer {
     }
 }
 
-/// get certificate info
+/// Get certificate info
 fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
     let mut sans = Vec::new();
     match cert_ref.subject_alt_names() {
@@ -435,12 +450,12 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
     }
 }
 
-/// get validity in hours
+/// Get validity in hours
 fn get_validity_in_hours(not_after: &Asn1TimeRef) -> i32 {
     get_validity_days(not_after) * 24
 }
 
-/// get validity in days
+/// Get validity in days
 fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
     Asn1Time::days_from_now(0)
         .unwrap()
@@ -450,7 +465,7 @@ fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
         .days
 }
 
-/// check if certificate has expired
+/// Check if certificate has expired
 fn has_expired(not_after: &Asn1TimeRef) -> bool {
     not_after < Asn1Time::days_from_now(0).unwrap()
 }

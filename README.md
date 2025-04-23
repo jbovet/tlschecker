@@ -63,6 +63,45 @@ You can specify the port in three ways:
 2. Using a full URL: `https://example.com:8443`
 3. Using the default port (443) by just specifying the hostname: `example.com`
 
+### Certificate Revocation Checking
+
+TLSChecker now supports certificate revocation checking via OCSP (Online Certificate Status Protocol). This feature allows you to verify if a certificate has been revoked by its issuing Certificate Authority.
+
+To enable revocation checking, use the `--check-revocation` flag:
+
+```sh
+➜ tlschecker --check-revocation jpbd.dev
+```
+
+The revocation status will be displayed in the output:
+- **Valid**: Certificate is not revoked
+- **Revoked**: Certificate has been revoked (with reason if available)
+- **Unknown**: Revocation status couldn't be determined
+- **Not Checked**: Revocation status was not checked (default when not using the flag)
+
+Example with a revoked certificate:
+```sh
+➜ tlschecker --check-revocation revoked.badssl.com
+```
+
+Note: Revocation checking requires contacting OCSP responders, which adds some latency to the checks.
+
+### Prometheus Integration with Revocation Metrics
+
+When using Prometheus integration, the revocation status is included in the metrics:
+
+```sh
+tlschecker --prometheus --prometheus-address http://localhost:9091 --check-revocation example.com
+```
+
+A new metric `tlschecker_revocation_status` is exported with the following values:
+- 0 = Not checked
+- 1 = Good (not revoked)
+- 2 = Unknown
+- 3 = Revoked
+
+Additionally, a `revoked` label is added to all metrics with a boolean value indicating whether the certificate is revoked.
+
 ### Troubleshooting Connection Issues
 
 If you encounter connection problems, here are some common error messages and solutions:
@@ -82,67 +121,76 @@ If you encounter connection problems, here are some common error messages and so
    - There might be an issue with the server's certificate configuration
    - Your network might be intercepting the TLS connection
 
+### Output Formats
+
 JSON output:
 ```sh
 ➜ tlschecker jpbd.dev -o json
 [
   {
-    "hostname": "jpbd.dev",
-    "subject": {
-      "country_or_region": "None",
-      "state_or_province": "None",
-      "locality": "None",
-      "organization_unit": "None",
-      "organization": "None",
-      "common_name": "jpbd.dev"
+    "cipher": {
+      "name": "TLS_AES_128_GCM_SHA256",
+      "version": "TLSv1.3"
     },
-    "issued": {
-      "country_or_region": "US",
-      "organization": "Let's Encrypt",
-      "common_name": "E1"
-    },
-    "valid_from": "Jul 31 07:41:38 2023 GMT",
-    "valid_to": "Oct 29 07:41:37 2023 GMT",
-    "validity_days": 79,
-    "validity_hours": 1896,
-    "is_expired": false,
-    "cert_sn": "417275593632489451472716682020094135372872",
-    "cert_ver": "2",
-    "cert_alg": "ecdsa-with-SHA384",
-    "sans": [
-      "*.jpbd.dev",
-      "jpbd.dev"
-    ],
-    "chain": [
-      {
-        "subject": "jpbd.dev",
-        "issuer": "E1",
-        "valid_from": "Jul 31 07:41:38 2023 GMT",
-        "valid_to": "Oct 29 07:41:37 2023 GMT",
-        "signature_algorithm": "ecdsa-with-SHA384"
+    "certificate": {
+      "hostname": "jpbd.dev",
+      "subject": {
+        "country_or_region": "None",
+        "state_or_province": "None",
+        "locality": "None",
+        "organization_unit": "None",
+        "organization": "None",
+        "common_name": "jpbd.dev"
       },
-      {
-        "subject": "E1",
-        "issuer": "ISRG Root X2",
-        "valid_from": "Sep  4 00:00:00 2020 GMT",
-        "valid_to": "Sep 15 16:00:00 2025 GMT",
-        "signature_algorithm": "ecdsa-with-SHA384"
+      "issued": {
+        "country_or_region": "US",
+        "organization": "Let's Encrypt",
+        "common_name": "E1"
       },
-      {
-        "subject": "ISRG Root X2",
-        "issuer": "ISRG Root X1",
-        "valid_from": "Sep  4 00:00:00 2020 GMT",
-        "valid_to": "Sep 15 16:00:00 2025 GMT",
-        "signature_algorithm": "sha256WithRSAEncryption"
-      },
-      {
-        "subject": "ISRG Root X1",
-        "issuer": "DST Root CA X3",
-        "valid_from": "Jan 20 19:14:03 2021 GMT",
-        "valid_to": "Sep 30 18:14:03 2024 GMT",
-        "signature_algorithm": "sha256WithRSAEncryption"
-      }
-    ]
+      "valid_from": "Jul 31 07:41:38 2023 GMT",
+      "valid_to": "Oct 29 07:41:37 2023 GMT",
+      "validity_days": 79,
+      "validity_hours": 1896,
+      "is_expired": false,
+      "cert_sn": "417275593632489451472716682020094135372872",
+      "cert_ver": "2",
+      "cert_alg": "ecdsa-with-SHA384",
+      "sans": [
+        "*.jpbd.dev",
+        "jpbd.dev"
+      ],
+      "chain": [
+        {
+          "subject": "jpbd.dev",
+          "issuer": "E1",
+          "valid_from": "Jul 31 07:41:38 2023 GMT",
+          "valid_to": "Oct 29 07:41:37 2023 GMT",
+          "signature_algorithm": "ecdsa-with-SHA384"
+        },
+        {
+          "subject": "E1",
+          "issuer": "ISRG Root X2",
+          "valid_from": "Sep  4 00:00:00 2020 GMT",
+          "valid_to": "Sep 15 16:00:00 2025 GMT",
+          "signature_algorithm": "ecdsa-with-SHA384"
+        },
+        {
+          "subject": "ISRG Root X2",
+          "issuer": "ISRG Root X1",
+          "valid_from": "Sep  4 00:00:00 2020 GMT",
+          "valid_to": "Sep 15 16:00:00 2025 GMT",
+          "signature_algorithm": "sha256WithRSAEncryption"
+        },
+        {
+          "subject": "ISRG Root X1",
+          "issuer": "DST Root CA X3",
+          "valid_from": "Jan 20 19:14:03 2021 GMT",
+          "valid_to": "Sep 30 18:14:03 2024 GMT",
+          "signature_algorithm": "sha256WithRSAEncryption"
+        }
+      ],
+      "revocation_status": "NotChecked"
+    }
   }
 ]
 ```
@@ -172,6 +220,7 @@ Expired: false
 Certificate version: 2
 Certificate algorithm: ecdsa-with-SHA384
 Certificate S/N: 417275593632489451472716682020094135372872
+Revocation Status: Not Checked
 Subject Alternative Names:
  DNS Name: *.jpbd.dev
  DNS Name: jpbd.dev
