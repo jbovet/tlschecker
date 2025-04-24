@@ -43,7 +43,6 @@ sudo install tlschecker /usr/local/bin/tlschecker
 ```sh
 ➜  tlschecker --help
 ```
-![](/img/1-1.png)
 
 ## Examples
 
