@@ -49,7 +49,7 @@ sudo install tlschecker /usr/local/bin/tlschecker
 
 Basic usage:
 ```sh
-➜ tlschecker jpbd.dev expired.badssl.com
+➜ tlschecker --check-revocation x.com revoked.badssl.com jpbd.dev expired.badssl.com 
 ```
 ![](/img/1-2.png)
 
