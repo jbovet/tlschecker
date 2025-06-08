@@ -1,5 +1,6 @@
 use std::sync::mpsc::sync_channel;
 use std::thread;
+mod config;
 mod metrics;
 
 use clap::{Parser, ValueEnum};
@@ -11,13 +12,23 @@ use tlschecker::RevocationStatus; // Import the new RevocationStatus enum
 use tlschecker::TLS;
 use url::Url;
 
+use config::{Config, ConfigError};
+
 /// Experimental TLS/SSL certificate checker
 #[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// A space-delimited hosts list to be checked
-    #[clap(value_parser, required = true)]
+    #[clap(value_parser)]
     addresses: Vec<String>,
+
+    /// Configuration file path (TOML format)
+    #[arg(short, long)]
+    config: Option<String>,
+
+    /// Generate example configuration file
+    #[arg(long)]
+    generate_config: bool,
 
     /// Enable verbose to see what is going on
     #[arg(short, value_enum, default_value_t = OutFormat::Summary)]
@@ -57,6 +68,29 @@ enum OutFormat {
     Text,
     /// Summary by default
     Summary,
+}
+
+impl std::fmt::Display for OutFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutFormat::Json => write!(f, "json"),
+            OutFormat::Text => write!(f, "text"),
+            OutFormat::Summary => write!(f, "summary"),
+        }
+    }
+}
+
+impl std::str::FromStr for OutFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "json" => Ok(OutFormat::Json),
+            "text" => Ok(OutFormat::Text),
+            "summary" => Ok(OutFormat::Summary),
+            _ => Err(format!("Invalid output format: {}", s)),
+        }
+    }
 }
 
 /// Output Formatter trait
@@ -262,14 +296,82 @@ struct HostPort {
     port: Option<u16>,
 }
 
-/// Main function
+/// Struct to hold final configuration after merging CLI and file
+struct FinalConfig {
+    addresses: Vec<String>,
+    output: OutFormat,
+    exit_code: i32,
+    prometheus: bool,
+    prometheus_address: String,
+    check_revocation: bool,
+}
+
+impl FinalConfig {
+    fn from_merged_config(config: Config) -> Result<Self, ConfigError> {
+        let addresses = config.hosts.unwrap_or_default();
+
+        if addresses.is_empty() {
+            return Err(ConfigError::Validation(
+                "No hosts specified. Please provide at least one host via command line or config file.\n\
+                 Usage: tlschecker <hosts...> [OPTIONS]\n\
+                 Example: tlschecker example.com another.com:8443".to_string()
+            ));
+        }
+
+        let output_str = config.output.unwrap_or_else(|| "summary".to_string());
+        let output = output_str
+            .parse::<OutFormat>()
+            .map_err(ConfigError::Validation)?;
+
+        let prometheus_config = config
+            .prometheus
+            .unwrap_or_else(|| config::PrometheusConfig {
+                enabled: Some(false),
+                address: Some("http://localhost:9091".to_string()),
+            });
+
+        Ok(FinalConfig {
+            addresses,
+            output,
+            exit_code: config.exit_code.unwrap_or(0),
+            prometheus: prometheus_config.enabled.unwrap_or(false),
+            prometheus_address: prometheus_config
+                .address
+                .unwrap_or_else(|| "http://localhost:9091".to_string()),
+            check_revocation: config.check_revocation.unwrap_or(false),
+        })
+    }
+}
+
 fn main() {
     let cli = Args::parse();
-    let exit_code = cli.exit_code;
+
+    // Handle config generation
+    if cli.generate_config {
+        println!("# TLSChecker Configuration File");
+        println!(
+            "# Save this as tlschecker.toml and use with: tlschecker --config tlschecker.toml"
+        );
+        println!();
+        println!("{}", Config::example_toml());
+        return;
+    }
+
+    // Load configuration
+    let final_config = match load_config(&cli) {
+        Ok(config) => config,
+        Err(_e) => {
+            eprintln!("Try running with --help for usage information");
+            eprintln!("Or use --generate-config to create a sample configuration file");
+            std::process::exit(1);
+        }
+    };
+
+    let exit_code = final_config.exit_code;
     let mut failed_result = false;
 
     // Parse hosts and ports
-    let hosts_and_ports: Vec<HostPort> = cli
+    let hosts_and_ports: Vec<HostPort> = final_config
         .addresses
         .iter()
         .map(|address| parse_host_port(address))
@@ -278,7 +380,7 @@ fn main() {
     let size = hosts_and_ports.len();
     let (sender, receiver) = sync_channel(size);
     let hosts_len = hosts_and_ports.len();
-    let check_revocation = cli.check_revocation;
+    let check_revocation = final_config.check_revocation;
 
     thread::spawn(move || {
         for host_port in hosts_and_ports {
@@ -357,18 +459,56 @@ fn main() {
         failed_result = true;
     }
 
-    let formatter = match cli.output {
+    let formatter = match final_config.output {
         OutFormat::Json => FormatterFactory::new_formatter(&OutFormat::Json),
         OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
         OutFormat::Summary => FormatterFactory::new_formatter(&OutFormat::Summary),
     };
     formatter.format(&results);
 
-    if cli.prometheus {
-        metrics::prom::prometheus_metrics(results, cli.prometheus_address);
+    if final_config.prometheus {
+        metrics::prom::prometheus_metrics(results, final_config.prometheus_address);
     }
 
     exit(exit_code, failed_result);
+}
+
+/// Load and merge configuration from file and CLI arguments
+fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
+    // Start with default configuration
+    let mut config = Config::default();
+
+    // Load from config file if specified, otherwise try tlschecker.toml
+    if let Some(config_path) = &cli.config {
+        let file_config = Config::from_file(config_path)?;
+        config = config.merge_with(file_config);
+    } else {
+        // Try to load from default tlschecker.toml if it exists
+        if let Ok(file_config) = Config::from_file("tlschecker.toml") {
+            config = config.merge_with(file_config);
+        }
+    }
+
+    // Merge with CLI arguments (CLI takes precedence)
+    let cli_addresses = if !cli.addresses.is_empty() {
+        Some(cli.addresses.clone())
+    } else {
+        None
+    };
+
+    let cli_config = Config::from_cli_args(
+        cli_addresses,
+        Some(cli.output.to_string()),
+        Some(cli.exit_code),
+        Some(cli.prometheus),
+        Some(cli.prometheus_address.clone()),
+        Some(cli.check_revocation),
+    );
+
+    config = config.merge_with(cli_config);
+
+    // Convert to final configuration and validate
+    FinalConfig::from_merged_config(config)
 }
 
 /// Exit function to handle exit codes
