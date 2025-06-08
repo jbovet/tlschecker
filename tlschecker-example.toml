@@ -1,11 +1,5 @@
 # TLSChecker Configuration File
 # Save this as tlschecker.toml and use with: tlschecker --config tlschecker.toml
 
-hosts = ["jpbd.dev", "expired.badssl.com"]
-output = "Json"
-exit_code = 1
-check_revocation = true
-
-[prometheus]
-enabled = true
-address = "http://localhost:9091"
+hosts = ["jpbd.dev", "expired.badssl.com", "self-signed.badssl.com"]
+output = "summary"

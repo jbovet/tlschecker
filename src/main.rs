@@ -31,25 +31,25 @@ struct Args {
     generate_config: bool,
 
     /// Enable verbose to see what is going on
-    #[arg(short, value_enum, default_value_t = OutFormat::Summary)]
-    output: OutFormat,
+    #[arg(short, value_enum)]
+    output: Option<OutFormat>,
 
     /// Exits with code 0 even when certificate expired is detected
-    #[arg(long, default_value_t = 0)]
-    exit_code: i32,
+    #[arg(long)]
+    exit_code: Option<i32>,
 
     /// Enable prometheus push gateway metrics
     #[arg(long)]
-    prometheus: bool,
+    prometheus: Option<bool>,
 
     /// Prometheus push gateway address
     /// Default is http://localhost:9091
-    #[arg(long, default_value = "http://localhost:9091")]
-    prometheus_address: String,
+    #[arg(long)]
+    prometheus_address: Option<String>,
 
     /// Enable certificate revocation checking
-    #[arg(long)]
-    check_revocation: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    check_revocation: Option<bool>,
 }
 
 /// Output format
@@ -498,11 +498,11 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
 
     let cli_config = Config::from_cli_args(
         cli_addresses,
-        Some(cli.output.to_string()),
-        Some(cli.exit_code),
-        Some(cli.prometheus),
-        Some(cli.prometheus_address.clone()),
-        Some(cli.check_revocation),
+        cli.output.as_ref().map(|o| o.to_string()),
+        cli.exit_code,
+        cli.prometheus,
+        cli.prometheus_address.clone(),
+        cli.check_revocation,
     );
 
     config = config.merge_with(cli_config);
