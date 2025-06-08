@@ -141,132 +141,28 @@ If you encounter connection problems, here are some common error messages and so
    - There might be an issue with the server's certificate configuration
    - Your network might be intercepting the TLS connection
 
-### Output Formats
+### Configuration File Support
 
-JSON output:
-```sh
-➜ tlschecker jpbd.dev -o json
-[
-  {
-    "cipher": {
-      "name": "TLS_AES_128_GCM_SHA256",
-      "version": "TLSv1.3"
-    },
-    "certificate": {
-      "hostname": "jpbd.dev",
-      "subject": {
-        "country_or_region": "None",
-        "state_or_province": "None",
-        "locality": "None",
-        "organization_unit": "None",
-        "organization": "None",
-        "common_name": "jpbd.dev"
-      },
-      "issued": {
-        "country_or_region": "US",
-        "organization": "Let's Encrypt",
-        "common_name": "E1"
-      },
-      "valid_from": "Jul 31 07:41:38 2023 GMT",
-      "valid_to": "Oct 29 07:41:37 2023 GMT",
-      "validity_days": 79,
-      "validity_hours": 1896,
-      "is_expired": false,
-      "cert_sn": "417275593632489451472716682020094135372872",
-      "cert_ver": "2",
-      "cert_alg": "ecdsa-with-SHA384",
-      "sans": [
-        "*.jpbd.dev",
-        "jpbd.dev"
-      ],
-      "chain": [
-        {
-          "subject": "jpbd.dev",
-          "issuer": "E1",
-          "valid_from": "Jul 31 07:41:38 2023 GMT",
-          "valid_to": "Oct 29 07:41:37 2023 GMT",
-          "signature_algorithm": "ecdsa-with-SHA384"
-        },
-        {
-          "subject": "E1",
-          "issuer": "ISRG Root X2",
-          "valid_from": "Sep  4 00:00:00 2020 GMT",
-          "valid_to": "Sep 15 16:00:00 2025 GMT",
-          "signature_algorithm": "ecdsa-with-SHA384"
-        },
-        {
-          "subject": "ISRG Root X2",
-          "issuer": "ISRG Root X1",
-          "valid_from": "Sep  4 00:00:00 2020 GMT",
-          "valid_to": "Sep 15 16:00:00 2025 GMT",
-          "signature_algorithm": "sha256WithRSAEncryption"
-        },
-        {
-          "subject": "ISRG Root X1",
-          "issuer": "DST Root CA X3",
-          "valid_from": "Jan 20 19:14:03 2021 GMT",
-          "valid_to": "Sep 30 18:14:03 2024 GMT",
-          "signature_algorithm": "sha256WithRSAEncryption"
-        }
-      ],
-      "revocation_status": "NotChecked"
-    }
-  }
+You can use a TOML configuration file to check multiple hosts. Create a file like `tlschecker.toml`:
+
+```toml
+hosts = [
+    "example.com",
+    "example.com:8443",
+    "secure-service.internal:9443"
 ]
+
+# Optional settings
+check_revocation = true
+output_format = "json"
+prometheus = false
+prometheus_address = "http://localhost:9091"
 ```
 
-Text output:
+Then run TLSChecker with the config file:
+
 ```sh
-➜ tlschecker jpbd.dev -o text
---------------------------------------
-Hostname: jpbd.dev
-Issued domain: jpbd.dev
-Subject Name :
- Country or Region: None
- State or Province: None
- Locality: None
- Organizational Unit: None
- Organization: None
- Common Name: jpbd.dev
-Issuer Name:
- Country or Region: US
- Organization: Let's Encrypt
- Common Name: E1
-Valid from: Jul 31 07:41:38 2023 GMT
-Valid to: Oct 29 07:41:37 2023 GMT
-Days left: 79
-Hours left: 1896
-Expired: false
-Certificate version: 2
-Certificate algorithm: ecdsa-with-SHA384
-Certificate S/N: 417275593632489451472716682020094135372872
-Revocation Status: Not Checked
-Subject Alternative Names:
- DNS Name: *.jpbd.dev
- DNS Name: jpbd.dev
-Additional Certificates (if supplied):
-Chain #1
- Subject: "jpbd.dev"
- Valid from: "Jul 31 07:41:38 2023 GMT"
- Valid until: "Oct 29 07:41:37 2023 GMT"
- Issuer: "E1"
- Signature algorithm: "ecdsa-with-SHA384"
-Chain #2
- Subject: "E1"
- Valid from: "Sep  4 00:00:00 2020 GMT"
- Valid until: "Sep 15 16:00:00 2025 GMT"
- Issuer: "ISRG Root X2"
- Signature algorithm: "ecdsa-with-SHA384"
-Chain #3
- Subject: "ISRG Root X2"
- Valid from: "Sep  4 00:00:00 2020 GMT"
- Valid until: "Sep 15 16:00:00 2025 GMT"
- Issuer: "ISRG Root X1"
- Signature algorithm: "sha256WithRSAEncryption"
-Chain #4
- Subject: "ISRG Root X1"
- Valid from: "Jan 20 19:14:03 2021 GMT"
- Valid until: "Sep 30 18:14:03 2024 GMT"
- Issuer: "DST Root CA X3"
- Signature algorithm: "sha256WithRSAEncryption"
+➜ tlschecker -c example-tlschecker.toml
 ```
+
+See [tlschecker-example.toml](tlschecker-example.toml) for a complete configuration example.
