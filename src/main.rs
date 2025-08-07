@@ -573,3 +573,34 @@ fn parse_host_port(address: &str) -> HostPort {
         port: None,
     }
 }
+
+#[test]
+fn test_self_signed_certificate() {
+    let host = "self-signed.badssl.com";
+    match TLS::from(host, None, false) {
+        Ok(tls_result) => {
+            // The certificate should be marked as self-signed
+            assert!(
+                tls_result.certificate.is_self_signed,
+                "Expected self-signed.badssl.com certificate to be self-signed"
+            );
+        }
+        Err(err) => {
+            // It's also acceptable if the connection fails since some TLS clients reject self-signed certs
+            assert!(
+                err.details.contains("certificate"),
+                "Expected certificate error, got: {}",
+                err.details
+            );
+        }
+    }
+
+    // Test a known non-self-signed certificate
+    let host = "google.com";
+    if let Ok(tls_result) = TLS::from(host, None, false) {
+        assert!(
+            !tls_result.certificate.is_self_signed,
+            "google.com certificate should not be self-signed"
+        );
+    }
+}
