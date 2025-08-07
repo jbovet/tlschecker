@@ -70,6 +70,7 @@ pub struct CertificateInfo {
     pub sans: Vec<String>,
     pub chain: Option<Vec<Chain>>,
     pub revocation_status: RevocationStatus,
+    pub is_self_signed: bool,
 }
 /// Issuer
 #[derive(Serialize, Deserialize, Clone)]
@@ -500,6 +501,7 @@ impl TLS {
             sans: data.sans,
             chain: Some(chain_info),
             revocation_status: data.revocation_status,
+            is_self_signed: data.is_self_signed,
         };
 
         Ok(TLS {
@@ -582,6 +584,7 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         sans,
         chain: None,
         revocation_status: RevocationStatus::NotChecked,
+        is_self_signed: is_self_signed_certificate(cert_ref),
     }
 }
 
@@ -639,6 +642,32 @@ impl From<ErrorStack> for TLSValidationError {
 impl<S> From<HandshakeError<S>> for TLSValidationError {
     fn from(_: HandshakeError<S>) -> TLSValidationError {
         TLSValidationError::new("TLS handshake failed.")
+    }
+}
+
+/// Check if a certificate is self-signed
+/// A certificate is considered self-signed if:
+/// 1. Subject and issuer are identical
+/// 2. The certificate can be verified using its own public key
+pub fn is_self_signed_certificate(cert: &X509) -> bool {
+    let subject = cert.subject_name();
+    let issuer = cert.issuer_name();
+
+    // Basic check: compare subject and issuer
+    let names_match = subject
+        .try_cmp(issuer)
+        .map(|ordering| ordering == std::cmp::Ordering::Equal)
+        .unwrap_or(false);
+
+    if !names_match {
+        return false;
+    }
+
+    // Cryptographic verification: check if the certificate
+    // can be verified using its own public key
+    match cert.public_key() {
+        Ok(public_key) => cert.verify(&public_key).is_ok(),
+        Err(_) => false,
     }
 }
 
