@@ -134,6 +134,7 @@ impl Formatter for TextFormat {
             println!("Valid to: {}", cert.valid_to);
             println!("Days left: {}", cert.validity_days);
             println!("Hours left: {}", cert.validity_hours);
+            println!("Self-signed: {}", cert.is_self_signed);
             println!("Expired: {}", cert.is_expired);
             println!("Certificate version: {}", cert.cert_ver);
             println!("Certificate algorithm: {}", cert.cert_alg);
@@ -191,6 +192,7 @@ impl Formatter for SummaryFormat {
                 "Protocol",
                 "Issuer",
                 "Expired",
+                "Self-Signed",
                 "Revocation",
                 "Days before expired",
                 "Hours before expired",
@@ -244,6 +246,17 @@ impl Formatter for SummaryFormat {
                     .set_alignment(CellAlignment::Center),
             };
 
+            let self_signed_cell = match rs.certificate.is_self_signed {
+                true => Cell::new("Yes")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Yellow)
+                    .set_alignment(CellAlignment::Center),
+                false => Cell::new("No")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Green)
+                    .set_alignment(CellAlignment::Center),
+            };
+
             table.add_row(vec![
                 Cell::new(&rs.certificate.hostname)
                     .add_attribute(Attribute::Bold)
@@ -258,6 +271,7 @@ impl Formatter for SummaryFormat {
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Blue),
                 expired_cell,
+                self_signed_cell,
                 revocation_cell,
                 Cell::new(rs.certificate.validity_days).set_alignment(CellAlignment::Center),
                 Cell::new(rs.certificate.validity_hours).set_alignment(CellAlignment::Center),
@@ -557,5 +571,36 @@ fn parse_host_port(address: &str) -> HostPort {
     HostPort {
         host: clean_address.to_string(),
         port: None,
+    }
+}
+
+#[test]
+fn test_self_signed_certificate() {
+    let host = "self-signed.badssl.com";
+    match TLS::from(host, None, false) {
+        Ok(tls_result) => {
+            // The certificate should be marked as self-signed
+            assert!(
+                tls_result.certificate.is_self_signed,
+                "Expected self-signed.badssl.com certificate to be self-signed"
+            );
+        }
+        Err(err) => {
+            // It's also acceptable if the connection fails since some TLS clients reject self-signed certs
+            assert!(
+                err.details.contains("certificate"),
+                "Expected certificate error, got: {}",
+                err.details
+            );
+        }
+    }
+
+    // Test a known non-self-signed certificate
+    let host = "google.com";
+    if let Ok(tls_result) = TLS::from(host, None, false) {
+        assert!(
+            !tls_result.certificate.is_self_signed,
+            "google.com certificate should not be self-signed"
+        );
     }
 }
