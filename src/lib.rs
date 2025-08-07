@@ -655,10 +655,10 @@ pub fn is_self_signed_certificate(cert: &X509) -> bool {
 
     // A certificate is considered self-signed if the issuer and subject are the same,
     // and the certificate's signature can be verified with its own public key.
-    subject.try_cmp(issuer).map_or(false, |o| o.is_eq())
+    subject.try_cmp(issuer).is_ok_and(|o| o.is_eq())
         && cert
             .public_key()
-            .map_or(false, |pkey| cert.verify(&pkey).is_ok())
+            .is_ok_and(|pkey| cert.verify(&pkey).is_ok())
 }
 
 #[cfg(test)]
