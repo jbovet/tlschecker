@@ -653,22 +653,12 @@ pub fn is_self_signed_certificate(cert: &X509) -> bool {
     let subject = cert.subject_name();
     let issuer = cert.issuer_name();
 
-    // Basic check: compare subject and issuer
-    let names_match = subject
-        .try_cmp(issuer)
-        .map(|ordering| ordering == std::cmp::Ordering::Equal)
-        .unwrap_or(false);
-
-    if !names_match {
-        return false;
-    }
-
-    // Cryptographic verification: check if the certificate
-    // can be verified using its own public key
-    match cert.public_key() {
-        Ok(public_key) => cert.verify(&public_key).is_ok(),
-        Err(_) => false,
-    }
+    // A certificate is considered self-signed if the issuer and subject are the same,
+    // and the certificate's signature can be verified with its own public key.
+    subject.try_cmp(issuer).map_or(false, |o| o.is_eq())
+        && cert
+            .public_key()
+            .map_or(false, |pkey| cert.verify(&pkey).is_ok())
 }
 
 #[cfg(test)]
