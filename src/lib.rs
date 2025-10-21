@@ -1,3 +1,27 @@
+//! Core TLS/SSL certificate validation library.
+//!
+//! This module provides functionality for:
+//! - Establishing TLS connections to remote hosts
+//! - Extracting and parsing X.509 certificates
+//! - Validating certificate expiration dates
+//! - Checking certificate revocation status via OCSP and CRL
+//! - Detecting self-signed certificates
+//! - Extracting certificate chain information
+//!
+//! # Example
+//!
+//! ```no_run
+//! use tlschecker::TLS;
+//!
+//! // Check a certificate without revocation checking
+//! let result = TLS::from("example.com", None, false)?;
+//! println!("Certificate expires in {} days", result.certificate.validity_days);
+//!
+//! // Check with revocation checking enabled
+//! let result = TLS::from("example.com", Some(443), true)?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+
 use std::fmt::Debug;
 use std::io::Error;
 use std::ops::Deref;
@@ -11,87 +35,179 @@ use openssl::ssl::HandshakeError;
 use openssl::x509::{CrlStatus, ReasonCode, X509Crl, X509NameEntries, X509Ref, X509};
 use serde::{Deserialize, Serialize};
 
-/// Timeout for TLS connection
+/// Default timeout for TLS connection attempts (30 seconds).
 static TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Revocation Status
+/// Represents the revocation status of a certificate.
+///
+/// Certificate revocation checking is performed via OCSP (Online Certificate Status Protocol)
+/// and CRL (Certificate Revocation List) mechanisms. This enum indicates the outcome of
+/// those checks.
+///
+/// # Variants
+///
+/// - `Good`: Certificate is valid and not revoked
+/// - `Revoked(String)`: Certificate has been revoked, with optional reason
+/// - `Unknown`: Status could not be determined (responder unavailable, network error, etc.)
+/// - `NotChecked`: Revocation checking was not performed
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum RevocationStatus {
-    Good,            // Certificate is valid
-    Revoked(String), // Reason for revocation if available
-    Unknown,         // OCSP responder is unavailable or unknown
-    NotChecked,      // Revocation status not checked
+    /// Certificate is valid and not revoked
+    Good,
+    /// Certificate has been revoked, with the reason for revocation if available
+    Revoked(String),
+    /// OCSP responder is unavailable or status cannot be determined
+    Unknown,
+    /// Revocation status checking was not performed
+    NotChecked,
 }
 
-/// Revocation Status trait
 impl Default for RevocationStatus {
+    /// Returns `NotChecked` as the default revocation status.
     fn default() -> Self {
         RevocationStatus::NotChecked
     }
 }
 
-/// Certificate Chain
+/// Represents a certificate in the certificate chain.
+///
+/// Contains basic information about an intermediate or root certificate
+/// in the TLS certificate chain.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Chain {
+    /// Subject common name of the certificate
     pub subject: String,
+    /// Issuer common name of the certificate
     pub issuer: String,
+    /// Certificate validity start date
     pub valid_from: String,
+    /// Certificate expiration date
     pub valid_to: String,
+    /// Signature algorithm used by the certificate
     pub signature_algorithm: String,
 }
 
-/// TLS Struct
+/// Complete TLS connection information including cipher and certificate details.
+///
+/// This is the main result type returned when checking a TLS certificate.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TLS {
+    /// TLS cipher suite information
     pub cipher: Cipher,
+    /// Detailed certificate information
     pub certificate: CertificateInfo,
 }
-/// Cipher Struct
+
+/// TLS cipher suite information.
+///
+/// Contains details about the negotiated cipher and protocol version
+/// used for the TLS connection.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Cipher {
+    /// Name of the cipher suite (e.g., "ECDHE-RSA-AES128-GCM-SHA256")
     pub name: String,
+    /// TLS protocol version (e.g., "TLSv1.3", "TLSv1.2")
     pub version: String,
 }
 
-/// Certificate
+/// Comprehensive X.509 certificate information.
+///
+/// Contains all extracted metadata from a TLS certificate including
+/// validity dates, subject/issuer information, revocation status,
+/// and the certificate chain.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CertificateInfo {
+    /// The hostname that was checked
     pub hostname: String,
+    /// Certificate subject (owner) information
     pub subject: Subject,
+    /// Certificate issuer (CA) information
     pub issued: Issuer,
+    /// Certificate validity start date (ISO 8601 format)
     pub valid_from: String,
+    /// Certificate expiration date (ISO 8601 format)
     pub valid_to: String,
+    /// Number of days until certificate expires (negative if expired)
     pub validity_days: i32,
+    /// Number of hours until certificate expires (negative if expired)
     pub validity_hours: i32,
+    /// Whether the certificate has expired
     pub is_expired: bool,
+    /// Certificate serial number
     pub cert_sn: String,
+    /// Certificate version (typically "2" for v3 certificates)
     pub cert_ver: String,
+    /// Certificate signature algorithm
     pub cert_alg: String,
+    /// Subject Alternative Names (SANs) - DNS names the certificate is valid for
     pub sans: Vec<String>,
+    /// Complete certificate chain (intermediate and root certificates)
     pub chain: Option<Vec<Chain>>,
+    /// Certificate revocation status (if checked)
     pub revocation_status: RevocationStatus,
+    /// Whether this is a self-signed certificate
     pub is_self_signed: bool,
 }
-/// Issuer
+
+/// Certificate issuer (Certificate Authority) information.
+///
+/// Identifies the organization that issued and signed the certificate.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Issuer {
+    /// Country or region code (e.g., "US", "UK")
     pub country_or_region: String,
+    /// Organization name (e.g., "Let's Encrypt")
     pub organization: String,
+    /// Common name of the issuer
     pub common_name: String,
 }
 
-/// Subject
+/// Certificate subject (owner) information.
+///
+/// Identifies the entity to whom the certificate was issued.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Subject {
+    /// Country or region code
     pub country_or_region: String,
+    /// State or province name
     pub state_or_province: String,
+    /// City or locality name
     pub locality: String,
+    /// Organizational unit (department, division)
     pub organization_unit: String,
+    /// Organization name
     pub organization: String,
+    /// Common name (typically the primary domain name)
     pub common_name: String,
 }
 
-/// Find the issuer certificate in the chain
+/// Finds the issuer certificate in a certificate chain.
+///
+/// Given a certificate and a chain of certificates, this function searches for the
+/// certificate that issued (signed) the given certificate by comparing the certificate's
+/// issuer name with each chain certificate's subject name.
+///
+/// # Arguments
+///
+/// * `cert` - The certificate whose issuer to find
+/// * `chain` - The certificate chain to search within
+///
+/// # Returns
+///
+/// * `Some(&X509)` - Reference to the issuer certificate if found
+/// * `None` - If no matching issuer is found in the chain
+///
+/// # Example
+///
+/// ```no_run
+/// # use openssl::x509::X509;
+/// # use tlschecker::find_issuer_cert;
+/// # fn example(cert: &X509, chain: &[X509]) {
+/// if let Some(issuer) = find_issuer_cert(cert, chain) {
+///     println!("Found issuer: {:?}", issuer.subject_name());
+/// }
+/// # }
+/// ```
 pub fn find_issuer_cert<'a>(cert: &X509Ref, chain: &'a [X509]) -> Option<&'a X509> {
     let cert_issuer = cert.issuer_name();
 
@@ -110,15 +226,36 @@ pub fn find_issuer_cert<'a>(cert: &X509Ref, chain: &'a [X509]) -> Option<&'a X50
     None
 }
 
-/// Check OCSP status
-/// This function checks the OCSP status of a given certificate against a chain of certificates.
-/// It returns a RevocationStatus indicating whether the certificate is good, revoked, or unknown.
-/// It uses the OCSP responder URLs from the certificate to perform the check.
-/// If the issuer certificate is not found in the chain, it returns Unknown.
-/// If the OCSP responder is unavailable or the response is not successful, it returns Unknown.
-/// If the OCSP response indicates that the certificate is revoked, it returns Revoked with the reason.
-/// If the OCSP response indicates that the certificate is good, it returns Good.
-/// If the OCSP response is not valid, it returns Unknown.
+/// Checks certificate revocation status using OCSP (Online Certificate Status Protocol).
+///
+/// This function queries OCSP responders listed in the certificate's Authority Information Access
+/// extension to determine if the certificate has been revoked. OCSP provides real-time certificate
+/// status checking and is generally preferred over CRL checking due to its lower latency.
+///
+/// # Arguments
+///
+/// * `cert` - The certificate to check for revocation
+/// * `chain` - The certificate chain (must include the issuer certificate)
+///
+/// # Returns
+///
+/// * `Ok(RevocationStatus::Good)` - Certificate is valid and not revoked
+/// * `Ok(RevocationStatus::Revoked(reason))` - Certificate has been revoked
+/// * `Ok(RevocationStatus::Unknown)` - Status could not be determined
+/// * `Err(TLSValidationError)` - An error occurred during the check
+///
+/// # Timeout
+///
+/// Each OCSP responder request has a 10-second timeout. If multiple responders are listed,
+/// they are tried sequentially until one provides a definitive answer.
+///
+/// # Note
+///
+/// Returns `Unknown` in the following cases:
+/// - Issuer certificate not found in chain
+/// - No OCSP responder URLs in certificate
+/// - All OCSP responders are unavailable or return errors
+/// - OCSP response validation fails
 pub fn check_ocsp_status(
     cert: &X509,
     chain: &[X509],
@@ -262,7 +399,31 @@ pub fn check_ocsp_status(
     Ok(RevocationStatus::Unknown)
 }
 
-/// Combined revocation checking function that tries both OCSP and CRL
+/// Performs comprehensive certificate revocation checking using both OCSP and CRL.
+///
+/// This function attempts to determine certificate revocation status by trying multiple
+/// methods in order of preference:
+/// 1. OCSP (Online Certificate Status Protocol) - checked first as it's real-time
+/// 2. CRL (Certificate Revocation List) - fallback if OCSP is inconclusive
+///
+/// # Arguments
+///
+/// * `cert` - The certificate to check for revocation
+/// * `chain` - The certificate chain (must include the issuer certificate)
+///
+/// # Returns
+///
+/// * `Ok(RevocationStatus::Good)` - Certificate is valid per OCSP or CRL
+/// * `Ok(RevocationStatus::Revoked(reason))` - Certificate has been revoked
+/// * `Ok(RevocationStatus::Unknown)` - Status could not be determined by either method
+/// * `Err(TLSValidationError)` - An error occurred during checking
+///
+/// # Strategy
+///
+/// The function implements a waterfall strategy:
+/// - Returns immediately if OCSP check returns `Good` or `Revoked`
+/// - Falls back to CRL checking if OCSP returns `Unknown` or fails
+/// - Returns `Unknown` only if both methods fail to provide a definitive answer
 pub fn check_revocation_status(
     cert: &X509,
     chain: &[X509],
@@ -278,6 +439,34 @@ pub fn check_revocation_status(
     }
 }
 
+/// Checks certificate revocation status using CRL (Certificate Revocation List).
+///
+/// This function downloads and parses CRLs from the certificate's CRL Distribution Points
+/// extension to check if the certificate has been revoked. CRLs are periodically published
+/// lists of revoked certificate serial numbers.
+///
+/// # Arguments
+///
+/// * `cert` - The certificate to check for revocation
+/// * `chain` - The certificate chain (must include the issuer certificate)
+///
+/// # Returns
+///
+/// * `Ok(RevocationStatus::Good)` - Certificate is not in the CRL (valid)
+/// * `Ok(RevocationStatus::Revoked(reason))` - Certificate is listed in the CRL
+/// * `Ok(RevocationStatus::Unknown)` - Status could not be determined
+/// * `Err(TLSValidationError)` - An error occurred during the check
+///
+/// # Timeout
+///
+/// Each CRL download request has a 10-second timeout. Multiple distribution points
+/// are tried sequentially until one succeeds.
+///
+/// # Note
+///
+/// - Supports both DER and PEM encoded CRLs
+/// - Verifies CRL signature against the issuer certificate
+/// - Returns `Unknown` if no CRL distribution points are found or all are inaccessible
 pub fn check_crl_status(
     cert: &X509,
     chain: &[X509],
@@ -397,14 +586,55 @@ pub fn check_crl_status(
     Ok(RevocationStatus::Unknown)
 }
 
-/// Check TLS certificate
-/// This function checks the TLS certificate of a given host and port.
-/// It returns a TLS struct containing information about the cipher and certificate.
-/// If the connection fails, it returns a TLSValidationError.
-/// If the hostname is empty, it returns a TLSValidationError.
-/// If the OCSP status check fails, it returns a TLSValidationError.
-/// If the OCSP status is not checked, it returns a TLSValidationError.
 impl TLS {
+    /// Establishes a TLS connection and retrieves certificate information.
+    ///
+    /// This is the primary entry point for checking TLS certificates. It performs the following:
+    /// 1. Establishes a TLS connection to the specified host and port
+    /// 2. Extracts the server's certificate and certificate chain
+    /// 3. Parses certificate metadata (validity dates, subject, issuer, etc.)
+    /// 4. Optionally checks certificate revocation status via OCSP and CRL
+    /// 5. Detects self-signed certificates
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - The hostname or IP address to connect to (whitespace is trimmed)
+    /// * `port` - Optional port number (defaults to 443 if None)
+    /// * `check_revocation` - Whether to perform revocation checking (OCSP + CRL)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(TLS)` - Successfully retrieved certificate information
+    /// * `Err(TLSValidationError)` - Connection failed or certificate could not be retrieved
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Hostname is empty (after trimming whitespace)
+    /// - DNS resolution fails
+    /// - TCP connection fails or times out (30s timeout)
+    /// - TLS handshake fails
+    /// - Certificate chain is unavailable
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use tlschecker::TLS;
+    ///
+    /// // Check certificate without revocation checking
+    /// let result = TLS::from("example.com", None, false)?;
+    /// println!("Expires in {} days", result.certificate.validity_days);
+    ///
+    /// // Check with custom port and revocation checking
+    /// let result = TLS::from("secure.example.com", Some(8443), true)?;
+    /// # Ok::<(), tlschecker::TLSValidationError>(())
+    /// ```
+    ///
+    /// # Note
+    ///
+    /// - TLS peer verification is intentionally disabled to allow checking invalid certificates
+    /// - Connection and read operations have a 30-second timeout
+    /// - Revocation checking adds latency (10s timeout per OCSP/CRL request)
     pub fn from(
         host: &str,
         port: Option<u16>,
@@ -511,7 +741,15 @@ impl TLS {
     }
 }
 
-/// Get x509 name entries
+/// Extracts the first entry from X.509 name entries and converts it to a string.
+///
+/// # Arguments
+///
+/// * `entries` - Iterator over X.509 name entries
+///
+/// # Returns
+///
+/// The first entry as a UTF-8 string, or "None" if no entries exist.
 fn from_entries(mut entries: X509NameEntries) -> String {
     match entries.next() {
         None => "None".to_string(),
@@ -522,7 +760,20 @@ fn from_entries(mut entries: X509NameEntries) -> String {
             .to_string(),
     }
 }
-/// Get subject from certificate
+
+/// Extracts subject information from an X.509 certificate.
+///
+/// Parses the certificate's subject distinguished name (DN) and extracts
+/// all relevant fields into a structured `Subject` object.
+///
+/// # Arguments
+///
+/// * `cert_ref` - Reference to the X.509 certificate
+///
+/// # Returns
+///
+/// A `Subject` struct containing country, state, locality, organization unit,
+/// organization, and common name fields.
 fn get_subject(cert_ref: &X509) -> Subject {
     let subject = cert_ref.subject_name();
 
@@ -543,7 +794,18 @@ fn get_subject(cert_ref: &X509) -> Subject {
     }
 }
 
-/// Get issuer from certificate
+/// Extracts issuer information from an X.509 certificate.
+///
+/// Parses the certificate's issuer distinguished name (DN) to identify
+/// the Certificate Authority that issued the certificate.
+///
+/// # Arguments
+///
+/// * `cert_ref` - Reference to the X.509 certificate
+///
+/// # Returns
+///
+/// An `Issuer` struct containing the CA's country, organization, and common name.
 fn get_issuer(cert_ref: &X509) -> Issuer {
     let issuer = cert_ref.issuer_name();
 
@@ -558,7 +820,19 @@ fn get_issuer(cert_ref: &X509) -> Issuer {
     }
 }
 
-/// Get certificate info
+/// Extracts comprehensive information from an X.509 certificate.
+///
+/// This is an internal helper function that parses all certificate metadata
+/// including subject, issuer, validity dates, serial number, and SANs.
+///
+/// # Arguments
+///
+/// * `cert_ref` - Reference to the X.509 certificate
+///
+/// # Returns
+///
+/// A `CertificateInfo` struct with all extracted certificate metadata.
+/// The hostname field is set to "None" and should be populated by the caller.
 fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
     let mut sans = Vec::new();
     match cert_ref.subject_alt_names() {
@@ -588,12 +862,28 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
     }
 }
 
-/// Get validity in hours
+/// Calculates the number of hours until certificate expiration.
+///
+/// # Arguments
+///
+/// * `not_after` - Certificate expiration timestamp
+///
+/// # Returns
+///
+/// Number of hours until expiration (negative if already expired).
 fn get_validity_in_hours(not_after: &Asn1TimeRef) -> i32 {
     get_validity_days(not_after) * 24
 }
 
-/// Get validity in days
+/// Calculates the number of days until certificate expiration.
+///
+/// # Arguments
+///
+/// * `not_after` - Certificate expiration timestamp
+///
+/// # Returns
+///
+/// Number of days until expiration (negative if already expired).
 fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
     Asn1Time::days_from_now(0)
         .unwrap()
@@ -603,17 +893,39 @@ fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
         .days
 }
 
-/// Check if certificate has expired
+/// Checks whether a certificate has expired.
+///
+/// # Arguments
+///
+/// * `not_after` - Certificate expiration timestamp
+///
+/// # Returns
+///
+/// `true` if the certificate has expired, `false` otherwise.
 fn has_expired(not_after: &Asn1TimeRef) -> bool {
     not_after < Asn1Time::days_from_now(0).unwrap()
 }
 
+/// Error type for TLS certificate validation failures.
+///
+/// This error is returned when certificate checking fails due to connection issues,
+/// invalid certificates, or other validation problems.
+///
+/// # Fields
+///
+/// * `details` - Human-readable error message describing what went wrong
 #[derive(Debug)]
 pub struct TLSValidationError {
+    /// Detailed error message
     pub details: String,
 }
 
 impl TLSValidationError {
+    /// Creates a new `TLSValidationError` with the specified message.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg` - Error message describing the validation failure
     fn new(msg: &str) -> TLSValidationError {
         TLSValidationError {
             details: msg.to_string(),
@@ -645,10 +957,35 @@ impl<S> From<HandshakeError<S>> for TLSValidationError {
     }
 }
 
-/// Check if a certificate is self-signed
-/// A certificate is considered self-signed if:
-/// 1. Subject and issuer are identical
-/// 2. The certificate can be verified using its own public key
+/// Determines whether a certificate is self-signed.
+///
+/// A certificate is considered self-signed if it meets both criteria:
+/// 1. The subject and issuer distinguished names are identical
+/// 2. The certificate's signature can be verified using its own public key
+///
+/// Self-signed certificates are commonly used in testing environments or for
+/// internal services, but are not suitable for production use on the public internet.
+///
+/// # Arguments
+///
+/// * `cert` - The certificate to check
+///
+/// # Returns
+///
+/// `true` if the certificate is self-signed, `false` otherwise.
+///
+/// # Example
+///
+/// ```no_run
+/// use openssl::x509::X509;
+/// use tlschecker::is_self_signed_certificate;
+///
+/// # fn example(cert: &X509) {
+/// if is_self_signed_certificate(cert) {
+///     println!("Warning: This is a self-signed certificate");
+/// }
+/// # }
+/// ```
 pub fn is_self_signed_certificate(cert: &X509) -> bool {
     let subject = cert.subject_name();
     let issuer = cert.issuer_name();
