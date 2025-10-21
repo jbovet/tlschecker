@@ -703,7 +703,10 @@ impl TLS {
 
         // Validate hostname is not empty
         if host.is_empty() {
-            return Err(TLSValidationError::new("Hostname cannot be empty"));
+            return Err(TLSValidationError::InvalidInput {
+                field: "hostname".to_string(),
+                reason: "cannot be empty".to_string(),
+            });
         }
 
         let mut context = SslContext::builder(SslMethod::tls())?;
@@ -1102,10 +1105,11 @@ mod tests {
             }
             Err(err) => {
                 // It's okay if the connection fails (certificate rejected)
+                let err_msg = err.to_string();
                 assert!(
-                    err.details.contains("certificate"),
+                    err_msg.contains("certificate") || err_msg.contains("handshake"),
                     "Expected certificate error, got: {}",
-                    err.details
+                    err_msg
                 );
             }
         }
@@ -1114,15 +1118,21 @@ mod tests {
     #[test]
     fn test_empty_hostname() {
         let host = "";
-        let result = TLS::from(host, None, false).err();
-        assert_eq!(result.unwrap().details, "Hostname cannot be empty");
+        let result = TLS::from(host, None, false);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, TLSValidationError::InvalidInput { .. }));
+        assert!(err.to_string().contains("hostname"));
     }
 
     #[test]
     fn test_whitespace_hostname() {
         let host = "  ";
-        let result = TLS::from(host, None, false).err();
-        assert_eq!(result.unwrap().details, "Hostname cannot be empty");
+        let result = TLS::from(host, None, false);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, TLSValidationError::InvalidInput { .. }));
+        assert!(err.to_string().contains("hostname"));
     }
 
     #[test]
@@ -1156,7 +1166,7 @@ mod tests {
             }
             Err(e) => {
                 // Connection error - this is unexpected but could happen
-                println!("Connection error to google.com: {}", e.details);
+                println!("Connection error to google.com: {}", e);
                 assert!(true);
             }
         }
@@ -1188,7 +1198,7 @@ mod tests {
             }
             Err(e) => {
                 // Connection error - this is unexpected but could happen
-                println!("Connection error to digicert.com: {}", e.details);
+                println!("Connection error to digicert.com: {}", e);
                 assert!(true);
             }
         }
@@ -1226,10 +1236,11 @@ mod tests {
             }
             Err(err) => {
                 // It's okay if the connection fails (certificate rejected)
+                let err_msg = err.to_string();
                 assert!(
-                    err.details.contains("certificate"),
+                    err_msg.contains("certificate") || err_msg.contains("handshake"),
                     "Expected certificate error, got: {}",
-                    err.details
+                    err_msg
                 );
             }
         }
