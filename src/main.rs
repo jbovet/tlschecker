@@ -28,24 +28,35 @@
 
 use std::sync::mpsc::sync_channel;
 use std::thread;
+
+#[cfg(feature = "cli")]
 mod config;
+
+#[cfg(feature = "prometheus-metrics")]
 mod metrics;
 
+#[cfg(feature = "cli")]
 use clap::{Parser, ValueEnum};
+
+#[cfg(feature = "cli")]
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
+#[cfg(feature = "cli")]
 use comfy_table::presets::UTF8_FULL;
+#[cfg(feature = "cli")]
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 
 use tlschecker::RevocationStatus;
 use tlschecker::TLS;
 use url::Url;
 
+#[cfg(feature = "cli")]
 use config::{Config, ConfigError};
 
 /// Experimental TLS/SSL certificate checker.
 ///
 /// Checks TLS certificates for multiple hosts, validates expiration dates,
 /// optionally checks revocation status, and outputs results in various formats.
+#[cfg(feature = "cli")]
 #[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
@@ -103,6 +114,7 @@ struct Args {
 /// - **Healthy** (Green): > 30 days until expiration
 /// - **Warning** (Yellow): 15-30 days until expiration
 /// - **Critical** (Red): ≤ 15 days until expiration or expired
+#[cfg(feature = "cli")]
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum OutFormat {
     /// JSON format for programmatic parsing
@@ -113,6 +125,7 @@ enum OutFormat {
     Summary,
 }
 
+#[cfg(feature = "cli")]
 impl std::fmt::Display for OutFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -123,6 +136,7 @@ impl std::fmt::Display for OutFormat {
     }
 }
 
+#[cfg(feature = "cli")]
 impl std::str::FromStr for OutFormat {
     type Err = String;
 
@@ -140,6 +154,7 @@ impl std::str::FromStr for OutFormat {
 ///
 /// Implementations of this trait define how certificate data is presented
 /// to the user in different formats (Text, JSON, Summary).
+#[cfg(feature = "cli")]
 trait Formatter {
     /// Formats and outputs the given TLS certificate data.
     ///
@@ -153,20 +168,24 @@ trait Formatter {
 ///
 /// Displays all certificate fields in a human-readable text format,
 /// including subject, issuer, validity dates, SANs, and certificate chain.
+#[cfg(feature = "cli")]
 struct TextFormat;
 
 /// JSON formatter - outputs certificate data as JSON.
 ///
 /// Serializes certificate information to pretty-printed JSON format,
 /// suitable for programmatic consumption and integration with other tools.
+#[cfg(feature = "cli")]
 struct JsonFormat;
 
 /// Summary formatter - outputs a colored table of certificate information.
 ///
 /// Displays certificate data in a tabular format with color-coded health indicators,
 /// making it easy to quickly assess the status of multiple certificates.
+#[cfg(feature = "cli")]
 struct SummaryFormat;
 
+#[cfg(feature = "cli")]
 impl Formatter for TextFormat {
     fn format(&self, tls: &[TLS]) {
         let certificates = tls
@@ -234,6 +253,7 @@ impl Formatter for TextFormat {
 }
 
 /// Implement Formatter trait for SummaryFormat
+#[cfg(feature = "cli")]
 impl Formatter for SummaryFormat {
     fn format(&self, tls: &[TLS]) {
         if tls.is_empty() {
@@ -342,6 +362,7 @@ impl Formatter for SummaryFormat {
 }
 
 /// Implement Formatter trait for JsonFormat
+#[cfg(feature = "cli")]
 impl Formatter for JsonFormat {
     fn format(&self, tls: &[TLS]) {
         println!(
@@ -354,8 +375,10 @@ impl Formatter for JsonFormat {
 ///
 /// Implements the Factory design pattern to create appropriate formatter
 /// instances based on the requested output format.
+#[cfg(feature = "cli")]
 struct FormatterFactory;
 
+#[cfg(feature = "cli")]
 impl FormatterFactory {
     /// Creates a new formatter instance for the specified output format.
     ///
@@ -392,6 +415,7 @@ struct HostPort {
 /// 1. Default values
 /// 2. Configuration file values
 /// 3. Command-line argument values (highest priority)
+#[cfg(feature = "cli")]
 struct FinalConfig {
     addresses: Vec<String>,
     output: OutFormat,
@@ -401,6 +425,7 @@ struct FinalConfig {
     check_revocation: bool,
 }
 
+#[cfg(feature = "cli")]
 impl FinalConfig {
     fn from_merged_config(config: Config) -> Result<Self, ConfigError> {
         let addresses = config.hosts.unwrap_or_default();
@@ -438,6 +463,7 @@ impl FinalConfig {
     }
 }
 
+#[cfg(feature = "cli")]
 fn main() {
     let cli = Args::parse();
 
@@ -561,8 +587,9 @@ fn main() {
     };
     formatter.format(&results);
 
+    #[cfg(feature = "prometheus-metrics")]
     if final_config.prometheus {
-        metrics::prom::prometheus_metrics(results, final_config.prometheus_address);
+        metrics::prom::prometheus_metrics(results.clone(), final_config.prometheus_address);
     }
 
     exit(exit_code, failed_result);
@@ -589,6 +616,7 @@ fn main() {
 /// - If `--config` is specified, loads from that file (fails if file doesn't exist)
 /// - Otherwise, attempts to load from `tlschecker.toml` in current directory (optional)
 /// - Command-line arguments always override file settings
+#[cfg(feature = "cli")]
 fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
     // Start with default configuration
     let mut config = Config::default();
@@ -641,6 +669,7 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
 /// - If `failed_result` is `true` and `exit_code` is non-zero, exits with `exit_code`
 /// - Otherwise, exits normally with code 0
 /// - Useful for CI/CD pipelines where exit code indicates build success/failure
+#[cfg(feature = "cli")]
 fn exit(exit_code: i32, failed_result: bool) {
     if exit_code != 0 && failed_result {
         std::process::exit(exit_code)
@@ -710,6 +739,7 @@ fn parse_host_port(address: &str) -> HostPort {
     }
 }
 
+#[cfg(all(test, feature = "cli"))]
 #[test]
 fn test_self_signed_certificate() {
     let host = "self-signed.badssl.com";
@@ -739,4 +769,12 @@ fn test_self_signed_certificate() {
             "google.com certificate should not be self-signed"
         );
     }
+}
+
+// Stub main for when CLI feature is not enabled
+#[cfg(not(feature = "cli"))]
+fn main() {
+    eprintln!("This binary requires the 'cli' feature to be enabled.");
+    eprintln!("Please build with: cargo build --features cli");
+    std::process::exit(1);
 }

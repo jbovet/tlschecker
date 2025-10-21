@@ -1,14 +1,27 @@
-//! Core TLS/SSL certificate validation library.
+//! # TLSChecker - TLS/SSL Certificate Validation Library
 //!
-//! This module provides functionality for:
-//! - Establishing TLS connections to remote hosts
-//! - Extracting and parsing X.509 certificates
-//! - Validating certificate expiration dates
-//! - Checking certificate revocation status via OCSP and CRL
-//! - Detecting self-signed certificates
-//! - Extracting certificate chain information
+//! A comprehensive Rust library for checking TLS/SSL certificates, validating expiration dates,
+//! and verifying certificate revocation status via OCSP and CRL.
 //!
-//! # Example
+//! ## Features
+//!
+//! - ✅ **Certificate Chain Validation** - Extract and validate complete certificate chains
+//! - ✅ **Expiration Checking** - Calculate days/hours until certificate expiration
+//! - ✅ **Revocation Status** - Check certificate revocation via OCSP and CRL
+//! - ✅ **Self-Signed Detection** - Identify self-signed certificates
+//! - ✅ **Custom Port Support** - Connect to non-standard TLS ports
+//! - ✅ **Detailed Certificate Info** - Extract subject, issuer, SANs, and more
+//!
+//! ## Quick Start
+//!
+//! Add this to your `Cargo.toml`:
+//!
+//! ```toml
+//! [dependencies]
+//! tlschecker = "1.2.0"
+//! ```
+//!
+//! ## Basic Usage
 //!
 //! ```no_run
 //! use tlschecker::TLS;
@@ -16,22 +29,56 @@
 //! // Check a certificate without revocation checking
 //! let result = TLS::from("example.com", None, false)?;
 //! println!("Certificate expires in {} days", result.certificate.validity_days);
+//! println!("Issuer: {}", result.certificate.issued.organization);
 //!
 //! // Check with revocation checking enabled
 //! let result = TLS::from("example.com", Some(443), true)?;
-//! # Ok::<(), tlschecker::TLSValidationError>(())
+//! # Ok::<(), tlschecker::error::TLSValidationError>(())
 //! ```
+//!
+//! ## Advanced Usage - Revocation Checking
+//!
+//! ```no_run
+//! use tlschecker::{TLS, RevocationStatus};
+//!
+//! let result = TLS::from("example.com", None, true)?;
+//!
+//! match result.certificate.revocation_status {
+//!     RevocationStatus::Good => println!("✓ Certificate is valid"),
+//!     RevocationStatus::Revoked(reason) => println!("✗ Revoked: {}", reason),
+//!     RevocationStatus::Unknown => println!("? Status could not be determined"),
+//!     RevocationStatus::NotChecked => println!("- Revocation not checked"),
+//! }
+//! # Ok::<(), tlschecker::error::TLSValidationError>(())
+//! ```
+//!
+//! ## Features
+//!
+//! - `prometheus-metrics` - Enable Prometheus metrics export (optional)
+//! - `cli` - Include command-line interface dependencies (default)
+//!
+//! ## Examples
+//!
+//! See the [examples](https://github.com/jbovet/tlschecker/tree/main/examples) directory
+//! for more comprehensive usage patterns.
+
+#![warn(missing_docs)]
+#![warn(missing_debug_implementations)]
+#![deny(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+// Public API exports
+pub mod error;
+
+pub use error::{Result, TLSValidationError};
 
 use std::fmt::Debug;
-use std::io::Error;
 use std::ops::Deref;
 use std::time::Duration;
 
 use openssl::asn1::{Asn1Time, Asn1TimeRef};
-use openssl::error::ErrorStack;
 use openssl::nid::Nid;
 use openssl::ocsp::OcspCertStatus;
-use openssl::ssl::HandshakeError;
 use openssl::x509::{CrlStatus, ReasonCode, X509Crl, X509NameEntries, X509Ref, X509};
 use serde::{Deserialize, Serialize};
 
@@ -360,7 +407,10 @@ pub fn check_ocsp_status(
 
         // Skip verification of basic response if it fails - many OCSP responders
         // don't provide all the certificates needed for complete verification
-        let certs = openssl::stack::Stack::<X509>::new().unwrap();
+        let certs = match openssl::stack::Stack::<X509>::new() {
+            Ok(stack) => stack,
+            Err(_) => continue,
+        };
         let _ = basic_resp.verify(&certs, &store, openssl::ocsp::OcspFlag::empty());
 
         // Check status
@@ -554,7 +604,11 @@ pub fn check_crl_status(
         };
 
         // Verify the CRL signature
-        if crl.verify(&issuer.public_key().unwrap()).is_err() {
+        let issuer_pubkey = match issuer.public_key() {
+            Ok(key) => key,
+            Err(_) => continue,
+        };
+        if crl.verify(&issuer_pubkey).is_err() {
             continue; // CRL signature verification failed
         }
 
@@ -675,9 +729,10 @@ impl TLS {
         // `Ssl` object associated with this stream
         let ssl = stream.ssl();
 
+        let current_cipher = ssl.current_cipher().ok_or("No cipher negotiated")?;
         let cipher = Cipher {
-            name: ssl.current_cipher().unwrap().name().to_string(),
-            version: ssl.current_cipher().unwrap().version().to_string(),
+            name: current_cipher.name().to_string(),
+            version: current_cipher.version().to_string(),
         };
 
         // Get the peer certificate chain
@@ -835,14 +890,23 @@ fn get_issuer(cert_ref: &X509) -> Issuer {
 /// The hostname field is set to "None" and should be populated by the caller.
 fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
     let mut sans = Vec::new();
-    match cert_ref.subject_alt_names() {
-        None => {}
-        Some(general_names) => {
-            for general_name in general_names {
-                sans.push(general_name.dnsname().unwrap().to_string());
+    if let Some(general_names) = cert_ref.subject_alt_names() {
+        for general_name in general_names {
+            // Handle both DNS names and IP addresses in SANs
+            if let Some(dns) = general_name.dnsname() {
+                sans.push(dns.to_string());
+            } else if let Some(ip) = general_name.ipaddress() {
+                // Format IP address as string
+                sans.push(format!("IP:{}", String::from_utf8_lossy(ip)));
             }
         }
     }
+    let cert_sn = cert_ref
+        .serial_number()
+        .to_bn()
+        .map(|bn| bn.to_string())
+        .unwrap_or_else(|_| "Unknown".to_string());
+
     CertificateInfo {
         hostname: "None".to_string(),
         subject: get_subject(cert_ref),
@@ -852,7 +916,7 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         validity_days: get_validity_days(cert_ref.not_after()),
         validity_hours: get_validity_in_hours(cert_ref.not_after()),
         is_expired: has_expired(cert_ref.not_after()),
-        cert_sn: cert_ref.serial_number().to_bn().unwrap().to_string(),
+        cert_sn,
         cert_ver: cert_ref.version().to_string(),
         cert_alg: cert_ref.signature_algorithm().object().to_string(),
         sans,
@@ -886,11 +950,10 @@ fn get_validity_in_hours(not_after: &Asn1TimeRef) -> i32 {
 /// Number of days until expiration (negative if already expired).
 fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
     Asn1Time::days_from_now(0)
-        .unwrap()
-        .deref()
-        .diff(not_after)
-        .unwrap()
-        .days
+        .ok()
+        .and_then(|now| now.deref().diff(not_after).ok())
+        .map(|diff| diff.days)
+        .unwrap_or(0)
 }
 
 /// Checks whether a certificate has expired.
@@ -903,59 +966,11 @@ fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
 ///
 /// `true` if the certificate has expired, `false` otherwise.
 fn has_expired(not_after: &Asn1TimeRef) -> bool {
-    not_after < Asn1Time::days_from_now(0).unwrap()
+    Asn1Time::days_from_now(0)
+        .map(|now| not_after < now)
+        .unwrap_or(false)
 }
 
-/// Error type for TLS certificate validation failures.
-///
-/// This error is returned when certificate checking fails due to connection issues,
-/// invalid certificates, or other validation problems.
-///
-/// # Fields
-///
-/// * `details` - Human-readable error message describing what went wrong
-#[derive(Debug)]
-pub struct TLSValidationError {
-    /// Detailed error message
-    pub details: String,
-}
-
-impl TLSValidationError {
-    /// Creates a new `TLSValidationError` with the specified message.
-    ///
-    /// # Arguments
-    ///
-    /// * `msg` - Error message describing the validation failure
-    fn new(msg: &str) -> TLSValidationError {
-        TLSValidationError {
-            details: msg.to_string(),
-        }
-    }
-}
-
-impl From<Error> for TLSValidationError {
-    fn from(e: Error) -> TLSValidationError {
-        TLSValidationError::new(&e.to_string())
-    }
-}
-
-impl From<&str> for TLSValidationError {
-    fn from(e: &str) -> TLSValidationError {
-        TLSValidationError::new(e)
-    }
-}
-
-impl From<ErrorStack> for TLSValidationError {
-    fn from(e: ErrorStack) -> TLSValidationError {
-        TLSValidationError::new(&e.to_string())
-    }
-}
-
-impl<S> From<HandshakeError<S>> for TLSValidationError {
-    fn from(_: HandshakeError<S>) -> TLSValidationError {
-        TLSValidationError::new("TLS handshake failed.")
-    }
-}
 
 /// Determines whether a certificate is self-signed.
 ///

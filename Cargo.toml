@@ -1,31 +1,59 @@
 [package]
 name = "tlschecker"
-version = "1.1.1"
-edition = "2018"
-description = "Experimental TLS/SSL certificate checker from command line"
+version = "1.2.0"
+edition = "2021"
+rust-version = "1.70"
+description = "TLS/SSL certificate validation library with revocation checking (OCSP/CRL)"
 authors = ["Jose Bovet Derpich <jose.bovet@gmail.com>"]
-license = "GNU"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/jbovet/tlschecker"
+documentation = "https://docs.rs/tlschecker"
+homepage = "https://github.com/jbovet/tlschecker"
+keywords = ["tls", "ssl", "certificate", "ocsp", "security"]
+categories = ["network-programming", "cryptography", "command-line-utilities"]
+exclude = [".github/*", "img/*"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[dependencies]
-prometheus = { version = "0.14.0", features = ["process", "push"] }
-openssl = { version = "0.10.73", features = ["vendored"] }
-clap = { version = "4.5.48", features = ["derive"] }
-serde_json = "1.0.145"
-serde = { version = "1.0.226", features = ["derive"] }
-comfy-table = "7.2.1"
-strum = "0.27.2"
-strum_macros = "0.27.2"
-lazy_static = "1.5.0"
-url = "2.5.7"
-reqwest = { version = "0.12.23", features = ["blocking", "json"] }
-toml = "0.9.7"
-tempfile = "3.22.0"
+[lib]
+name = "tlschecker"
+path = "src/lib.rs"
 
 [[bin]]
 name = "tlschecker"
+path = "src/main.rs"
 test = true
 doc = true
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["clap", "comfy-table", "serde_json", "toml", "strum", "strum_macros", "prometheus-metrics"]
+prometheus-metrics = ["prometheus", "lazy_static"]
+
+[dependencies]
+# Core library dependencies
+openssl = { version = "0.10.73", features = ["vendored"] }
+serde = { version = "1.0.226", features = ["derive"] }
+reqwest = { version = "0.12.23", features = ["blocking"] }
+url = "2.5.7"
+
+# CLI-only dependencies (optional)
+clap = { version = "4.5.48", features = ["derive"], optional = true }
+comfy-table = { version = "7.2.1", optional = true }
+serde_json = { version = "1.0.145", optional = true }
+toml = { version = "0.9.7", optional = true }
+strum = { version = "0.27.2", optional = true }
+strum_macros = { version = "0.27.2", optional = true }
+
+# Metrics dependencies (optional)
+prometheus = { version = "0.14.0", features = ["process", "push"], optional = true }
+lazy_static = { version = "1.5.0", optional = true }
+
+[dev-dependencies]
+tempfile = "3.22.0"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
