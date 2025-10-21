@@ -73,9 +73,8 @@ If you're using tlschecker as a library, the main changes are:
 2. **Import Path**: Error types now in separate module
    ```rust
    // Add to imports
-   use tlschecker::error::TLSValidationError;
-   // Or use the Result alias
-   use tlschecker::Result;
+   use tlschecker::TLSValidationError;
+   // Functions return Result<T, TLSValidationError>
    ```
 
 ### For CLI Users

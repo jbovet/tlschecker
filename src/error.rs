@@ -6,9 +6,6 @@
 use std::fmt;
 use std::io;
 
-/// Result type alias for TLS validation operations.
-pub type Result<T> = std::result::Result<T, TLSValidationError>;
-
 /// Error type for TLS certificate validation failures.
 ///
 /// This error is returned when certificate checking fails due to connection issues,

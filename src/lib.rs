@@ -70,7 +70,7 @@
 // Public API exports
 pub mod error;
 
-pub use error::{Result, TLSValidationError};
+pub use error::TLSValidationError;
 
 use std::fmt::Debug;
 use std::ops::Deref;
