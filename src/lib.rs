@@ -19,7 +19,7 @@
 //!
 //! // Check with revocation checking enabled
 //! let result = TLS::from("example.com", Some(443), true)?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # Ok::<(), tlschecker::TLSValidationError>(())
 //! ```
 
 use std::fmt::Debug;
