@@ -1,7 +1,36 @@
+//! Configuration file management for TLSChecker.
+//!
+//! This module handles loading, parsing, and merging configuration from TOML files
+//! and command-line arguments. It supports a hierarchical configuration system where
+//! settings can be specified in multiple places with clear precedence rules.
+//!
+//! # Configuration Precedence
+//!
+//! 1. Default values (lowest priority)
+//! 2. Configuration file (tlschecker.toml or specified with --config)
+//! 3. Command-line arguments (highest priority)
+//!
+//! # Example Configuration File
+//!
+//! ```toml
+//! hosts = ["example.com", "example.com:8443"]
+//! output = "summary"
+//! exit_code = 1
+//! check_revocation = true
+//!
+//! [prometheus]
+//! enabled = true
+//! address = "http://localhost:9091"
+//! ```
+
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+/// Main configuration structure for TLSChecker.
+///
+/// All fields are optional to support partial configuration and merging.
+/// Missing values will be filled in by defaults or overridden by CLI arguments.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     /// List of hosts to check
@@ -16,16 +45,38 @@ pub struct Config {
     pub prometheus: Option<PrometheusConfig>,
 }
 
+/// Prometheus integration configuration.
+///
+/// Controls whether metrics are pushed to a Prometheus Push Gateway
+/// and specifies the gateway address.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PrometheusConfig {
     /// Enable prometheus metrics pushing
     pub enabled: Option<bool>,
-    /// Prometheus push gateway address
+    /// Prometheus push gateway address (e.g., "http://localhost:9091")
     pub address: Option<String>,
 }
 
 impl Config {
-    /// Load configuration from a TOML file
+    /// Loads configuration from a TOML file.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the TOML configuration file
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Config)` - Successfully parsed configuration
+    /// * `Err(ConfigError::Io)` - File could not be read
+    /// * `Err(ConfigError::Parse)` - File contains invalid TOML
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use tlschecker::config::Config;
+    /// let config = Config::from_file("tlschecker.toml")?;
+    /// # Ok::<(), tlschecker::config::ConfigError>(())
+    /// ```
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let content =
             fs::read_to_string(path.as_ref()).map_err(|e| ConfigError::Io(e.to_string()))?;
@@ -36,7 +87,20 @@ impl Config {
         Ok(config)
     }
 
-    /// Create a default configuration
+    /// Creates a default configuration with sensible defaults.
+    ///
+    /// # Default Values
+    ///
+    /// - `hosts`: None (must be provided)
+    /// - `output`: "summary"
+    /// - `exit_code`: 0 (don't fail on expired certificates)
+    /// - `check_revocation`: false
+    /// - `prometheus.enabled`: false
+    /// - `prometheus.address`: "http://localhost:9091"
+    ///
+    /// # Returns
+    ///
+    /// A `Config` struct with default values.
     pub fn default() -> Self {
         Config {
             hosts: None,
@@ -50,7 +114,27 @@ impl Config {
         }
     }
 
-    /// Merge this config with another, prioritizing the other config's values
+    /// Merges this configuration with another, prioritizing the other's values.
+    ///
+    /// For each field, if the `other` config has a value (Some), it overrides
+    /// this config's value. If the `other` value is None, keeps the current value.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - Configuration to merge (takes priority)
+    ///
+    /// # Returns
+    ///
+    /// The merged configuration with `other`'s values taking precedence.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use tlschecker::config::Config;
+    /// let defaults = Config::default();
+    /// let file_config = Config::from_file("config.toml").unwrap_or_default();
+    /// let merged = defaults.merge_with(file_config);
+    /// ```
     pub fn merge_with(mut self, other: Config) -> Self {
         if other.hosts.is_some() {
             self.hosts = other.hosts;
@@ -79,7 +163,24 @@ impl Config {
         self
     }
 
-    /// Convert CLI arguments to a Config for merging
+    /// Creates a Config from command-line arguments for merging.
+    ///
+    /// Converts CLI arguments into a Config structure that can be merged
+    /// with file-based and default configurations. Only provided arguments
+    /// (Some values) will override other configurations.
+    ///
+    /// # Arguments
+    ///
+    /// * `addresses` - List of hosts to check
+    /// * `output` - Output format (json, text, summary)
+    /// * `exit_code` - Exit code for failures
+    /// * `prometheus` - Enable Prometheus metrics
+    /// * `prometheus_address` - Prometheus push gateway address
+    /// * `check_revocation` - Enable certificate revocation checking
+    ///
+    /// # Returns
+    ///
+    /// A `Config` struct with only the specified CLI values set.
     pub fn from_cli_args(
         addresses: Option<Vec<String>>,
         output: Option<String>,
@@ -100,7 +201,23 @@ impl Config {
         }
     }
 
-    /// Generate an example configuration file
+    /// Generates an example configuration file in TOML format.
+    ///
+    /// Creates a sample configuration with all available options set to
+    /// example values. Useful for bootstrapping a new configuration file.
+    ///
+    /// # Returns
+    ///
+    /// A pretty-printed TOML string containing example configuration.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use tlschecker::config::Config;
+    /// let example = Config::example_toml();
+    /// println!("{}", example);
+    /// // Save to file: std::fs::write("tlschecker.toml", example)?;
+    /// ```
     pub fn example_toml() -> String {
         let example = Config {
             hosts: Some(vec![
@@ -123,10 +240,14 @@ impl Config {
     }
 }
 
+/// Errors that can occur during configuration loading and parsing.
 #[derive(Debug)]
 pub enum ConfigError {
+    /// I/O error (file not found, permission denied, etc.)
     Io(String),
+    /// TOML parsing error (invalid syntax, type mismatch, etc.)
     Parse(String),
+    /// Validation error (missing required fields, invalid values, etc.)
     Validation(String),
 }
 
