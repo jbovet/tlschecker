@@ -21,9 +21,7 @@ strum = "0.27.2"
 strum_macros = "0.27.2"
 lazy_static = "1.5.0"
 url = "2.5.7"
-reqwest = { version = "0.12.23", features = ["json"] }
-tokio = { version = "1", features = ["full"] }
-tokio-openssl = "0.6"
+reqwest = { version = "0.12.23", features = ["blocking", "json"] }
 toml = "0.9.7"
 tempfile = "3.22.0"
 
