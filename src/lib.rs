@@ -38,18 +38,7 @@ use serde::{Deserialize, Serialize};
 /// Default timeout for TLS connection attempts (30 seconds).
 static TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Represents the revocation status of a certificate.
-///
-/// Certificate revocation checking is performed via OCSP (Online Certificate Status Protocol)
-/// and CRL (Certificate Revocation List) mechanisms. This enum indicates the outcome of
-/// those checks.
-///
-/// # Variants
-///
-/// - `Good`: Certificate is valid and not revoked
-/// - `Revoked(String)`: Certificate has been revoked, with optional reason
-/// - `Unknown`: Status could not be determined (responder unavailable, network error, etc.)
-/// - `NotChecked`: Revocation checking was not performed
+/// Revocation Status
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum RevocationStatus {
     /// Certificate is valid and not revoked
@@ -226,36 +215,15 @@ pub fn find_issuer_cert<'a>(cert: &X509Ref, chain: &'a [X509]) -> Option<&'a X50
     None
 }
 
-/// Checks certificate revocation status using OCSP (Online Certificate Status Protocol).
-///
-/// This function queries OCSP responders listed in the certificate's Authority Information Access
-/// extension to determine if the certificate has been revoked. OCSP provides real-time certificate
-/// status checking and is generally preferred over CRL checking due to its lower latency.
-///
-/// # Arguments
-///
-/// * `cert` - The certificate to check for revocation
-/// * `chain` - The certificate chain (must include the issuer certificate)
-///
-/// # Returns
-///
-/// * `Ok(RevocationStatus::Good)` - Certificate is valid and not revoked
-/// * `Ok(RevocationStatus::Revoked(reason))` - Certificate has been revoked
-/// * `Ok(RevocationStatus::Unknown)` - Status could not be determined
-/// * `Err(TLSValidationError)` - An error occurred during the check
-///
-/// # Timeout
-///
-/// Each OCSP responder request has a 10-second timeout. If multiple responders are listed,
-/// they are tried sequentially until one provides a definitive answer.
-///
-/// # Note
-///
-/// Returns `Unknown` in the following cases:
-/// - Issuer certificate not found in chain
-/// - No OCSP responder URLs in certificate
-/// - All OCSP responders are unavailable or return errors
-/// - OCSP response validation fails
+/// Check OCSP status
+/// This function checks the OCSP status of a given certificate against a chain of certificates.
+/// It returns a RevocationStatus indicating whether the certificate is good, revoked, or unknown.
+/// It uses the OCSP responder URLs from the certificate to perform the check.
+/// If the issuer certificate is not found in the chain, it returns Unknown.
+/// If the OCSP responder is unavailable or the response is not successful, it returns Unknown.
+/// If the OCSP response indicates that the certificate is revoked, it returns Revoked with the reason.
+/// If the OCSP response indicates that the certificate is good, it returns Good.
+/// If the OCSP response is not valid, it returns Unknown.
 pub fn check_ocsp_status(
     cert: &X509,
     chain: &[X509],
@@ -399,31 +367,7 @@ pub fn check_ocsp_status(
     Ok(RevocationStatus::Unknown)
 }
 
-/// Performs comprehensive certificate revocation checking using both OCSP and CRL.
-///
-/// This function attempts to determine certificate revocation status by trying multiple
-/// methods in order of preference:
-/// 1. OCSP (Online Certificate Status Protocol) - checked first as it's real-time
-/// 2. CRL (Certificate Revocation List) - fallback if OCSP is inconclusive
-///
-/// # Arguments
-///
-/// * `cert` - The certificate to check for revocation
-/// * `chain` - The certificate chain (must include the issuer certificate)
-///
-/// # Returns
-///
-/// * `Ok(RevocationStatus::Good)` - Certificate is valid per OCSP or CRL
-/// * `Ok(RevocationStatus::Revoked(reason))` - Certificate has been revoked
-/// * `Ok(RevocationStatus::Unknown)` - Status could not be determined by either method
-/// * `Err(TLSValidationError)` - An error occurred during checking
-///
-/// # Strategy
-///
-/// The function implements a waterfall strategy:
-/// - Returns immediately if OCSP check returns `Good` or `Revoked`
-/// - Falls back to CRL checking if OCSP returns `Unknown` or fails
-/// - Returns `Unknown` only if both methods fail to provide a definitive answer
+/// Combined revocation checking function that tries both OCSP and CRL
 pub fn check_revocation_status(
     cert: &X509,
     chain: &[X509],
@@ -439,34 +383,6 @@ pub fn check_revocation_status(
     }
 }
 
-/// Checks certificate revocation status using CRL (Certificate Revocation List).
-///
-/// This function downloads and parses CRLs from the certificate's CRL Distribution Points
-/// extension to check if the certificate has been revoked. CRLs are periodically published
-/// lists of revoked certificate serial numbers.
-///
-/// # Arguments
-///
-/// * `cert` - The certificate to check for revocation
-/// * `chain` - The certificate chain (must include the issuer certificate)
-///
-/// # Returns
-///
-/// * `Ok(RevocationStatus::Good)` - Certificate is not in the CRL (valid)
-/// * `Ok(RevocationStatus::Revoked(reason))` - Certificate is listed in the CRL
-/// * `Ok(RevocationStatus::Unknown)` - Status could not be determined
-/// * `Err(TLSValidationError)` - An error occurred during the check
-///
-/// # Timeout
-///
-/// Each CRL download request has a 10-second timeout. Multiple distribution points
-/// are tried sequentially until one succeeds.
-///
-/// # Note
-///
-/// - Supports both DER and PEM encoded CRLs
-/// - Verifies CRL signature against the issuer certificate
-/// - Returns `Unknown` if no CRL distribution points are found or all are inaccessible
 pub fn check_crl_status(
     cert: &X509,
     chain: &[X509],
@@ -587,54 +503,6 @@ pub fn check_crl_status(
 }
 
 impl TLS {
-    /// Establishes a TLS connection and retrieves certificate information.
-    ///
-    /// This is the primary entry point for checking TLS certificates. It performs the following:
-    /// 1. Establishes a TLS connection to the specified host and port
-    /// 2. Extracts the server's certificate and certificate chain
-    /// 3. Parses certificate metadata (validity dates, subject, issuer, etc.)
-    /// 4. Optionally checks certificate revocation status via OCSP and CRL
-    /// 5. Detects self-signed certificates
-    ///
-    /// # Arguments
-    ///
-    /// * `host` - The hostname or IP address to connect to (whitespace is trimmed)
-    /// * `port` - Optional port number (defaults to 443 if None)
-    /// * `check_revocation` - Whether to perform revocation checking (OCSP + CRL)
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(TLS)` - Successfully retrieved certificate information
-    /// * `Err(TLSValidationError)` - Connection failed or certificate could not be retrieved
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Hostname is empty (after trimming whitespace)
-    /// - DNS resolution fails
-    /// - TCP connection fails or times out (30s timeout)
-    /// - TLS handshake fails
-    /// - Certificate chain is unavailable
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use tlschecker::TLS;
-    ///
-    /// // Check certificate without revocation checking
-    /// let result = TLS::from("example.com", None, false)?;
-    /// println!("Expires in {} days", result.certificate.validity_days);
-    ///
-    /// // Check with custom port and revocation checking
-    /// let result = TLS::from("secure.example.com", Some(8443), true)?;
-    /// # Ok::<(), tlschecker::TLSValidationError>(())
-    /// ```
-    ///
-    /// # Note
-    ///
-    /// - TLS peer verification is intentionally disabled to allow checking invalid certificates
-    /// - Connection and read operations have a 30-second timeout
-    /// - Revocation checking adds latency (10s timeout per OCSP/CRL request)
     pub fn from(
         host: &str,
         port: Option<u16>,

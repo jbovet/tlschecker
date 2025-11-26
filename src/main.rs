@@ -1,31 +1,3 @@
-//! TLSChecker - Command-line TLS/SSL certificate validation tool.
-//!
-//! This is the main entry point for the tlschecker binary. It provides a CLI
-//! interface for checking TLS certificates, with features including:
-//!
-//! - Multi-threaded certificate checking for multiple hosts
-//! - Flexible output formats (JSON, Text, Summary/Table)
-//! - Certificate revocation checking (OCSP + CRL)
-//! - Prometheus metrics integration
-//! - Configuration file support (TOML format)
-//! - Custom exit codes for CI/CD integration
-//!
-//! # Example Usage
-//!
-//! ```bash
-//! # Check a single host
-//! tlschecker example.com
-//!
-//! # Check multiple hosts with custom ports
-//! tlschecker example.com google.com:443 secure.example.com:8443
-//!
-//! # Enable revocation checking and JSON output
-//! tlschecker --check-revocation -o json example.com
-//!
-//! # Use a configuration file
-//! tlschecker --config tlschecker.toml
-//! ```
-
 use std::sync::mpsc::sync_channel;
 use std::thread;
 mod config;
