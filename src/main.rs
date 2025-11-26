@@ -6,13 +6,16 @@ use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 
-use tlschecker::RevocationStatus; // Import the new RevocationStatus enum
+use tlschecker::RevocationStatus;
 use tlschecker::TLS;
 use url::Url;
 
 use config::{Config, ConfigError};
 
-/// Experimental TLS/SSL certificate checker
+/// Experimental TLS/SSL certificate checker.
+///
+/// Checks TLS certificates for multiple hosts, validates expiration dates,
+/// optionally checks revocation status, and outputs results in various formats.
 #[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
@@ -50,21 +53,33 @@ struct Args {
     check_revocation: Option<bool>,
 }
 
-/// Output format
-/// Json, Text, Summary
-/// Default is Summary
-/// Json: Output as JSON format
-/// Text: Output as text format
-/// Summary: Output as summary format
-/// Summary format is a table with the following columns:
-/// Host, Expired, Status, Days before expired, Hours before expired
+/// Output format for certificate information.
+///
+/// Determines how certificate data is presented to the user:
+///
+/// - **Json**: Machine-readable JSON format for programmatic consumption
+/// - **Text**: Human-readable detailed text format showing all certificate fields
+/// - **Summary**: Colored table format with certificate health indicators (default)
+///
+/// # Summary Format Columns
+///
+/// The summary table includes:
+/// - Host, Cipher Suite, Protocol, Issuer
+/// - Expired, Self-Signed, Revocation Status
+/// - Days/Hours before expiration, Overall Status (Healthy/Warning/Critical)
+///
+/// # Health Indicators
+///
+/// - **Healthy** (Green): > 30 days until expiration
+/// - **Warning** (Yellow): 15-30 days until expiration
+/// - **Critical** (Red): ≤ 15 days until expiration or expired
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum OutFormat {
-    /// Enable JSON in the output
+    /// JSON format for programmatic parsing
     Json,
-    /// Enable Text in the output
+    /// Detailed text format showing all certificate fields
     Text,
-    /// Summary by default
+    /// Summary table format with color-coded status (default)
     Summary,
 }
 
@@ -91,21 +106,37 @@ impl std::str::FromStr for OutFormat {
     }
 }
 
-/// Output Formatter trait
+/// Trait for formatting TLS certificate output.
+///
+/// Implementations of this trait define how certificate data is presented
+/// to the user in different formats (Text, JSON, Summary).
 trait Formatter {
+    /// Formats and outputs the given TLS certificate data.
+    ///
+    /// # Arguments
+    ///
+    /// * `tls` - Slice of TLS structs containing certificate information
     fn format(&self, tls: &[TLS]);
 }
 
-/// Text format
+/// Text formatter - outputs detailed certificate information.
+///
+/// Displays all certificate fields in a human-readable text format,
+/// including subject, issuer, validity dates, SANs, and certificate chain.
 struct TextFormat;
 
-/// JSON format
+/// JSON formatter - outputs certificate data as JSON.
+///
+/// Serializes certificate information to pretty-printed JSON format,
+/// suitable for programmatic consumption and integration with other tools.
 struct JsonFormat;
 
-/// Summary format
+/// Summary formatter - outputs a colored table of certificate information.
+///
+/// Displays certificate data in a tabular format with color-coded health indicators,
+/// making it easy to quickly assess the status of multiple certificates.
 struct SummaryFormat;
 
-/// Implement Formatter trait for TextFormat
 impl Formatter for TextFormat {
     fn format(&self, tls: &[TLS]) {
         let certificates = tls
@@ -289,11 +320,22 @@ impl Formatter for JsonFormat {
         );
     }
 }
-/// FormatterFactory
+/// Factory for creating formatter instances.
+///
+/// Implements the Factory design pattern to create appropriate formatter
+/// instances based on the requested output format.
 struct FormatterFactory;
 
-/// FormatterFactory implementation
 impl FormatterFactory {
+    /// Creates a new formatter instance for the specified output format.
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - The desired output format
+    ///
+    /// # Returns
+    ///
+    /// A boxed trait object implementing the `Formatter` trait.
     fn new_formatter(s: &OutFormat) -> Box<dyn Formatter> {
         match s {
             OutFormat::Json => Box::new(JsonFormat {}),
@@ -302,13 +344,24 @@ impl FormatterFactory {
         }
     }
 }
-/// Struct to hold parsed host and port
+
+/// Parsed hostname and port information.
+///
+/// Represents the result of parsing a host address specification,
+/// which may include a port number or use the default port 443.
 struct HostPort {
+    /// Hostname or IP address (IPv6 brackets are removed)
     host: String,
+    /// Port number (None indicates default port 443 should be used)
     port: Option<u16>,
 }
 
-/// Struct to hold final configuration after merging CLI and file
+/// Final merged configuration used for execution.
+///
+/// This struct holds the complete configuration after merging:
+/// 1. Default values
+/// 2. Configuration file values
+/// 3. Command-line argument values (highest priority)
 struct FinalConfig {
     addresses: Vec<String>,
     output: OutFormat,
@@ -482,7 +535,27 @@ async fn main() {
     exit(exit_code, failed_result);
 }
 
-/// Load and merge configuration from file and CLI arguments
+/// Loads and merges configuration from multiple sources.
+///
+/// Configuration is loaded and merged in priority order:
+/// 1. Default values (lowest priority)
+/// 2. Configuration file values (if specified or tlschecker.toml exists)
+/// 3. Command-line arguments (highest priority)
+///
+/// # Arguments
+///
+/// * `cli` - Parsed command-line arguments
+///
+/// # Returns
+///
+/// * `Ok(FinalConfig)` - Successfully loaded and merged configuration
+/// * `Err(ConfigError)` - Configuration file not found, invalid, or missing required fields
+///
+/// # Configuration Sources
+///
+/// - If `--config` is specified, loads from that file (fails if file doesn't exist)
+/// - Otherwise, attempts to load from `tlschecker.toml` in current directory (optional)
+/// - Command-line arguments always override file settings
 fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
     // Start with default configuration
     let mut config = Config::default();
@@ -520,14 +593,49 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
     FinalConfig::from_merged_config(config)
 }
 
-/// Exit function to handle exit codes
+/// Exits the program with the appropriate exit code.
+///
+/// This function implements conditional exit behavior based on whether
+/// any certificates failed validation (expired or revoked).
+///
+/// # Arguments
+///
+/// * `exit_code` - The exit code to use when failures are detected
+/// * `failed_result` - Whether any certificate checks failed
+///
+/// # Behavior
+///
+/// - If `failed_result` is `true` and `exit_code` is non-zero, exits with `exit_code`
+/// - Otherwise, exits normally with code 0
+/// - Useful for CI/CD pipelines where exit code indicates build success/failure
 fn exit(exit_code: i32, failed_result: bool) {
     if exit_code != 0 && failed_result {
         std::process::exit(exit_code)
     }
 }
 
-// Function to parse a hostname with an optional port
+/// Parses a hostname/address specification that may include a port.
+///
+/// Supports multiple input formats:
+/// - `example.com` → hostname, default port 443
+/// - `example.com:8443` → hostname with explicit port
+/// - `https://example.com:8443` → full URL (scheme ignored)
+/// - `[::1]:443` → IPv6 address with port
+/// - `192.168.1.1:8443` → IPv4 address with port
+///
+/// # Arguments
+///
+/// * `address` - The address string to parse
+///
+/// # Returns
+///
+/// A `HostPort` struct containing the extracted hostname and optional port.
+///
+/// # Note
+///
+/// - IPv6 brackets are automatically removed from the hostname
+/// - If no port is specified, returns `None` for the port (defaults to 443)
+/// - URL schemes (http://, https://) are stripped and ignored
 fn parse_host_port(address: &str) -> HostPort {
     // Try to fix common user mistakes by adding https:// if missing a scheme
     let address_with_scheme = if !address.contains("://") {

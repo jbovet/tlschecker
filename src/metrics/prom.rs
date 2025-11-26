@@ -1,3 +1,33 @@
+//! Prometheus metrics integration for TLSChecker.
+//!
+//! This module provides functionality to export TLS certificate metrics to
+//! a Prometheus Push Gateway for monitoring and alerting.
+//!
+//! # Exported Metrics
+//!
+//! - `tlschecker_days_before_expired` - Days until certificate expiration (gauge)
+//! - `tlschecker_hours_before_expired` - Hours until certificate expiration (gauge)
+//! - `tlschecker_revocation_status` - Certificate revocation status (gauge)
+//!
+//! # Metric Labels
+//!
+//! Each metric includes the following labels:
+//! - `instance`, `job` - Standard Prometheus identifiers
+//! - `host` - Target hostname
+//! - `cipher` - TLS cipher suite name
+//! - `cipher_protocol_version` - TLS protocol version
+//! - `issuer` - Certificate issuer organization
+//! - `expired` - Boolean expiration status
+//! - `revoked` - Boolean revocation status
+//!
+//! # Revocation Status Values
+//!
+//! The `tlschecker_revocation_status` metric uses the following values:
+//! - `0.0` - Not checked
+//! - `1.0` - Good (not revoked)
+//! - `2.0` - Unknown (couldn't determine)
+//! - `3.0` - Revoked
+
 use lazy_static::lazy_static;
 use prometheus::{labels, register_gauge, Gauge};
 
@@ -5,20 +35,54 @@ use tlschecker::RevocationStatus;
 use tlschecker::TLS;
 
 lazy_static! {
+    /// Gauge metric tracking days until certificate expiration.
     static ref TLSCHECKER_DAYS_BEFORE_EXPIRED: Gauge =
         register_gauge!("tlschecker_days_before_expired", "days before expiration").unwrap();
+
+    /// Gauge metric tracking hours until certificate expiration.
     static ref TLSCHECKER_HOURS_BEFORE_EXPIRED: Gauge =
         register_gauge!("tlschecker_hours_before_expired", "hours before expiration").unwrap();
+
+    /// Gauge metric tracking certificate revocation status.
+    /// Values: 0=not checked, 1=good, 2=unknown, 3=revoked
     static ref TLSCHECKER_REVOCATION_STATUS: Gauge = register_gauge!(
         "tlschecker_revocation_status",
         "certificate revocation status"
     )
     .unwrap();
 }
-/// Function to push metrics to prometheus
+
+/// Pushes TLS certificate metrics to a Prometheus Push Gateway.
+///
+/// This function exports certificate metrics for each checked host to a Prometheus
+/// Push Gateway, making the data available for monitoring, alerting, and visualization.
+///
 /// # Arguments
-/// * `results` - Vector of TLS structs
-/// * `prometheus_address` - String of prometheus address
+///
+/// * `results` - Vector of TLS certificate check results
+/// * `prometheus_address` - URL of the Prometheus Push Gateway (e.g., "http://localhost:9091")
+///
+/// # Metrics Exported
+///
+/// For each certificate:
+/// - Days and hours until expiration
+/// - Revocation status (0-3, see module documentation)
+/// - Associated labels (host, cipher, issuer, etc.)
+///
+/// # Error Handling
+///
+/// If pushing metrics fails (network error, gateway unavailable, etc.),
+/// an error message is printed to stderr but the function doesn't panic.
+///
+/// # Example
+///
+/// ```no_run
+/// # use tlschecker::TLS;
+/// # use tlschecker::metrics::prom::prometheus_metrics;
+/// # fn example(results: Vec<TLS>) {
+/// prometheus_metrics(results, "http://localhost:9091".to_string());
+/// # }
+/// ```
 pub fn prometheus_metrics(results: Vec<TLS>, prometheus_address: String) {
     for tls in results.iter() {
         TLSCHECKER_DAYS_BEFORE_EXPIRED.set(f64::from(tls.certificate.validity_days.to_owned()));
