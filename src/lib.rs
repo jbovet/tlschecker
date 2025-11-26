@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 /// Timeout for TLS connection
 static TIMEOUT: Duration = Duration::from_secs(30);
 
+use std::pin::Pin;
+use tokio::net::TcpStream;
+use tokio_openssl::SslStream;
+
 /// Revocation Status
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum RevocationStatus {
@@ -119,7 +123,7 @@ pub fn find_issuer_cert<'a>(cert: &X509Ref, chain: &'a [X509]) -> Option<&'a X50
 /// If the OCSP response indicates that the certificate is revoked, it returns Revoked with the reason.
 /// If the OCSP response indicates that the certificate is good, it returns Good.
 /// If the OCSP response is not valid, it returns Unknown.
-pub fn check_ocsp_status(
+pub async fn check_ocsp_status(
     cert: &X509,
     chain: &[X509],
 ) -> Result<RevocationStatus, TLSValidationError> {
@@ -167,7 +171,7 @@ pub fn check_ocsp_status(
         };
 
         // Make HTTP POST request to OCSP responder
-        let client = match reqwest::blocking::Client::builder()
+        let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
         {
@@ -180,6 +184,7 @@ pub fn check_ocsp_status(
             .header("Content-Type", "application/ocsp-request")
             .body(req_bytes.clone())
             .send()
+            .await
         {
             Ok(resp) => resp,
             Err(_) => continue, // Try next responder if this one fails
@@ -189,7 +194,7 @@ pub fn check_ocsp_status(
             continue;
         }
 
-        let resp_bytes = match response.bytes() {
+        let resp_bytes = match response.bytes().await {
             Ok(bytes) => bytes.to_vec(),
             Err(_) => continue,
         };
@@ -263,22 +268,22 @@ pub fn check_ocsp_status(
 }
 
 /// Combined revocation checking function that tries both OCSP and CRL
-pub fn check_revocation_status(
+pub async fn check_revocation_status(
     cert: &X509,
     chain: &[X509],
 ) -> Result<RevocationStatus, TLSValidationError> {
     // First try OCSP checking as it's typically more up-to-date
-    match check_ocsp_status(cert, chain) {
+    match check_ocsp_status(cert, chain).await {
         Ok(RevocationStatus::Good) => Ok(RevocationStatus::Good),
         Ok(revoked @ RevocationStatus::Revoked(_)) => Ok(revoked),
         _ => {
             // Fallback to CRL checking if OCSP was inconclusive
-            check_crl_status(cert, chain)
+            check_crl_status(cert, chain).await
         }
     }
 }
 
-pub fn check_crl_status(
+pub async fn check_crl_status(
     cert: &X509,
     chain: &[X509],
 ) -> Result<RevocationStatus, TLSValidationError> {
@@ -330,7 +335,7 @@ pub fn check_crl_status(
         };
 
         // Download the CRL
-        let client = match reqwest::blocking::Client::builder()
+        let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
         {
@@ -338,7 +343,7 @@ pub fn check_crl_status(
             Err(_) => continue,
         };
 
-        let response = match client.get(crl_url).send() {
+        let response = match client.get(crl_url).send().await {
             Ok(resp) => resp,
             Err(_) => continue,
         };
@@ -347,7 +352,7 @@ pub fn check_crl_status(
             continue;
         }
 
-        let crl_data = match response.bytes() {
+        let crl_data = match response.bytes().await {
             Ok(bytes) => bytes.to_vec(),
             Err(_) => continue,
         };
@@ -405,14 +410,13 @@ pub fn check_crl_status(
 /// If the OCSP status check fails, it returns a TLSValidationError.
 /// If the OCSP status is not checked, it returns a TLSValidationError.
 impl TLS {
-    pub fn from(
+    pub async fn from(
         host: &str,
         port: Option<u16>,
         check_revocation: bool,
     ) -> Result<TLS, TLSValidationError> {
         use openssl::nid::Nid;
         use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
-        use std::net::{TcpStream, ToSocketAddrs};
 
         // Trim any whitespace
         let host = host.trim();
@@ -432,15 +436,28 @@ impl TLS {
         // Use the provided port or default to 443
         let port = port.unwrap_or(443);
         let remote = format!("{host}:{port}");
-        let socket_addr = remote
-            .to_socket_addrs()?
-            .next()
-            .ok_or("Failed parse remote hostname")?;
 
-        let tcp_stream = TcpStream::connect_timeout(&socket_addr, TIMEOUT)?;
+        // Use tokio for DNS resolution
+        let mut addrs = tokio::net::lookup_host(&remote)
+            .await
+            .map_err(|e| TLSValidationError::new(&format!("Failed to resolve host: {}", e)))?;
 
-        tcp_stream.set_read_timeout(Some(TIMEOUT))?;
-        let stream = connector.connect(tcp_stream)?;
+        let socket_addr = addrs.next().ok_or("Failed parse remote hostname")?;
+
+        // Connect with timeout
+        let tcp_stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(socket_addr))
+            .await
+            .map_err(|_| TLSValidationError::new("Connection timed out"))?
+            .map_err(|e| TLSValidationError::new(&format!("Failed to connect: {}", e)))?;
+
+        let mut stream = SslStream::new(connector, tcp_stream)
+            .map_err(|e| TLSValidationError::new(&format!("Failed to create SslStream: {}", e)))?;
+
+        // Perform TLS handshake with timeout
+        tokio::time::timeout(TIMEOUT, Pin::new(&mut stream).connect())
+            .await
+            .map_err(|_| TLSValidationError::new("TLS handshake timed out"))?
+            .map_err(|e| TLSValidationError::new(&format!("TLS handshake failed: {}", e)))?;
 
         // `Ssl` object associated with this stream
         let ssl = stream.ssl();
@@ -475,7 +492,7 @@ impl TLS {
             let cert_chain: Vec<openssl::x509::X509> =
                 peer_cert_chain.iter().map(|cert| cert.to_owned()).collect();
 
-            match check_revocation_status(&x509_ref, &cert_chain) {
+            match check_revocation_status(&x509_ref, &cert_chain).await {
                 Ok(status) => status,
                 Err(_) => RevocationStatus::Unknown,
             }
@@ -665,11 +682,11 @@ pub fn is_self_signed_certificate(cert: &X509) -> bool {
 mod tests {
     use crate::{RevocationStatus, TLS};
 
-    #[test]
-    fn test_check_tls_for_valid_host() {
+    #[tokio::test]
+    async fn test_check_tls_for_valid_host() {
         let host = "google.com";
         // Check without revocation checking
-        let tls_result = TLS::from(host, None, true).unwrap();
+        let tls_result = TLS::from(host, None, true).await.unwrap();
 
         assert!(!tls_result.certificate.is_expired);
         assert_eq!(tls_result.certificate.hostname, host);
@@ -679,12 +696,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_check_tls_with_revocation() {
+    #[tokio::test]
+    async fn test_check_tls_with_revocation() {
         // This test depends on external services, so we'll just check that it runs
         // without error and returns a valid status (not specifically which status)
         let host = "google.com";
-        let tls_result = TLS::from(host, None, true).unwrap();
+        let tls_result = TLS::from(host, None, true).await.unwrap();
 
         match tls_result.certificate.revocation_status {
             RevocationStatus::Good | RevocationStatus::Unknown => {
@@ -707,24 +724,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_check_tls_expired_host() {
+    #[tokio::test]
+    async fn test_check_tls_expired_host() {
         let host = "expired.badssl.com";
-        let tls_result = TLS::from(host, None, false).unwrap();
+        let tls_result = TLS::from(host, None, false).await.unwrap();
 
         assert!(tls_result.certificate.is_expired);
         assert!(tls_result.certificate.validity_days < 0);
         assert_eq!(tls_result.certificate.hostname, host);
     }
 
-    #[test]
-    fn test_check_revoked_host() {
+    #[tokio::test]
+    async fn test_check_revoked_host() {
         // NOTE: This test may be flaky due to external service dependencies
         // Test that the revoked.badssl.com host returns a revoked status
         // If the OCSP responder is unavailable, this might return Unknown instead
         let host = "revoked.badssl.com";
 
-        match TLS::from(host, None, true) {
+        match TLS::from(host, None, true).await {
             Ok(tls_result) => {
                 // The badssl.com site should either show as revoked or unknown
                 // depending on whether the OCSP responder is working
@@ -759,28 +776,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_empty_hostname() {
+    #[tokio::test]
+    async fn test_empty_hostname() {
         let host = "";
-        let result = TLS::from(host, None, false).err();
+        let result = TLS::from(host, None, false).await.err();
         assert_eq!(result.unwrap().details, "Hostname cannot be empty");
     }
 
-    #[test]
-    fn test_whitespace_hostname() {
+    #[tokio::test]
+    async fn test_whitespace_hostname() {
         let host = "  ";
-        let result = TLS::from(host, None, false).err();
+        let result = TLS::from(host, None, false).await.err();
         assert_eq!(result.unwrap().details, "Hostname cannot be empty");
     }
 
-    #[test]
-    fn test_combined_revocation_checking() {
+    #[tokio::test]
+    async fn test_combined_revocation_checking() {
         // This test checks that the combined revocation checking function works correctly
         // It depends on external services, so we'll just test that it doesn't error out
         // rather than checking specific result values
 
         let host = "google.com";
-        match TLS::from(host, None, true) {
+        match TLS::from(host, None, true).await {
             Ok(tls_result) => {
                 // Just check that we get a valid status type
                 match tls_result.certificate.revocation_status {
@@ -810,12 +827,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_crl_distribution_point_parsing() {
+    #[tokio::test]
+    async fn test_crl_distribution_point_parsing() {
         // Try to connect to a site that definitely has CRL distribution points
         // We'll use digicert.com as they're a major CA and likely have proper CRLs
         let host = "digicert.com";
-        match TLS::from(host, None, true) {
+        match TLS::from(host, None, true).await {
             Ok(tls_result) => {
                 // The test passes if we get any valid status
                 match tls_result.certificate.revocation_status {
@@ -842,13 +859,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_revoked_cert_detection() {
+    #[tokio::test]
+    async fn test_revoked_cert_detection() {
         // Try to test with a known revoked certificate
         // badssl.com provides a revoked certificate test site
         let host = "revoked.badssl.com";
 
-        match TLS::from(host, None, true) {
+        match TLS::from(host, None, true).await {
             Ok(tls_result) => {
                 // The certificate should either be detected as revoked or unknown
                 // depending on whether the revocation checking services are available

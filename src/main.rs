@@ -1,5 +1,3 @@
-use std::sync::mpsc::sync_channel;
-use std::thread;
 mod config;
 mod metrics;
 
@@ -357,7 +355,8 @@ impl FinalConfig {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Args::parse();
 
     // Handle config generation
@@ -391,65 +390,61 @@ fn main() {
         .map(|address| parse_host_port(address))
         .collect();
 
-    let size = hosts_and_ports.len();
-    let (sender, receiver) = sync_channel(size);
     let hosts_len = hosts_and_ports.len();
     let check_revocation = final_config.check_revocation;
 
-    thread::spawn(move || {
-        for host_port in hosts_and_ports {
-            let thread_tx = sender.clone();
-            let check_revocation = check_revocation;
-            let handle = thread::spawn(move || {
-                let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
+    let mut join_set = tokio::task::JoinSet::new();
 
-                match TLS::from(&host_port.host, host_port.port, check_revocation) {
-                    Ok(cert) => {
-                        thread_tx.send(cert).unwrap();
+    for host_port in hosts_and_ports {
+        join_set.spawn(async move {
+            let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
+
+            match TLS::from(&host_port.host, host_port.port, check_revocation).await {
+                Ok(cert) => Some(cert),
+                Err(err) => {
+                    if err.details.contains("failed to lookup address information") {
+                        eprintln!(
+                            "ERROR: Cannot resolve hostname: {}{}",
+                            host_port.host, port_display
+                        );
+                        eprintln!("  - Check that the hostname is spelled correctly");
+                        eprintln!("  - Verify your network and DNS configuration");
+                        eprintln!("  - Try using an IP address instead if DNS resolution is not available");
+                    } else if err.details.contains("connection refused") {
+                        eprintln!(
+                            "ERROR: Connection refused for host: {}{}",
+                            host_port.host, port_display
+                        );
+                        eprintln!(
+                            "  - Verify the host is running a TLS service on port {}",
+                            host_port.port.unwrap_or(443)
+                        );
+                        eprintln!("  - Check if a firewall might be blocking the connection");
+                    } else if err.details.contains("certificate") {
+                        eprintln!(
+                            "ERROR: Certificate issue with host: {}{}",
+                            host_port.host, port_display
+                        );
+                        eprintln!("  - Error details: {}", &err.details);
+                    } else {
+                        eprintln!(
+                            "ERROR: Failed to check host: {}{}",
+                            host_port.host, port_display
+                        );
+                        eprintln!("  - Error details: {}", &err.details);
                     }
-                    Err(err) => {
-                        if err.details.contains("failed to lookup address information") {
-                            eprintln!(
-                                "ERROR: Cannot resolve hostname: {}{}",
-                                host_port.host, port_display
-                            );
-                            eprintln!("  - Check that the hostname is spelled correctly");
-                            eprintln!("  - Verify your network and DNS configuration");
-                            eprintln!("  - Try using an IP address instead if DNS resolution is not available");
-                        } else if err.details.contains("connection refused") {
-                            eprintln!(
-                                "ERROR: Connection refused for host: {}{}",
-                                host_port.host, port_display
-                            );
-                            eprintln!(
-                                "  - Verify the host is running a TLS service on port {}",
-                                host_port.port.unwrap_or(443)
-                            );
-                            eprintln!("  - Check if a firewall might be blocking the connection");
-                        } else if err.details.contains("certificate") {
-                            eprintln!(
-                                "ERROR: Certificate issue with host: {}{}",
-                                host_port.host, port_display
-                            );
-                            eprintln!("  - Error details: {}", &err.details);
-                        } else {
-                            eprintln!(
-                                "ERROR: Failed to check host: {}{}",
-                                host_port.host, port_display
-                            );
-                            eprintln!("  - Error details: {}", &err.details);
-                        }
-                    }
+                    None
                 }
-            });
-            handle.join().unwrap();
-        }
-    });
+            }
+        });
+    }
 
     let mut results: Vec<TLS> = Vec::with_capacity(hosts_len);
 
-    for tls_result in receiver {
-        results.push(tls_result);
+    while let Some(res) = join_set.join_next().await {
+        if let Ok(Some(tls_result)) = res {
+            results.push(tls_result);
+        }
     }
 
     let expired_certs = &results
@@ -574,10 +569,10 @@ fn parse_host_port(address: &str) -> HostPort {
     }
 }
 
-#[test]
-fn test_self_signed_certificate() {
+#[tokio::test]
+async fn test_self_signed_certificate() {
     let host = "self-signed.badssl.com";
-    match TLS::from(host, None, false) {
+    match TLS::from(host, None, false).await {
         Ok(tls_result) => {
             // The certificate should be marked as self-signed
             assert!(
@@ -597,7 +592,7 @@ fn test_self_signed_certificate() {
 
     // Test a known non-self-signed certificate
     let host = "google.com";
-    if let Ok(tls_result) = TLS::from(host, None, false) {
+    if let Ok(tls_result) = TLS::from(host, None, false).await {
         assert!(
             !tls_result.certificate.is_self_signed,
             "google.com certificate should not be self-signed"
