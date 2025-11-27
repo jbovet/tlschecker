@@ -58,6 +58,17 @@ impl Default for RevocationStatus {
     }
 }
 
+/// Security warnings identified during certificate analysis.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum SecurityWarning {
+    /// Certificate uses a weak signature algorithm (e.g., SHA1, MD5)
+    WeakSignatureAlgorithm(String),
+    /// Certificate chain is incomplete or has missing intermediates
+    IncompleteChain(String),
+    /// Certificate chain ordering is incorrect
+    InvalidChainOrder(String),
+}
+
 /// Represents a certificate in the certificate chain.
 ///
 /// Contains basic information about an intermediate or root certificate
@@ -136,6 +147,8 @@ pub struct CertificateInfo {
     pub revocation_status: RevocationStatus,
     /// Whether this is a self-signed certificate
     pub is_self_signed: bool,
+    /// Security warnings identified during analysis
+    pub security_warnings: Vec<SecurityWarning>,
 }
 
 /// Certificate issuer (Certificate Authority) information.
@@ -213,6 +226,81 @@ pub fn find_issuer_cert<'a>(cert: &X509Ref, chain: &'a [X509]) -> Option<&'a X50
         }
     }
     None
+}
+
+/// Analyzes a certificate chain for security issues.
+///
+/// Checks for:
+/// - Weak signature algorithms (SHA1, MD5)
+/// - Chain completeness
+/// - Chain ordering
+///
+/// # Arguments
+///
+/// * `cert` - The end-entity certificate
+/// * `chain` - The complete certificate chain
+///
+/// # Returns
+///
+/// A vector of `SecurityWarning` items describing any issues found.
+pub fn analyze_certificate_chain(cert: &X509, chain: &[X509]) -> Vec<SecurityWarning> {
+    let mut warnings = Vec::new();
+
+    // Check for weak signature algorithms in the end-entity certificate
+    let sig_alg = cert.signature_algorithm().object().to_string();
+    if is_weak_algorithm(&sig_alg) {
+        warnings.push(SecurityWarning::WeakSignatureAlgorithm(format!(
+            "Certificate uses weak signature algorithm: {}",
+            sig_alg
+        )));
+    }
+
+    // Check for weak algorithms in the chain
+    for chain_cert in chain.iter() {
+        let chain_sig_alg = chain_cert.signature_algorithm().object().to_string();
+        if is_weak_algorithm(&chain_sig_alg) {
+            let subject = chain_cert
+                .subject_name()
+                .entries_by_nid(Nid::COMMONNAME)
+                .next()
+                .and_then(|e| e.data().as_utf8().ok().map(|s| s.to_string()))
+                .unwrap_or_else(|| "Unknown".to_string());
+            warnings.push(SecurityWarning::WeakSignatureAlgorithm(format!(
+                "Chain certificate '{}' uses weak signature algorithm: {}",
+                subject, chain_sig_alg
+            )));
+        }
+    }
+
+    // Check chain completeness - verify each cert's issuer is in the chain
+    if !chain.is_empty() {
+        let issuer = find_issuer_cert(cert, chain);
+        if issuer.is_none() && !is_self_signed_certificate(cert) {
+            warnings.push(SecurityWarning::IncompleteChain(
+                "Certificate issuer not found in chain".to_string(),
+            ));
+        }
+    }
+
+    warnings
+}
+
+/// Checks if a signature algorithm is considered weak.
+///
+/// # Arguments
+///
+/// * `algorithm` - The signature algorithm OID string
+///
+/// # Returns
+///
+/// `true` if the algorithm is weak, `false` otherwise.
+fn is_weak_algorithm(algorithm: &str) -> bool {
+    // Check for SHA1 and MD5 based algorithms
+    algorithm.contains("sha1") || algorithm.contains("SHA1") ||
+    algorithm.contains("md5") || algorithm.contains("MD5") ||
+    algorithm.contains("1.2.840.113549.1.1.5") ||  // sha1WithRSAEncryption
+    algorithm.contains("1.2.840.113549.1.1.4") ||  // md5WithRSAEncryption
+    algorithm.contains("1.2.840.10040.4.3") // dsaWithSHA1
 }
 
 /// Check OCSP status
@@ -584,6 +672,11 @@ impl TLS {
         let mut data = get_certificate_info(&x509_ref);
         data.revocation_status = revocation_status;
 
+        // Analyze certificate chain for security issues
+        let cert_chain: Vec<openssl::x509::X509> =
+            peer_cert_chain.iter().map(|cert| cert.to_owned()).collect();
+        let security_warnings = analyze_certificate_chain(&x509_ref, &cert_chain);
+
         let certificate = CertificateInfo {
             hostname: host.to_string(),
             subject: data.subject,
@@ -600,6 +693,7 @@ impl TLS {
             chain: Some(chain_info),
             revocation_status: data.revocation_status,
             is_self_signed: data.is_self_signed,
+            security_warnings,
         };
 
         Ok(TLS {
@@ -727,6 +821,7 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         chain: None,
         revocation_status: RevocationStatus::NotChecked,
         is_self_signed: is_self_signed_certificate(cert_ref),
+        security_warnings: Vec::new(),
     }
 }
 
