@@ -34,7 +34,7 @@ jobs:
             asset_name: tlschecker-macos-aarch64
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: actions-rs/toolchain@v1
         with:
