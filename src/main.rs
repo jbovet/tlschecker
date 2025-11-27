@@ -12,7 +12,10 @@ use tlschecker::RevocationStatus;
 use tlschecker::TLS;
 use url::Url;
 
+use anyhow::Result;
 use config::{Config, ConfigError};
+use tlschecker::TLSError;
+use tracing::error;
 
 /// Experimental TLS/SSL certificate checker.
 ///
@@ -454,7 +457,10 @@ impl FinalConfig {
     }
 }
 
-fn main() {
+fn main() -> Result<()> {
+    // Initialize tracing
+    tracing_subscriber::fmt::init();
+
     let cli = Args::parse();
 
     // Handle config generation
@@ -465,15 +471,15 @@ fn main() {
         );
         println!();
         println!("{}", Config::example_toml());
-        return;
+        return Ok(());
     }
 
     // Load configuration
     let final_config = match load_config(&cli) {
         Ok(config) => config,
         Err(_e) => {
-            eprintln!("Try running with --help for usage information");
-            eprintln!("Or use --generate-config to create a sample configuration file");
+            error!("Try running with --help for usage information");
+            error!("Or use --generate-config to create a sample configuration file");
             std::process::exit(1);
         }
     };
@@ -504,39 +510,40 @@ fn main() {
                     Ok(cert) => {
                         thread_tx.send(cert).unwrap();
                     }
-                    Err(err) => {
-                        if err.details.contains("failed to lookup address information") {
-                            eprintln!(
-                                "ERROR: Cannot resolve hostname: {}{}",
+                    Err(err) => match err {
+                        TLSError::DNS(msg) => {
+                            error!(
+                                "Cannot resolve hostname: {}{}",
                                 host_port.host, port_display
                             );
-                            eprintln!("  - Check that the hostname is spelled correctly");
-                            eprintln!("  - Verify your network and DNS configuration");
-                            eprintln!("  - Try using an IP address instead if DNS resolution is not available");
-                        } else if err.details.contains("connection refused") {
-                            eprintln!(
-                                "ERROR: Connection refused for host: {}{}",
-                                host_port.host, port_display
-                            );
-                            eprintln!(
-                                "  - Verify the host is running a TLS service on port {}",
-                                host_port.port.unwrap_or(443)
-                            );
-                            eprintln!("  - Check if a firewall might be blocking the connection");
-                        } else if err.details.contains("certificate") {
-                            eprintln!(
-                                "ERROR: Certificate issue with host: {}{}",
-                                host_port.host, port_display
-                            );
-                            eprintln!("  - Error details: {}", &err.details);
-                        } else {
-                            eprintln!(
-                                "ERROR: Failed to check host: {}{}",
-                                host_port.host, port_display
-                            );
-                            eprintln!("  - Error details: {}", &err.details);
+                            error!("  - {}", msg);
                         }
-                    }
+                        TLSError::Connection(e) => {
+                            error!(
+                                "Connection refused for host: {}{}",
+                                host_port.host, port_display
+                            );
+                            error!("  - {}", e);
+                        }
+                        TLSError::Certificate(msg) => {
+                            error!(
+                                "Certificate issue with host: {}{}",
+                                host_port.host, port_display
+                            );
+                            error!("  - {}", msg);
+                        }
+                        TLSError::Validation(msg) => {
+                            error!(
+                                "Validation error for host: {}{}",
+                                host_port.host, port_display
+                            );
+                            error!("  - {}", msg);
+                        }
+                        _ => {
+                            error!("Failed to check host: {}{}", host_port.host, port_display);
+                            error!("  - {}", err);
+                        }
+                    },
                 }
             });
             handle.join().unwrap();
@@ -582,6 +589,7 @@ fn main() {
     }
 
     exit(exit_code, failed_result);
+    Ok(())
 }
 
 /// Loads and merges configuration from multiple sources.
@@ -740,9 +748,9 @@ fn test_self_signed_certificate() {
         Err(err) => {
             // It's also acceptable if the connection fails since some TLS clients reject self-signed certs
             assert!(
-                err.details.contains("certificate"),
-                "Expected certificate error, got: {}",
-                err.details
+                matches!(err, TLSError::Certificate(_)),
+                "Expected certificate error, got: {:?}",
+                err
             );
         }
     }

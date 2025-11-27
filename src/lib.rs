@@ -19,11 +19,10 @@
 //!
 //! // Check with revocation checking enabled
 //! let result = TLS::from("example.com", Some(443), true)?;
-//! # Ok::<(), tlschecker::TLSValidationError>(())
+//! # Ok::<(), tlschecker::TLSError>(())
 //! ```
 
 use std::fmt::Debug;
-use std::io::Error;
 use std::ops::Deref;
 use std::time::Duration;
 
@@ -34,6 +33,8 @@ use openssl::ocsp::OcspCertStatus;
 use openssl::ssl::HandshakeError;
 use openssl::x509::{CrlStatus, ReasonCode, X509Crl, X509NameEntries, X509Ref, X509};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{error, instrument, warn};
 
 /// Default timeout for TLS connection attempts (30 seconds).
 static TIMEOUT: Duration = Duration::from_secs(30);
@@ -312,10 +313,8 @@ fn is_weak_algorithm(algorithm: &str) -> bool {
 /// If the OCSP response indicates that the certificate is revoked, it returns Revoked with the reason.
 /// If the OCSP response indicates that the certificate is good, it returns Good.
 /// If the OCSP response is not valid, it returns Unknown.
-pub fn check_ocsp_status(
-    cert: &X509,
-    chain: &[X509],
-) -> Result<RevocationStatus, TLSValidationError> {
+#[instrument(skip(cert, chain))]
+pub fn check_ocsp_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus, TLSError> {
     use openssl::hash::MessageDigest;
     use openssl::ocsp::OcspCertId;
 
@@ -456,10 +455,8 @@ pub fn check_ocsp_status(
 }
 
 /// Combined revocation checking function that tries both OCSP and CRL
-pub fn check_revocation_status(
-    cert: &X509,
-    chain: &[X509],
-) -> Result<RevocationStatus, TLSValidationError> {
+#[instrument(skip(cert, chain))]
+pub fn check_revocation_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus, TLSError> {
     // First try OCSP checking as it's typically more up-to-date
     match check_ocsp_status(cert, chain) {
         Ok(RevocationStatus::Good) => Ok(RevocationStatus::Good),
@@ -471,10 +468,8 @@ pub fn check_revocation_status(
     }
 }
 
-pub fn check_crl_status(
-    cert: &X509,
-    chain: &[X509],
-) -> Result<RevocationStatus, TLSValidationError> {
+#[instrument(skip(cert, chain))]
+pub fn check_crl_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus, TLSError> {
     use openssl::x509::store::X509StoreBuilder;
 
     // Find the issuer certificate in the chain
@@ -591,11 +586,8 @@ pub fn check_crl_status(
 }
 
 impl TLS {
-    pub fn from(
-        host: &str,
-        port: Option<u16>,
-        check_revocation: bool,
-    ) -> Result<TLS, TLSValidationError> {
+    #[instrument]
+    pub fn from(host: &str, port: Option<u16>, check_revocation: bool) -> Result<TLS, TLSError> {
         use openssl::nid::Nid;
         use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
         use std::net::{TcpStream, ToSocketAddrs};
@@ -605,7 +597,7 @@ impl TLS {
 
         // Validate hostname is not empty
         if host.is_empty() {
-            return Err(TLSValidationError::new("Hostname cannot be empty"));
+            return Err(TLSError::Validation("Hostname cannot be empty".to_string()));
         }
 
         let mut context = SslContext::builder(SslMethod::tls())?;
@@ -621,7 +613,7 @@ impl TLS {
         let socket_addr = remote
             .to_socket_addrs()?
             .next()
-            .ok_or("Failed parse remote hostname")?;
+            .ok_or_else(|| TLSError::DNS("Failed parse remote hostname".to_string()))?;
 
         let tcp_stream = TcpStream::connect_timeout(&socket_addr, TIMEOUT)?;
 
@@ -632,14 +624,20 @@ impl TLS {
         let ssl = stream.ssl();
 
         let cipher = Cipher {
-            name: ssl.current_cipher().unwrap().name().to_string(),
-            version: ssl.current_cipher().unwrap().version().to_string(),
+            name: ssl
+                .current_cipher()
+                .map(|c| c.name().to_string())
+                .unwrap_or_else(|| "Unknown".to_string()),
+            version: ssl
+                .current_cipher()
+                .map(|c| c.version().to_string())
+                .unwrap_or_else(|| "Unknown".to_string()),
         };
 
         // Get the peer certificate chain
         let peer_cert_chain = ssl
             .peer_cert_chain()
-            .ok_or("Peer certificate chain not found")?;
+            .ok_or_else(|| TLSError::Certificate("Peer certificate chain not found".to_string()))?;
 
         // Create the Chain objects for return data
         let chain_info = peer_cert_chain
@@ -653,7 +651,9 @@ impl TLS {
             })
             .collect::<Vec<Chain>>();
 
-        let x509_ref = ssl.peer_certificate().ok_or("Certificate not found")?;
+        let x509_ref = ssl
+            .peer_certificate()
+            .ok_or_else(|| TLSError::Certificate("Certificate not found".to_string()))?;
 
         // Check revocation status if requested
         let revocation_status = if check_revocation {
@@ -870,54 +870,22 @@ fn has_expired(not_after: &Asn1TimeRef) -> bool {
 }
 
 /// Error type for TLS certificate validation failures.
-///
-/// This error is returned when certificate checking fails due to connection issues,
-/// invalid certificates, or other validation problems.
-///
-/// # Fields
-///
-/// * `details` - Human-readable error message describing what went wrong
-#[derive(Debug)]
-pub struct TLSValidationError {
-    /// Detailed error message
-    pub details: String,
-}
-
-impl TLSValidationError {
-    /// Creates a new `TLSValidationError` with the specified message.
-    ///
-    /// # Arguments
-    ///
-    /// * `msg` - Error message describing the validation failure
-    fn new(msg: &str) -> TLSValidationError {
-        TLSValidationError {
-            details: msg.to_string(),
-        }
-    }
-}
-
-impl From<Error> for TLSValidationError {
-    fn from(e: Error) -> TLSValidationError {
-        TLSValidationError::new(&e.to_string())
-    }
-}
-
-impl From<&str> for TLSValidationError {
-    fn from(e: &str) -> TLSValidationError {
-        TLSValidationError::new(e)
-    }
-}
-
-impl From<ErrorStack> for TLSValidationError {
-    fn from(e: ErrorStack) -> TLSValidationError {
-        TLSValidationError::new(&e.to_string())
-    }
-}
-
-impl<S> From<HandshakeError<S>> for TLSValidationError {
-    fn from(_: HandshakeError<S>) -> TLSValidationError {
-        TLSValidationError::new("TLS handshake failed.")
-    }
+#[derive(Error, Debug)]
+pub enum TLSError {
+    #[error("Validation error: {0}")]
+    Validation(String),
+    #[error("DNS resolution error: {0}")]
+    DNS(String),
+    #[error("Connection error: {0}")]
+    Connection(#[from] std::io::Error),
+    #[error("OpenSSL error: {0}")]
+    OpenSSL(#[from] ErrorStack),
+    #[error("TLS Handshake error: {0}")]
+    Handshake(#[from] HandshakeError<std::net::TcpStream>),
+    #[error("Certificate error: {0}")]
+    Certificate(String),
+    #[error("Unknown error: {0}")]
+    Unknown(String),
 }
 
 /// Determines whether a certificate is self-signed.
@@ -963,7 +931,7 @@ pub fn is_self_signed_certificate(cert: &X509) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{RevocationStatus, TLS};
+    use crate::{RevocationStatus, TLSError, TLS};
 
     #[test]
     fn test_check_tls_for_valid_host() {
@@ -1051,9 +1019,9 @@ mod tests {
             Err(err) => {
                 // It's okay if the connection fails (certificate rejected)
                 assert!(
-                    err.details.contains("certificate"),
-                    "Expected certificate error, got: {}",
-                    err.details
+                    matches!(err, TLSError::Certificate(_)),
+                    "Expected certificate error, got: {:?}",
+                    err
                 );
             }
         }
@@ -1062,15 +1030,15 @@ mod tests {
     #[test]
     fn test_empty_hostname() {
         let host = "";
-        let result = TLS::from(host, None, false).err();
-        assert_eq!(result.unwrap().details, "Hostname cannot be empty");
+        let result = TLS::from(host, None, false).err().unwrap();
+        assert!(matches!(result, TLSError::Validation(msg) if msg == "Hostname cannot be empty"));
     }
 
     #[test]
     fn test_whitespace_hostname() {
         let host = "  ";
-        let result = TLS::from(host, None, false).err();
-        assert_eq!(result.unwrap().details, "Hostname cannot be empty");
+        let result = TLS::from(host, None, false).err().unwrap();
+        assert!(matches!(result, TLSError::Validation(msg) if msg == "Hostname cannot be empty"));
     }
 
     #[test]
@@ -1104,7 +1072,7 @@ mod tests {
             }
             Err(e) => {
                 // Connection error - this is unexpected but could happen
-                println!("Connection error to google.com: {}", e.details);
+                println!("Connection error to google.com: {}", e);
                 assert!(true);
             }
         }
@@ -1136,7 +1104,7 @@ mod tests {
             }
             Err(e) => {
                 // Connection error - this is unexpected but could happen
-                println!("Connection error to digicert.com: {}", e.details);
+                println!("Connection error to digicert.com: {}", e);
                 assert!(true);
             }
         }
@@ -1175,9 +1143,9 @@ mod tests {
             Err(err) => {
                 // It's okay if the connection fails (certificate rejected)
                 assert!(
-                    err.details.contains("certificate"),
-                    "Expected certificate error, got: {}",
-                    err.details
+                    matches!(err, TLSError::Certificate(_)),
+                    "Expected certificate error, got: {:?}",
+                    err
                 );
             }
         }
