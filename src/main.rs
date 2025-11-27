@@ -185,6 +185,24 @@ impl Formatter for TextFormat {
                 }
             );
 
+            // Display security warnings if any
+            if !cert.security_warnings.is_empty() {
+                println!("\nSecurity Warnings:");
+                for warning in &cert.security_warnings {
+                    match warning {
+                        tlschecker::SecurityWarning::WeakSignatureAlgorithm(msg) => {
+                            println!("  ⚠️  WEAK ALGORITHM: {}", msg);
+                        }
+                        tlschecker::SecurityWarning::IncompleteChain(msg) => {
+                            println!("  ⚠️  INCOMPLETE CHAIN: {}", msg);
+                        }
+                        tlschecker::SecurityWarning::InvalidChainOrder(msg) => {
+                            println!("  ⚠️  INVALID CHAIN ORDER: {}", msg);
+                        }
+                    }
+                }
+            }
+
             println!("Subject Alternative Names:");
             for san in &cert.sans {
                 println!("\tDNS Name: {}", san);
@@ -313,6 +331,32 @@ impl Formatter for SummaryFormat {
             ]);
         }
         println!("{table}");
+
+        // Display security warnings if any certificates have them
+        let certs_with_warnings: Vec<&TLS> = tls
+            .iter()
+            .filter(|t| !t.certificate.security_warnings.is_empty())
+            .collect();
+
+        if !certs_with_warnings.is_empty() {
+            println!("\n⚠️  Security Warnings:");
+            for rs in certs_with_warnings {
+                println!("\n  Host: {}", rs.certificate.hostname);
+                for warning in &rs.certificate.security_warnings {
+                    match warning {
+                        tlschecker::SecurityWarning::WeakSignatureAlgorithm(msg) => {
+                            println!("    - WEAK ALGORITHM: {}", msg);
+                        }
+                        tlschecker::SecurityWarning::IncompleteChain(msg) => {
+                            println!("    - INCOMPLETE CHAIN: {}", msg);
+                        }
+                        tlschecker::SecurityWarning::InvalidChainOrder(msg) => {
+                            println!("    - INVALID CHAIN ORDER: {}", msg);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
