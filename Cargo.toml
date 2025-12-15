@@ -24,7 +24,7 @@ url = "2.5.7"
 reqwest = { version = "0.12.23", features = ["blocking", "json"] }
 toml = "0.9.7"
 tempfile = "3.22.0"
-thiserror = "1.0"
+thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
