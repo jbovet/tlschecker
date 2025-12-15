@@ -34,7 +34,7 @@ use openssl::ssl::HandshakeError;
 use openssl::x509::{CrlStatus, ReasonCode, X509Crl, X509NameEntries, X509Ref, X509};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{error, instrument, warn};
+use tracing::{instrument, warn};
 
 /// Default timeout for TLS connection attempts (30 seconds).
 static TIMEOUT: Duration = Duration::from_secs(30);
