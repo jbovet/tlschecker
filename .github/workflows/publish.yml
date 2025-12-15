@@ -55,7 +55,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Upload binaries to release
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.artifact_name }}
