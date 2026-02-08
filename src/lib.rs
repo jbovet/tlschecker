@@ -651,10 +651,7 @@ impl TLS {
                 .current_cipher()
                 .map(|c| c.version().to_string())
                 .unwrap_or_else(|| "Unknown".to_string()),
-            bits: ssl
-                .current_cipher()
-                .map(|c| c.bits().secret)
-                .unwrap_or(0),
+            bits: ssl.current_cipher().map(|c| c.bits().secret).unwrap_or(0),
         };
 
         // Get the peer certificate chain
@@ -746,16 +743,15 @@ impl TLS {
                 cert_key_algorithm,
                 is_expired: certificate.is_expired,
                 is_self_signed: certificate.is_self_signed,
-                has_incomplete_chain: certificate.security_warnings.iter().any(|w| {
-                    matches!(w, SecurityWarning::IncompleteChain(_))
-                }),
-                has_weak_signature: certificate.security_warnings.iter().any(|w| {
-                    matches!(w, SecurityWarning::WeakSignatureAlgorithm(_))
-                }),
-                is_revoked: matches!(
-                    certificate.revocation_status,
-                    RevocationStatus::Revoked(_)
-                ),
+                has_incomplete_chain: certificate
+                    .security_warnings
+                    .iter()
+                    .any(|w| matches!(w, SecurityWarning::IncompleteChain(_))),
+                has_weak_signature: certificate
+                    .security_warnings
+                    .iter()
+                    .any(|w| matches!(w, SecurityWarning::WeakSignatureAlgorithm(_))),
+                is_revoked: matches!(certificate.revocation_status, RevocationStatus::Revoked(_)),
             };
             Some(grading::calculate_grade(&grading_input))
         } else {
@@ -1001,9 +997,7 @@ pub fn is_self_signed_certificate(cert: &X509) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::grading;
-    use crate::{
-        CertificateInfo, Chain, Cipher, Issuer, RevocationStatus, Subject, TLSError, TLS,
-    };
+    use crate::{CertificateInfo, Chain, Cipher, Issuer, RevocationStatus, Subject, TLSError, TLS};
 
     /// Creates a synthetic TLS struct for offline testing.
     /// No network connection needed — all fields are populated with realistic data.
@@ -1517,8 +1511,7 @@ mod tests {
         let host = "google.com";
         let tls_result = TLS::from(host, None, false, false).unwrap();
         assert!(
-            !tls_result.certificate.issued.organization.is_empty()
-                || tls_result.certificate.issued.organization != "None",
+            tls_result.certificate.issued.organization != "None",
             "Expected issuer organization for google.com"
         );
     }
@@ -1612,9 +1605,7 @@ mod tests {
             .set_serial_number(&serial.to_asn1_integer().unwrap())
             .unwrap();
         builder.set_subject_name(&subject_name).unwrap();
-        builder
-            .set_issuer_name(issuer_cert.subject_name())
-            .unwrap();
+        builder.set_issuer_name(issuer_cert.subject_name()).unwrap();
         builder.set_pubkey(&pkey).unwrap();
         builder
             .set_not_before(&Asn1Time::days_from_now(0).unwrap())
@@ -1652,9 +1643,7 @@ mod tests {
             .set_serial_number(&serial.to_asn1_integer().unwrap())
             .unwrap();
         builder.set_subject_name(&subject_name).unwrap();
-        builder
-            .set_issuer_name(issuer_cert.subject_name())
-            .unwrap();
+        builder.set_issuer_name(issuer_cert.subject_name()).unwrap();
         builder.set_pubkey(&pkey).unwrap();
         builder
             .set_not_before(&Asn1Time::days_from_now(0).unwrap())
@@ -1675,10 +1664,7 @@ mod tests {
 
         let chain = vec![issuer_cert.clone()];
         let result = super::find_issuer_cert(&leaf_cert, &chain);
-        assert!(
-            result.is_some(),
-            "Expected to find issuer cert in chain"
-        );
+        assert!(result.is_some(), "Expected to find issuer cert in chain");
     }
 
     #[test]
@@ -1737,7 +1723,9 @@ mod tests {
         let chain = vec![ca_cert];
         let warnings = super::analyze_certificate_chain(&weak_leaf, &chain);
         assert!(
-            warnings.iter().any(|w| matches!(w, super::SecurityWarning::WeakSignatureAlgorithm(_))),
+            warnings
+                .iter()
+                .any(|w| matches!(w, super::SecurityWarning::WeakSignatureAlgorithm(_))),
             "Expected WeakSignatureAlgorithm warning for SHA1-signed cert, got: {:?}",
             warnings
         );
@@ -1753,7 +1741,9 @@ mod tests {
         let chain = vec![unrelated_cert];
         let warnings = super::analyze_certificate_chain(&leaf_cert, &chain);
         assert!(
-            warnings.iter().any(|w| matches!(w, super::SecurityWarning::IncompleteChain(_))),
+            warnings
+                .iter()
+                .any(|w| matches!(w, super::SecurityWarning::IncompleteChain(_))),
             "Expected IncompleteChain warning when issuer missing from chain, got: {:?}",
             warnings
         );
