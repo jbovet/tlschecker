@@ -69,6 +69,14 @@ struct Args {
     /// letter grade for each host.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     grade: Option<bool>,
+
+    /// Minimum number of days a certificate must remain valid.
+    ///
+    /// Certificates with fewer remaining days are treated as failures
+    /// for exit-code purposes. Set to 0 to disable (default).
+    /// Example: --min-validity 30 fails if any cert expires within 30 days.
+    #[arg(long)]
+    min_validity: Option<i32>,
 }
 
 /// Output format for certificate information.
@@ -467,6 +475,7 @@ struct FinalConfig {
     prometheus_address: String,
     check_revocation: bool,
     grade: bool,
+    min_validity: i32,
 }
 
 impl FinalConfig {
@@ -503,6 +512,7 @@ impl FinalConfig {
                 .unwrap_or_else(|| "http://localhost:9091".to_string()),
             check_revocation: config.check_revocation.unwrap_or(false),
             grade: config.grade.unwrap_or(false),
+            min_validity: config.min_validity.unwrap_or(0),
         })
     }
 }
@@ -629,6 +639,16 @@ fn main() -> Result<()> {
         failed_result = true;
     }
 
+    // Check certificates below minimum validity threshold
+    if final_config.min_validity > 0 {
+        let below_min_validity = results
+            .iter()
+            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < final_config.min_validity);
+        if below_min_validity {
+            failed_result = true;
+        }
+    }
+
     let formatter = match final_config.output {
         OutFormat::Json => FormatterFactory::new_formatter(&OutFormat::Json),
         OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
@@ -637,7 +657,7 @@ fn main() -> Result<()> {
     print!("{}", formatter.format(&results));
 
     if final_config.prometheus {
-        metrics::prom::prometheus_metrics(results, final_config.prometheus_address);
+        metrics::prom::prometheus_metrics(results, final_config.prometheus_address, final_config.min_validity);
     }
 
     exit(exit_code, failed_result);
@@ -695,6 +715,7 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
         cli.prometheus_address.clone(),
         cli.check_revocation,
         cli.grade,
+        cli.min_validity,
     );
 
     config = config.merge_with(cli_config);
@@ -922,6 +943,7 @@ mod tests {
             check_revocation: Some(false),
             prometheus: None,
             grade: Some(false),
+            min_validity: None,
         };
         let result = FinalConfig::from_merged_config(config);
         assert!(result.is_err());
@@ -936,6 +958,7 @@ mod tests {
             check_revocation: Some(false),
             prometheus: None,
             grade: Some(false),
+            min_validity: None,
         };
         let result = FinalConfig::from_merged_config(config);
         assert!(result.is_err());
@@ -950,6 +973,7 @@ mod tests {
             check_revocation: Some(false),
             prometheus: None,
             grade: Some(false),
+            min_validity: None,
         };
         let result = FinalConfig::from_merged_config(config);
         assert!(result.is_err());
@@ -964,6 +988,7 @@ mod tests {
             check_revocation: None,
             prometheus: None,
             grade: None,
+            min_validity: None,
         };
         let final_config = FinalConfig::from_merged_config(config).unwrap();
         assert_eq!(final_config.output, OutFormat::Summary);
@@ -972,6 +997,7 @@ mod tests {
         assert!(!final_config.prometheus);
         assert!(!final_config.grade);
         assert_eq!(final_config.prometheus_address, "http://localhost:9091");
+        assert_eq!(final_config.min_validity, 0);
     }
 
     #[test]
@@ -986,6 +1012,7 @@ mod tests {
                 address: Some("http://prom:9091".to_string()),
             }),
             grade: Some(true),
+            min_validity: Some(30),
         };
         let final_config = FinalConfig::from_merged_config(config).unwrap();
         assert_eq!(final_config.addresses, vec!["a.com", "b.com"]);
@@ -995,6 +1022,54 @@ mod tests {
         assert!(final_config.prometheus);
         assert_eq!(final_config.prometheus_address, "http://prom:9091");
         assert!(final_config.grade);
+        assert_eq!(final_config.min_validity, 30);
+    }
+
+    // ── min_validity FinalConfig tests ──────────────────────────────
+
+    #[test]
+    fn test_final_config_min_validity_default_is_zero() {
+        let config = Config {
+            hosts: Some(vec!["example.com".to_string()]),
+            output: None,
+            exit_code: None,
+            check_revocation: None,
+            prometheus: None,
+            grade: None,
+            min_validity: None,
+        };
+        let final_config = FinalConfig::from_merged_config(config).unwrap();
+        assert_eq!(final_config.min_validity, 0);
+    }
+
+    #[test]
+    fn test_final_config_min_validity_explicit_value() {
+        let config = Config {
+            hosts: Some(vec!["example.com".to_string()]),
+            output: None,
+            exit_code: None,
+            check_revocation: None,
+            prometheus: None,
+            grade: None,
+            min_validity: Some(60),
+        };
+        let final_config = FinalConfig::from_merged_config(config).unwrap();
+        assert_eq!(final_config.min_validity, 60);
+    }
+
+    #[test]
+    fn test_final_config_min_validity_zero_means_disabled() {
+        let config = Config {
+            hosts: Some(vec!["example.com".to_string()]),
+            output: None,
+            exit_code: None,
+            check_revocation: None,
+            prometheus: None,
+            grade: None,
+            min_validity: Some(0),
+        };
+        let final_config = FinalConfig::from_merged_config(config).unwrap();
+        assert_eq!(final_config.min_validity, 0);
     }
 
     // ── FormatterFactory tests ───────────────────────────────────────
@@ -1224,6 +1299,104 @@ mod tests {
         let output = SummaryFormat.format(&[tls_entry]);
         assert!(output.contains("Security Warnings:"));
         assert!(output.contains("WEAK ALGORITHM: SHA1 detected"));
+    }
+
+    // ── min_validity exit logic tests ──────────────────────────────
+
+    #[test]
+    fn test_min_validity_below_threshold_triggers_failure() {
+        // Cert with 20 days left, threshold 30 → should be below min validity
+        let mut tls = make_test_tls();
+        tls.certificate.validity_days = 20;
+        tls.certificate.is_expired = false;
+        let results = vec![tls];
+
+        let min_validity = 30;
+        let below = results
+            .iter()
+            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
+        assert!(below);
+    }
+
+    #[test]
+    fn test_min_validity_above_threshold_no_failure() {
+        // Cert with 365 days left, threshold 30 → should be above min validity
+        let tls = make_test_tls(); // validity_days = 365
+        let results = vec![tls];
+
+        let min_validity = 30;
+        let below = results
+            .iter()
+            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
+        assert!(!below);
+    }
+
+    #[test]
+    fn test_min_validity_exact_threshold_no_failure() {
+        // Cert with exactly 30 days left, threshold 30 → not below, so no failure
+        let mut tls = make_test_tls();
+        tls.certificate.validity_days = 30;
+        tls.certificate.is_expired = false;
+        let results = vec![tls];
+
+        let min_validity = 30;
+        let below = results
+            .iter()
+            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
+        assert!(!below);
+    }
+
+    #[test]
+    fn test_min_validity_disabled_when_zero() {
+        // Even with low validity, when min_validity is 0 (disabled), no check
+        let mut tls = make_test_tls();
+        tls.certificate.validity_days = 5;
+        tls.certificate.is_expired = false;
+        let results = vec![tls];
+
+        let min_validity = 0;
+        // The exit logic only checks when min_validity > 0
+        let would_check = min_validity > 0;
+        assert!(!would_check);
+
+        // Even if we checked, the result wouldn't matter since the check is skipped
+        let below = results
+            .iter()
+            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
+        // 5 < 0 is false, so even without the guard the logic is safe
+        assert!(!below);
+    }
+
+    #[test]
+    fn test_min_validity_ignores_already_expired_certs() {
+        // Already expired cert with negative days — should NOT trigger min_validity
+        // (expired certs are handled by the expired check, not min_validity)
+        let mut tls = make_test_tls();
+        tls.certificate.validity_days = -10;
+        tls.certificate.is_expired = true;
+        let results = vec![tls];
+
+        let min_validity = 30;
+        let below = results
+            .iter()
+            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
+        assert!(!below); // is_expired = true, so filtered out
+    }
+
+    #[test]
+    fn test_min_validity_multiple_certs_one_below() {
+        // Two certs: one healthy (365 days), one close to expiry (10 days)
+        let tls_healthy = make_test_tls(); // 365 days
+        let mut tls_expiring = make_test_tls();
+        tls_expiring.certificate.validity_days = 10;
+        tls_expiring.certificate.is_expired = false;
+        let results = vec![tls_healthy, tls_expiring];
+
+        let min_validity = 30;
+        let below = results
+            .iter()
+            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
+        assert!(below); // one cert is below threshold
     }
 
     // ── Integration test (network-dependent) ─────────────────────────

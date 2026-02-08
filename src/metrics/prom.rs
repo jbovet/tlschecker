@@ -8,6 +8,7 @@
 //! - `tlschecker_days_before_expired` - Days until certificate expiration (gauge)
 //! - `tlschecker_hours_before_expired` - Hours until certificate expiration (gauge)
 //! - `tlschecker_revocation_status` - Certificate revocation status (gauge)
+//! - `tlschecker_below_min_validity` - Whether certificate is below minimum validity threshold (gauge)
 //!
 //! # Metric Labels
 //!
@@ -57,6 +58,14 @@ lazy_static! {
         "TLS configuration grade score (0-100)"
     )
     .unwrap();
+
+    /// Gauge metric indicating if certificate validity is below the configured minimum threshold.
+    /// Values: 0=above threshold or not configured, 1=below threshold
+    static ref TLSCHECKER_BELOW_MIN_VALIDITY: Gauge = register_gauge!(
+        "tlschecker_below_min_validity",
+        "1 if certificate validity is below the configured minimum threshold, 0 otherwise"
+    )
+    .unwrap();
 }
 
 /// Pushes TLS certificate metrics to a Prometheus Push Gateway.
@@ -68,6 +77,7 @@ lazy_static! {
 ///
 /// * `results` - Vector of TLS certificate check results
 /// * `prometheus_address` - URL of the Prometheus Push Gateway (e.g., "http://localhost:9091")
+/// * `min_validity` - Minimum validity threshold in days (0 = disabled)
 ///
 /// # Metrics Exported
 ///
@@ -87,10 +97,10 @@ lazy_static! {
 /// # use tlschecker::TLS;
 /// # use tlschecker::metrics::prom::prometheus_metrics;
 /// # fn example(results: Vec<TLS>) {
-/// prometheus_metrics(results, "http://localhost:9091".to_string());
+/// prometheus_metrics(results, "http://localhost:9091".to_string(), 30);
 /// # }
 /// ```
-pub fn prometheus_metrics(results: Vec<TLS>, prometheus_address: String) {
+pub fn prometheus_metrics(results: Vec<TLS>, prometheus_address: String, min_validity: i32) {
     for tls in results.iter() {
         TLSCHECKER_DAYS_BEFORE_EXPIRED.set(f64::from(tls.certificate.validity_days.to_owned()));
         TLSCHECKER_HOURS_BEFORE_EXPIRED.set(f64::from(tls.certificate.validity_hours.to_owned()));
@@ -110,6 +120,16 @@ pub fn prometheus_metrics(results: Vec<TLS>, prometheus_address: String) {
             TLSCHECKER_GRADE_SCORE.set(f64::from(grade.score));
         }
 
+        // Set below minimum validity threshold metric
+        if min_validity > 0
+            && !tls.certificate.is_expired
+            && tls.certificate.validity_days < min_validity
+        {
+            TLSCHECKER_BELOW_MIN_VALIDITY.set(1.0);
+        } else {
+            TLSCHECKER_BELOW_MIN_VALIDITY.set(0.0);
+        }
+
         let metric_families = prometheus::gather();
         let prometheus_client = prometheus::push_metrics(
             "tlschecker",
@@ -123,6 +143,7 @@ pub fn prometheus_metrics(results: Vec<TLS>, prometheus_address: String) {
                 "expired".to_owned() => tls.certificate.is_expired.to_string(),
                 "revoked".to_owned() => (matches!(tls.certificate.revocation_status, RevocationStatus::Revoked(_))).to_string(),
                 "grade".to_owned() => tls.grade.as_ref().map_or("N/A".to_string(), |g| g.grade.clone()),
+                "below_min_validity".to_owned() => (min_validity > 0 && !tls.certificate.is_expired && tls.certificate.validity_days < min_validity).to_string(),
             },
             &format!("{}/metrics/job", prometheus_address),
             metric_families,
