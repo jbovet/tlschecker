@@ -43,6 +43,8 @@ pub struct Config {
     pub check_revocation: Option<bool>,
     /// Prometheus configuration
     pub prometheus: Option<PrometheusConfig>,
+    /// Enable TLS configuration grading
+    pub grade: Option<bool>,
 }
 
 /// Prometheus integration configuration.
@@ -111,6 +113,7 @@ impl Config {
                 enabled: Some(false),
                 address: Some("http://localhost:9091".to_string()),
             }),
+            grade: Some(false),
         }
     }
 
@@ -160,6 +163,9 @@ impl Config {
                 self.prometheus = Some(other_prom);
             }
         }
+        if other.grade.is_some() {
+            self.grade = other.grade;
+        }
         self
     }
 
@@ -188,6 +194,7 @@ impl Config {
         prometheus: Option<bool>,
         prometheus_address: Option<String>,
         check_revocation: Option<bool>,
+        grade: Option<bool>,
     ) -> Self {
         Config {
             hosts: addresses,
@@ -198,6 +205,7 @@ impl Config {
                 enabled: prometheus,
                 address: prometheus_address,
             }),
+            grade,
         }
     }
 
@@ -233,6 +241,7 @@ impl Config {
                 enabled: Some(true),
                 address: Some("http://localhost:9091".to_string()),
             }),
+            grade: Some(false),
         };
 
         toml::to_string_pretty(&example)
@@ -314,6 +323,7 @@ mod tests {
                 enabled: Some(false),
                 address: Some("http://base:9091".to_string()),
             }),
+            grade: Some(false),
         };
 
         let override_config = Config {
@@ -325,6 +335,7 @@ mod tests {
                 enabled: Some(true),
                 address: None,
             }),
+            grade: Some(true),
         };
 
         let merged = base_config.merge_with(override_config);
@@ -338,6 +349,7 @@ mod tests {
         let prometheus = merged.prometheus.unwrap();
         assert_eq!(prometheus.enabled, Some(true)); // Overridden
         assert_eq!(prometheus.address, Some("http://base:9091".to_string())); // From base
+        assert_eq!(merged.grade, Some(true)); // Overridden
     }
 
     #[test]
@@ -366,12 +378,14 @@ mod tests {
             Some(true),
             Some("http://cli:9091".to_string()),
             Some(true),
+            Some(true),
         );
 
         assert_eq!(config.hosts, Some(vec!["cli.com".to_string()]));
         assert_eq!(config.output, Some("json".to_string()));
         assert_eq!(config.exit_code, Some(2));
         assert_eq!(config.check_revocation, Some(true));
+        assert_eq!(config.grade, Some(true));
 
         let prometheus = config.prometheus.unwrap();
         assert_eq!(prometheus.enabled, Some(true));
