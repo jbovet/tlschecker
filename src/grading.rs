@@ -455,4 +455,183 @@ mod tests {
         assert_eq!(score_key_exchange("DHE-RSA-AES256-GCM-SHA384").0, 80);
         assert_eq!(score_key_exchange("AES256-GCM-SHA384").0, 20); // unknown
     }
+
+    // ── score_cipher_bits edge cases ─────────────────────────────────
+
+    #[test]
+    fn test_cipher_bits_boundaries() {
+        assert_eq!(score_cipher_bits(256).0, 100);
+        assert_eq!(score_cipher_bits(128).0, 80);
+        assert_eq!(score_cipher_bits(112).0, 50);
+        assert_eq!(score_cipher_bits(64).0, 20);
+        assert_eq!(score_cipher_bits(0).0, 0);
+        assert_eq!(score_cipher_bits(-1).0, 0);
+    }
+
+    #[test]
+    fn test_cipher_bits_just_above_thresholds() {
+        assert_eq!(score_cipher_bits(257).0, 100);
+        assert_eq!(score_cipher_bits(129).0, 80);
+        assert_eq!(score_cipher_bits(113).0, 50);
+    }
+
+    #[test]
+    fn test_cipher_bits_just_below_thresholds() {
+        assert_eq!(score_cipher_bits(255).0, 80);
+        assert_eq!(score_cipher_bits(127).0, 50);
+        assert_eq!(score_cipher_bits(111).0, 20);
+    }
+
+    // ── score_certificate_trust edge cases ────────────────────────────
+
+    #[test]
+    fn test_trust_all_good() {
+        let input = make_input(|_| {});
+        let (score, reason) = score_certificate_trust(&input);
+        assert_eq!(score, 100);
+        assert_eq!(reason, "Certificate trust chain valid");
+    }
+
+    #[test]
+    fn test_trust_expired_takes_priority() {
+        let input = make_input(|i| {
+            i.is_expired = true;
+            i.has_weak_signature = true;
+        });
+        let (score, reason) = score_certificate_trust(&input);
+        assert_eq!(score, 0);
+        assert!(reason.contains("expired"));
+        assert!(reason.contains("Weak signature"));
+    }
+
+    #[test]
+    fn test_trust_multiple_issues_combined() {
+        let input = make_input(|i| {
+            i.is_self_signed = true;
+            i.has_incomplete_chain = true;
+            i.has_weak_signature = true;
+        });
+        let (score, reason) = score_certificate_trust(&input);
+        // self-signed caps at 20, weak sig caps at 30, incomplete chain caps at 50
+        // The lowest cap (20) should win
+        assert_eq!(score, 20);
+        assert!(reason.contains("Self-signed"));
+        assert!(reason.contains("Weak signature"));
+        assert!(reason.contains("Incomplete"));
+    }
+
+    #[test]
+    fn test_trust_revoked_and_expired() {
+        let input = make_input(|i| {
+            i.is_expired = true;
+            i.is_revoked = true;
+        });
+        let (score, reason) = score_certificate_trust(&input);
+        assert_eq!(score, 0);
+        assert!(reason.contains("expired"));
+        assert!(reason.contains("revoked"));
+    }
+
+    // ── score_cert_key_size edge cases ────────────────────────────────
+
+    #[test]
+    fn test_ec_ed25519_key() {
+        let (score, reason) = score_cert_key_size(256, "ED25519");
+        assert_eq!(score, 90);
+        assert!(reason.contains("EC"));
+    }
+
+    #[test]
+    fn test_ec_ed448_key() {
+        let (score, reason) = score_cert_key_size(456, "ED448");
+        assert_eq!(score, 100);
+        assert!(reason.contains("EC"));
+    }
+
+    #[test]
+    fn test_rsa_below_1024() {
+        let (score, _) = score_cert_key_size(512, "RSA");
+        assert_eq!(score, 10);
+    }
+
+    // ── score_protocol edge cases ────────────────────────────────────
+
+    #[test]
+    fn test_protocol_unknown_version() {
+        let (score, reason) = score_protocol("SomeUnknownProtocol");
+        assert_eq!(score, 0);
+        assert!(reason.contains("Unknown protocol"));
+    }
+
+    #[test]
+    fn test_protocol_sslv3() {
+        let (score, _) = score_protocol("SSLv3");
+        assert_eq!(score, 0);
+    }
+
+    // ── Combined hard cap scenarios ──────────────────────────────────
+
+    #[test]
+    fn test_expired_overrides_perfect_config() {
+        let input = make_input(|i| {
+            i.cert_key_bits = 4096;
+            i.is_expired = true;
+        });
+        let grade = calculate_grade(&input);
+        assert_eq!(grade.grade, "F");
+        assert_eq!(grade.score, 0);
+    }
+
+    #[test]
+    fn test_self_signed_with_tls13_still_capped() {
+        let input = make_input(|i| {
+            i.cert_key_bits = 4096;
+            i.is_self_signed = true;
+        });
+        let grade = calculate_grade(&input);
+        assert!(grade.score <= 50);
+        assert!(
+            ["C", "D", "F"].contains(&grade.grade.as_str()),
+            "Expected C or worse for self-signed, got {}",
+            grade.grade
+        );
+    }
+
+    #[test]
+    fn test_tls11_deprecated_but_not_capped_at_d() {
+        let input = make_input(|i| {
+            i.protocol_version = "TLSv1.1".into();
+            i.cipher_name = "ECDHE-RSA-AES256-GCM-SHA384".into();
+        });
+        let grade = calculate_grade(&input);
+        // TLS 1.1 protocol_score is 40, which is > 20, so D cap does NOT apply
+        assert!(
+            grade.score > 35,
+            "TLS 1.1 should not be capped at D, got score {}",
+            grade.score
+        );
+    }
+
+    #[test]
+    fn test_sslv3_capped_at_d() {
+        let input = make_input(|i| {
+            i.protocol_version = "SSLv3".into();
+        });
+        let grade = calculate_grade(&input);
+        assert!(
+            grade.score <= 35,
+            "SSLv3 should be capped at D, got score {}",
+            grade.score
+        );
+    }
+
+    #[test]
+    fn test_key_exchange_ecdh_static() {
+        assert_eq!(score_key_exchange("ECDH-RSA-AES256-SHA384").0, 50);
+    }
+
+    #[test]
+    fn test_key_exchange_rsa() {
+        assert_eq!(score_key_exchange("RSA-AES256-SHA256").0, 30);
+    }
 }

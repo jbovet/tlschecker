@@ -91,7 +91,7 @@ struct Args {
 /// - **Healthy** (Green): > 30 days until expiration
 /// - **Warning** (Yellow): 15-30 days until expiration
 /// - **Critical** (Red): ≤ 15 days until expiration or expired
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum OutFormat {
     /// JSON format for programmatic parsing
     Json,
@@ -129,12 +129,16 @@ impl std::str::FromStr for OutFormat {
 /// Implementations of this trait define how certificate data is presented
 /// to the user in different formats (Text, JSON, Summary).
 trait Formatter {
-    /// Formats and outputs the given TLS certificate data.
+    /// Formats the given TLS certificate data into a displayable string.
     ///
     /// # Arguments
     ///
     /// * `tls` - Slice of TLS structs containing certificate information
-    fn format(&self, tls: &[TLS]);
+    ///
+    /// # Returns
+    ///
+    /// A formatted string ready for display.
+    fn format(&self, tls: &[TLS]) -> String;
 }
 
 /// Text formatter - outputs detailed certificate information.
@@ -156,38 +160,41 @@ struct JsonFormat;
 struct SummaryFormat;
 
 impl Formatter for TextFormat {
-    fn format(&self, tls: &[TLS]) {
+    fn format(&self, tls: &[TLS]) -> String {
+        use std::fmt::Write;
+        let mut output = String::new();
+
         for rs in tls {
             let cert = &rs.certificate;
-            println!("--------------------------------------");
-            println!("Hostname: {}", cert.hostname);
-            println!("Issued domain: {}", cert.subject.common_name);
-            println!("Subject Name :");
-            println!("\tCountry or Region: {}", cert.subject.country_or_region);
-            println!("\tState or Province: {}", cert.subject.state_or_province);
-            println!("\tLocality: {}", cert.subject.locality);
-            println!("\tOrganizational Unit: {}", cert.subject.organization_unit);
-            println!("\tOrganization: {}", cert.subject.organization);
-            println!("\tCommon Name: {}", cert.subject.common_name);
-            println!("Issuer Name:");
-            println!("\tCountry or Region: {}", cert.issued.country_or_region);
-            println!("\tOrganization: {}", cert.issued.organization);
-            println!("\tCommon Name: {}", cert.issued.common_name);
-            println!("Valid from: {}", cert.valid_from);
-            println!("Valid to: {}", cert.valid_to);
-            println!("Days left: {}", cert.validity_days);
-            println!("Hours left: {}", cert.validity_hours);
-            println!("Self-signed: {}", cert.is_self_signed);
-            println!("Expired: {}", cert.is_expired);
-            println!("Certificate version: {}", cert.cert_ver);
-            println!("Certificate algorithm: {}", cert.cert_alg);
-            println!("Certificate S/N: {}", cert.cert_sn);
-            println!("Certificate key: {} {}-bit", cert.cert_key_algorithm, cert.cert_key_bits);
-            println!("Cipher suite: {} ({}-bit)", rs.cipher.name, rs.cipher.bits);
-            println!("Protocol: {}", rs.cipher.version);
+            writeln!(output, "--------------------------------------").unwrap();
+            writeln!(output, "Hostname: {}", cert.hostname).unwrap();
+            writeln!(output, "Issued domain: {}", cert.subject.common_name).unwrap();
+            writeln!(output, "Subject Name :").unwrap();
+            writeln!(output, "\tCountry or Region: {}", cert.subject.country_or_region).unwrap();
+            writeln!(output, "\tState or Province: {}", cert.subject.state_or_province).unwrap();
+            writeln!(output, "\tLocality: {}", cert.subject.locality).unwrap();
+            writeln!(output, "\tOrganizational Unit: {}", cert.subject.organization_unit).unwrap();
+            writeln!(output, "\tOrganization: {}", cert.subject.organization).unwrap();
+            writeln!(output, "\tCommon Name: {}", cert.subject.common_name).unwrap();
+            writeln!(output, "Issuer Name:").unwrap();
+            writeln!(output, "\tCountry or Region: {}", cert.issued.country_or_region).unwrap();
+            writeln!(output, "\tOrganization: {}", cert.issued.organization).unwrap();
+            writeln!(output, "\tCommon Name: {}", cert.issued.common_name).unwrap();
+            writeln!(output, "Valid from: {}", cert.valid_from).unwrap();
+            writeln!(output, "Valid to: {}", cert.valid_to).unwrap();
+            writeln!(output, "Days left: {}", cert.validity_days).unwrap();
+            writeln!(output, "Hours left: {}", cert.validity_hours).unwrap();
+            writeln!(output, "Self-signed: {}", cert.is_self_signed).unwrap();
+            writeln!(output, "Expired: {}", cert.is_expired).unwrap();
+            writeln!(output, "Certificate version: {}", cert.cert_ver).unwrap();
+            writeln!(output, "Certificate algorithm: {}", cert.cert_alg).unwrap();
+            writeln!(output, "Certificate S/N: {}", cert.cert_sn).unwrap();
+            writeln!(output, "Certificate key: {} {}-bit", cert.cert_key_algorithm, cert.cert_key_bits).unwrap();
+            writeln!(output, "Cipher suite: {} ({}-bit)", rs.cipher.name, rs.cipher.bits).unwrap();
+            writeln!(output, "Protocol: {}", rs.cipher.version).unwrap();
 
-            // Add revocation status information
-            println!(
+            writeln!(
+                output,
                 "Revocation Status: {}",
                 match &cert.revocation_status {
                     RevocationStatus::Good => "Good (Not Revoked)".to_string(),
@@ -195,65 +202,68 @@ impl Formatter for TextFormat {
                     RevocationStatus::Unknown => "Unknown (Could not determine)".to_string(),
                     RevocationStatus::NotChecked => "Not Checked".to_string(),
                 }
-            );
+            )
+            .unwrap();
 
-            // Display security warnings if any
             if !cert.security_warnings.is_empty() {
-                println!("\nSecurity Warnings:");
+                writeln!(output, "\nSecurity Warnings:").unwrap();
                 for warning in &cert.security_warnings {
                     match warning {
                         tlschecker::SecurityWarning::WeakSignatureAlgorithm(msg) => {
-                            println!("  ⚠️  WEAK ALGORITHM: {}", msg);
+                            writeln!(output, "  WEAK ALGORITHM: {}", msg).unwrap();
                         }
                         tlschecker::SecurityWarning::IncompleteChain(msg) => {
-                            println!("  ⚠️  INCOMPLETE CHAIN: {}", msg);
+                            writeln!(output, "  INCOMPLETE CHAIN: {}", msg).unwrap();
                         }
                         tlschecker::SecurityWarning::InvalidChainOrder(msg) => {
-                            println!("  ⚠️  INVALID CHAIN ORDER: {}", msg);
+                            writeln!(output, "  INVALID CHAIN ORDER: {}", msg).unwrap();
                         }
                     }
                 }
             }
 
-            // Display TLS grade if available
             if let Some(ref grade) = rs.grade {
-                println!("\nTLS Configuration Grade: {} (Score: {}/100)", grade.grade, grade.score);
-                println!("  Category Breakdown:");
+                writeln!(output, "\nTLS Configuration Grade: {} (Score: {}/100)", grade.grade, grade.score).unwrap();
+                writeln!(output, "  Category Breakdown:").unwrap();
                 for cat in &grade.categories {
-                    println!("    {}: {}/100 - {}", cat.category, cat.score, cat.reason);
+                    writeln!(output, "    {}: {}/100 - {}", cat.category, cat.score, cat.reason).unwrap();
                 }
             }
 
-            println!("Subject Alternative Names:");
+            writeln!(output, "Subject Alternative Names:").unwrap();
             for san in &cert.sans {
-                println!("\tDNS Name: {}", san);
+                writeln!(output, "\tDNS Name: {}", san).unwrap();
             }
 
             match &cert.chain {
                 Some(chains) => {
-                    println!("Additional Certificates (if supplied):");
+                    writeln!(output, "Additional Certificates (if supplied):").unwrap();
                     for (i, c) in chains.iter().enumerate() {
-                        println!("Chain #{:?}", i + 1);
-                        println!("\tSubject: {:?}", c.subject);
-                        println!("\tValid from: {:?}", c.valid_from);
-                        println!("\tValid until: {:?}", c.valid_to);
-                        println!("\tIssuer: {:?}", c.issuer);
-                        println!("\tSignature algorithm: {:?}", c.signature_algorithm);
+                        writeln!(output, "Chain #{:?}", i + 1).unwrap();
+                        writeln!(output, "\tSubject: {:?}", c.subject).unwrap();
+                        writeln!(output, "\tValid from: {:?}", c.valid_from).unwrap();
+                        writeln!(output, "\tValid until: {:?}", c.valid_to).unwrap();
+                        writeln!(output, "\tIssuer: {:?}", c.issuer).unwrap();
+                        writeln!(output, "\tSignature algorithm: {:?}", c.signature_algorithm).unwrap();
                     }
                 }
                 None => todo!(),
             }
         }
+        output
     }
 }
 
 /// Implement Formatter trait for SummaryFormat
 impl Formatter for SummaryFormat {
-    fn format(&self, tls: &[TLS]) {
+    fn format(&self, tls: &[TLS]) -> String {
+        use std::fmt::Write;
+
         if tls.is_empty() {
-            return;
+            return String::new();
         }
 
+        let mut output = String::new();
         let mut table = Table::new();
         table
             .set_content_arrangement(ContentArrangement::Dynamic)
@@ -300,7 +310,6 @@ impl Formatter for SummaryFormat {
                     .set_alignment(CellAlignment::Center),
             };
 
-            // Add revocation status cell
             let revocation_cell = match &rs.certificate.revocation_status {
                 RevocationStatus::Good => Cell::new("Valid")
                     .add_attribute(Attribute::Bold)
@@ -371,7 +380,7 @@ impl Formatter for SummaryFormat {
                 grade_cell,
             ]);
         }
-        println!("{table}");
+        writeln!(output, "{table}").unwrap();
 
         // Display security warnings if any certificates have them
         let certs_with_warnings: Vec<&TLS> = tls
@@ -380,34 +389,32 @@ impl Formatter for SummaryFormat {
             .collect();
 
         if !certs_with_warnings.is_empty() {
-            println!("\n⚠️  Security Warnings:");
+            writeln!(output, "\nSecurity Warnings:").unwrap();
             for rs in certs_with_warnings {
-                println!("\n  Host: {}", rs.certificate.hostname);
+                writeln!(output, "\n  Host: {}", rs.certificate.hostname).unwrap();
                 for warning in &rs.certificate.security_warnings {
                     match warning {
                         tlschecker::SecurityWarning::WeakSignatureAlgorithm(msg) => {
-                            println!("    - WEAK ALGORITHM: {}", msg);
+                            writeln!(output, "    - WEAK ALGORITHM: {}", msg).unwrap();
                         }
                         tlschecker::SecurityWarning::IncompleteChain(msg) => {
-                            println!("    - INCOMPLETE CHAIN: {}", msg);
+                            writeln!(output, "    - INCOMPLETE CHAIN: {}", msg).unwrap();
                         }
                         tlschecker::SecurityWarning::InvalidChainOrder(msg) => {
-                            println!("    - INVALID CHAIN ORDER: {}", msg);
+                            writeln!(output, "    - INVALID CHAIN ORDER: {}", msg).unwrap();
                         }
                     }
                 }
             }
         }
+        output
     }
 }
 
 /// Implement Formatter trait for JsonFormat
 impl Formatter for JsonFormat {
-    fn format(&self, tls: &[TLS]) {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&tls).expect("Failed to format certificates as JSON")
-        );
+    fn format(&self, tls: &[TLS]) -> String {
+        serde_json::to_string_pretty(&tls).expect("Failed to format certificates as JSON")
     }
 }
 /// Factory for creating formatter instances.
@@ -627,7 +634,7 @@ fn main() -> Result<()> {
         OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
         OutFormat::Summary => FormatterFactory::new_formatter(&OutFormat::Summary),
     };
-    formatter.format(&results);
+    print!("{}", formatter.format(&results));
 
     if final_config.prometheus {
         metrics::prom::prometheus_metrics(results, final_config.prometheus_address);
@@ -780,33 +787,473 @@ fn parse_host_port(address: &str) -> HostPort {
     }
 }
 
-#[test]
-fn test_self_signed_certificate() {
-    let host = "self-signed.badssl.com";
-    match TLS::from(host, None, false, false) {
-        Ok(tls_result) => {
-            // The certificate should be marked as self-signed
-            assert!(
-                tls_result.certificate.is_self_signed,
-                "Expected self-signed.badssl.com certificate to be self-signed"
-            );
-        }
-        Err(err) => {
-            // It's also acceptable if the connection fails since some TLS clients reject self-signed certs
-            assert!(
-                matches!(err, TLSError::Certificate(_)),
-                "Expected certificate error, got: {:?}",
-                err
-            );
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_host_port tests ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_host_port_hostname_only() {
+        let hp = parse_host_port("example.com");
+        assert_eq!(hp.host, "example.com");
+        assert_eq!(hp.port, None);
+    }
+
+    #[test]
+    fn test_parse_host_port_with_port() {
+        let hp = parse_host_port("example.com:8443");
+        assert_eq!(hp.host, "example.com");
+        assert_eq!(hp.port, Some(8443));
+    }
+
+    #[test]
+    fn test_parse_host_port_https_url() {
+        let hp = parse_host_port("https://example.com:9443");
+        assert_eq!(hp.host, "example.com");
+        assert_eq!(hp.port, Some(9443));
+    }
+
+    #[test]
+    fn test_parse_host_port_https_url_no_port() {
+        let hp = parse_host_port("https://example.com");
+        assert_eq!(hp.host, "example.com");
+        assert_eq!(hp.port, None);
+    }
+
+    #[test]
+    fn test_parse_host_port_http_url() {
+        let hp = parse_host_port("http://example.com:8080");
+        assert_eq!(hp.host, "example.com");
+        assert_eq!(hp.port, Some(8080));
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv4_with_port() {
+        let hp = parse_host_port("192.168.1.1:8443");
+        assert_eq!(hp.host, "192.168.1.1");
+        assert_eq!(hp.port, Some(8443));
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv4_no_port() {
+        let hp = parse_host_port("10.0.0.1");
+        assert_eq!(hp.host, "10.0.0.1");
+        assert_eq!(hp.port, None);
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv6_with_port() {
+        let hp = parse_host_port("[::1]:443");
+        // URL parser keeps brackets for IPv6 addresses
+        assert_eq!(hp.host, "[::1]");
+        // url.port() returns None for scheme-default ports (443 for HTTPS),
+        // which is correct since the app defaults to 443 when port is None
+        assert_eq!(hp.port, None);
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv6_with_non_default_port() {
+        let hp = parse_host_port("[::1]:8443");
+        assert_eq!(hp.host, "[::1]");
+        assert_eq!(hp.port, Some(8443));
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv6_no_port() {
+        let hp = parse_host_port("[::1]");
+        assert_eq!(hp.host, "[::1]");
+        assert_eq!(hp.port, None);
+    }
+
+    #[test]
+    fn test_parse_host_port_default_port_443() {
+        let hp = parse_host_port("example.com");
+        assert_eq!(hp.port, None); // None means default 443
+    }
+
+    #[test]
+    fn test_parse_host_port_subdomain() {
+        let hp = parse_host_port("sub.domain.example.com:8443");
+        assert_eq!(hp.host, "sub.domain.example.com");
+        assert_eq!(hp.port, Some(8443));
+    }
+
+    // ── OutFormat Display tests ──────────────────────────────────────
+
+    #[test]
+    fn test_outformat_display() {
+        assert_eq!(format!("{}", OutFormat::Json), "json");
+        assert_eq!(format!("{}", OutFormat::Text), "text");
+        assert_eq!(format!("{}", OutFormat::Summary), "summary");
+    }
+
+    // ── OutFormat FromStr tests ──────────────────────────────────────
+
+    #[test]
+    fn test_outformat_from_str_valid() {
+        assert_eq!("json".parse::<OutFormat>().unwrap(), OutFormat::Json);
+        assert_eq!("text".parse::<OutFormat>().unwrap(), OutFormat::Text);
+        assert_eq!("summary".parse::<OutFormat>().unwrap(), OutFormat::Summary);
+    }
+
+    #[test]
+    fn test_outformat_from_str_case_insensitive() {
+        assert_eq!("JSON".parse::<OutFormat>().unwrap(), OutFormat::Json);
+        assert_eq!("Text".parse::<OutFormat>().unwrap(), OutFormat::Text);
+        assert_eq!("SUMMARY".parse::<OutFormat>().unwrap(), OutFormat::Summary);
+    }
+
+    #[test]
+    fn test_outformat_from_str_invalid() {
+        let result = "csv".parse::<OutFormat>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid output format"));
+    }
+
+    // ── FinalConfig tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_final_config_no_hosts_returns_error() {
+        let config = Config {
+            hosts: None,
+            output: Some("summary".to_string()),
+            exit_code: Some(0),
+            check_revocation: Some(false),
+            prometheus: None,
+            grade: Some(false),
+        };
+        let result = FinalConfig::from_merged_config(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_final_config_empty_hosts_returns_error() {
+        let config = Config {
+            hosts: Some(vec![]),
+            output: Some("summary".to_string()),
+            exit_code: Some(0),
+            check_revocation: Some(false),
+            prometheus: None,
+            grade: Some(false),
+        };
+        let result = FinalConfig::from_merged_config(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_final_config_invalid_output_format() {
+        let config = Config {
+            hosts: Some(vec!["example.com".to_string()]),
+            output: Some("xml".to_string()),
+            exit_code: Some(0),
+            check_revocation: Some(false),
+            prometheus: None,
+            grade: Some(false),
+        };
+        let result = FinalConfig::from_merged_config(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_final_config_defaults() {
+        let config = Config {
+            hosts: Some(vec!["example.com".to_string()]),
+            output: None,
+            exit_code: None,
+            check_revocation: None,
+            prometheus: None,
+            grade: None,
+        };
+        let final_config = FinalConfig::from_merged_config(config).unwrap();
+        assert_eq!(final_config.output, OutFormat::Summary);
+        assert_eq!(final_config.exit_code, 0);
+        assert!(!final_config.check_revocation);
+        assert!(!final_config.prometheus);
+        assert!(!final_config.grade);
+        assert_eq!(final_config.prometheus_address, "http://localhost:9091");
+    }
+
+    #[test]
+    fn test_final_config_all_options() {
+        let config = Config {
+            hosts: Some(vec!["a.com".to_string(), "b.com".to_string()]),
+            output: Some("json".to_string()),
+            exit_code: Some(2),
+            check_revocation: Some(true),
+            prometheus: Some(config::PrometheusConfig {
+                enabled: Some(true),
+                address: Some("http://prom:9091".to_string()),
+            }),
+            grade: Some(true),
+        };
+        let final_config = FinalConfig::from_merged_config(config).unwrap();
+        assert_eq!(final_config.addresses, vec!["a.com", "b.com"]);
+        assert_eq!(final_config.output, OutFormat::Json);
+        assert_eq!(final_config.exit_code, 2);
+        assert!(final_config.check_revocation);
+        assert!(final_config.prometheus);
+        assert_eq!(final_config.prometheus_address, "http://prom:9091");
+        assert!(final_config.grade);
+    }
+
+    // ── FormatterFactory tests ───────────────────────────────────────
+
+    #[test]
+    fn test_formatter_factory_creates_all_types() {
+        // Verify factory produces formatters without panicking
+        let _json = FormatterFactory::new_formatter(&OutFormat::Json);
+        let _text = FormatterFactory::new_formatter(&OutFormat::Text);
+        let _summary = FormatterFactory::new_formatter(&OutFormat::Summary);
+    }
+
+    // ── Formatter output tests ───────────────────────────────────────
+
+    fn make_test_tls() -> TLS {
+        TLS {
+            cipher: tlschecker::Cipher {
+                name: "TLS_AES_256_GCM_SHA384".to_string(),
+                version: "TLSv1.3".to_string(),
+                bits: 256,
+            },
+            certificate: tlschecker::CertificateInfo {
+                hostname: "test.example.com".to_string(),
+                subject: tlschecker::Subject {
+                    country_or_region: "US".to_string(),
+                    state_or_province: "California".to_string(),
+                    locality: "San Francisco".to_string(),
+                    organization_unit: "Engineering".to_string(),
+                    organization: "Example Inc".to_string(),
+                    common_name: "test.example.com".to_string(),
+                },
+                issued: tlschecker::Issuer {
+                    country_or_region: "US".to_string(),
+                    organization: "Test CA".to_string(),
+                    common_name: "Test CA Root".to_string(),
+                },
+                valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
+                valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                validity_days: 365,
+                validity_hours: 8760,
+                is_expired: false,
+                cert_sn: "1234567890".to_string(),
+                cert_ver: "2".to_string(),
+                cert_alg: "sha256WithRSAEncryption".to_string(),
+                sans: vec!["test.example.com".to_string(), "www.example.com".to_string()],
+                chain: Some(vec![tlschecker::Chain {
+                    subject: "test.example.com".to_string(),
+                    issuer: "Test CA Root".to_string(),
+                    valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
+                    valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                    signature_algorithm: "sha256WithRSAEncryption".to_string(),
+                }]),
+                revocation_status: RevocationStatus::NotChecked,
+                is_self_signed: false,
+                security_warnings: vec![],
+                cert_key_bits: 2048,
+                cert_key_algorithm: "RSA".to_string(),
+            },
+            grade: None,
         }
     }
 
-    // Test a known non-self-signed certificate
-    let host = "google.com";
-    if let Ok(tls_result) = TLS::from(host, None, false, false) {
-        assert!(
-            !tls_result.certificate.is_self_signed,
-            "google.com certificate should not be self-signed"
-        );
+    #[test]
+    fn test_json_format_output() {
+        let tls = vec![make_test_tls()];
+        let output = JsonFormat.format(&tls);
+        assert!(output.contains("test.example.com"));
+        assert!(output.contains("TLS_AES_256_GCM_SHA384"));
+        assert!(output.contains("\"bits\": 256"));
+        // grade should be absent when None (skip_serializing_if)
+        assert!(!output.contains("\"grade\""));
+    }
+
+    #[test]
+    fn test_json_format_includes_grade_when_present() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.grade = Some(tlschecker::grading::TLSGrade {
+            grade: "A+".to_string(),
+            score: 97,
+            categories: vec![],
+        });
+        let output = JsonFormat.format(&[tls_entry]);
+        assert!(output.contains("\"grade\""));
+        assert!(output.contains("\"A+\""));
+        assert!(output.contains("97"));
+    }
+
+    #[test]
+    fn test_json_format_empty_input() {
+        let output = JsonFormat.format(&[]);
+        assert_eq!(output, "[]");
+    }
+
+    #[test]
+    fn test_summary_format_empty_input_returns_empty() {
+        let output = SummaryFormat.format(&[]);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_text_format_contains_all_fields() {
+        let tls = vec![make_test_tls()];
+        let output = TextFormat.format(&tls);
+        assert!(output.contains("Hostname: test.example.com"));
+        assert!(output.contains("Issued domain: test.example.com"));
+        assert!(output.contains("Organization: Example Inc"));
+        assert!(output.contains("Common Name: Test CA Root"));
+        assert!(output.contains("Days left: 365"));
+        assert!(output.contains("Hours left: 8760"));
+        assert!(output.contains("Self-signed: false"));
+        assert!(output.contains("Expired: false"));
+        assert!(output.contains("Certificate algorithm: sha256WithRSAEncryption"));
+        assert!(output.contains("Certificate key: RSA 2048-bit"));
+        assert!(output.contains("Cipher suite: TLS_AES_256_GCM_SHA384 (256-bit)"));
+        assert!(output.contains("Protocol: TLSv1.3"));
+        assert!(output.contains("Revocation Status: Not Checked"));
+        assert!(output.contains("DNS Name: test.example.com"));
+        assert!(output.contains("DNS Name: www.example.com"));
+    }
+
+    #[test]
+    fn test_summary_format_contains_host_data() {
+        let tls = vec![make_test_tls()];
+        let output = SummaryFormat.format(&tls);
+        assert!(output.contains("test.example.com"));
+        assert!(output.contains("TLS_AES_256_GCM_SHA384"));
+        assert!(output.contains("TLSv1.3"));
+        assert!(output.contains("Test CA"));
+        assert!(output.contains("Healthy"));
+    }
+
+    #[test]
+    fn test_text_format_with_warnings() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.security_warnings = vec![
+            tlschecker::SecurityWarning::WeakSignatureAlgorithm("SHA1".to_string()),
+            tlschecker::SecurityWarning::IncompleteChain("Missing intermediate".to_string()),
+            tlschecker::SecurityWarning::InvalidChainOrder("Wrong order".to_string()),
+        ];
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(output.contains("Security Warnings:"));
+        assert!(output.contains("WEAK ALGORITHM: SHA1"));
+        assert!(output.contains("INCOMPLETE CHAIN: Missing intermediate"));
+        assert!(output.contains("INVALID CHAIN ORDER: Wrong order"));
+    }
+
+    #[test]
+    fn test_text_format_with_grade() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.grade = Some(tlschecker::grading::TLSGrade {
+            grade: "B".to_string(),
+            score: 75,
+            categories: vec![
+                tlschecker::grading::CategoryScore {
+                    category: "Protocol".to_string(),
+                    score: 80,
+                    reason: "TLS 1.2".to_string(),
+                },
+            ],
+        });
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(output.contains("TLS Configuration Grade: B (Score: 75/100)"));
+        assert!(output.contains("Category Breakdown:"));
+        assert!(output.contains("Protocol: 80/100 - TLS 1.2"));
+    }
+
+    #[test]
+    fn test_summary_format_expired_cert() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.is_expired = true;
+        tls_entry.certificate.validity_days = -10;
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Critical"));
+    }
+
+    #[test]
+    fn test_summary_format_warning_threshold() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.validity_days = 20;
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Warning"));
+    }
+
+    #[test]
+    fn test_summary_format_critical_threshold() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.validity_days = 10;
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Critical"));
+    }
+
+    #[test]
+    fn test_summary_format_revoked_cert() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.revocation_status =
+            RevocationStatus::Revoked("Key compromise".to_string());
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Revoked"));
+    }
+
+    #[test]
+    fn test_summary_format_self_signed() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.is_self_signed = true;
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Yes")); // self-signed = Yes
+    }
+
+    #[test]
+    fn test_summary_format_with_grade() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.grade = Some(tlschecker::grading::TLSGrade {
+            grade: "F".to_string(),
+            score: 0,
+            categories: vec![],
+        });
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("F"));
+    }
+
+    #[test]
+    fn test_summary_format_with_security_warnings() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.security_warnings = vec![
+            tlschecker::SecurityWarning::WeakSignatureAlgorithm("SHA1 detected".to_string()),
+        ];
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Security Warnings:"));
+        assert!(output.contains("WEAK ALGORITHM: SHA1 detected"));
+    }
+
+    // ── Integration test (network-dependent) ─────────────────────────
+
+    #[test]
+    #[ignore] // requires network: connects to badssl.com and google.com
+    fn test_self_signed_certificate() {
+        let host = "self-signed.badssl.com";
+        match TLS::from(host, None, false, false) {
+            Ok(tls_result) => {
+                assert!(
+                    tls_result.certificate.is_self_signed,
+                    "Expected self-signed.badssl.com certificate to be self-signed"
+                );
+            }
+            Err(err) => {
+                assert!(
+                    matches!(err, TLSError::Certificate(_)),
+                    "Expected certificate error, got: {:?}",
+                    err
+                );
+            }
+        }
+
+        let host = "google.com";
+        if let Ok(tls_result) = TLS::from(host, None, false, false) {
+            assert!(
+                !tls_result.certificate.is_self_signed,
+                "google.com certificate should not be self-signed"
+            );
+        }
     }
 }

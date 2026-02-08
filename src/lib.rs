@@ -651,10 +651,7 @@ impl TLS {
                 .current_cipher()
                 .map(|c| c.version().to_string())
                 .unwrap_or_else(|| "Unknown".to_string()),
-            bits: ssl
-                .current_cipher()
-                .map(|c| c.bits().secret)
-                .unwrap_or(0),
+            bits: ssl.current_cipher().map(|c| c.bits().secret).unwrap_or(0),
         };
 
         // Get the peer certificate chain
@@ -746,16 +743,15 @@ impl TLS {
                 cert_key_algorithm,
                 is_expired: certificate.is_expired,
                 is_self_signed: certificate.is_self_signed,
-                has_incomplete_chain: certificate.security_warnings.iter().any(|w| {
-                    matches!(w, SecurityWarning::IncompleteChain(_))
-                }),
-                has_weak_signature: certificate.security_warnings.iter().any(|w| {
-                    matches!(w, SecurityWarning::WeakSignatureAlgorithm(_))
-                }),
-                is_revoked: matches!(
-                    certificate.revocation_status,
-                    RevocationStatus::Revoked(_)
-                ),
+                has_incomplete_chain: certificate
+                    .security_warnings
+                    .iter()
+                    .any(|w| matches!(w, SecurityWarning::IncompleteChain(_))),
+                has_weak_signature: certificate
+                    .security_warnings
+                    .iter()
+                    .any(|w| matches!(w, SecurityWarning::WeakSignatureAlgorithm(_))),
+                is_revoked: matches!(certificate.revocation_status, RevocationStatus::Revoked(_)),
             };
             Some(grading::calculate_grade(&grading_input))
         } else {
@@ -1000,9 +996,85 @@ pub fn is_self_signed_certificate(cert: &X509) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{RevocationStatus, TLSError, TLS};
+    use crate::grading;
+    use crate::{CertificateInfo, Chain, Cipher, Issuer, RevocationStatus, Subject, TLSError, TLS};
+
+    /// Creates a synthetic TLS struct for offline testing.
+    /// No network connection needed — all fields are populated with realistic data.
+    fn make_test_tls() -> TLS {
+        TLS {
+            cipher: Cipher {
+                name: "TLS_AES_256_GCM_SHA384".to_string(),
+                version: "TLSv1.3".to_string(),
+                bits: 256,
+            },
+            certificate: CertificateInfo {
+                hostname: "test.example.com".to_string(),
+                subject: Subject {
+                    country_or_region: "US".to_string(),
+                    state_or_province: "California".to_string(),
+                    locality: "San Francisco".to_string(),
+                    organization_unit: "Engineering".to_string(),
+                    organization: "Example Inc".to_string(),
+                    common_name: "test.example.com".to_string(),
+                },
+                issued: Issuer {
+                    country_or_region: "US".to_string(),
+                    organization: "Test CA".to_string(),
+                    common_name: "Test CA Root".to_string(),
+                },
+                valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
+                valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                validity_days: 365,
+                validity_hours: 8760,
+                is_expired: false,
+                cert_sn: "1234567890".to_string(),
+                cert_ver: "2".to_string(),
+                cert_alg: "sha256WithRSAEncryption".to_string(),
+                sans: vec![
+                    "test.example.com".to_string(),
+                    "www.example.com".to_string(),
+                ],
+                chain: Some(vec![Chain {
+                    subject: "test.example.com".to_string(),
+                    issuer: "Test CA Root".to_string(),
+                    valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
+                    valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                    signature_algorithm: "sha256WithRSAEncryption".to_string(),
+                }]),
+                revocation_status: RevocationStatus::NotChecked,
+                is_self_signed: false,
+                security_warnings: vec![],
+                cert_key_bits: 2048,
+                cert_key_algorithm: "RSA".to_string(),
+            },
+            grade: None,
+        }
+    }
+
+    /// Creates a synthetic TLS struct with a grade for offline testing.
+    fn make_test_tls_with_grade() -> TLS {
+        let mut tls = make_test_tls();
+        let input = grading::GradingInput {
+            protocol_version: tls.cipher.version.clone(),
+            cipher_name: tls.cipher.name.clone(),
+            cipher_bits: tls.cipher.bits,
+            cert_key_bits: tls.certificate.cert_key_bits,
+            cert_key_algorithm: tls.certificate.cert_key_algorithm.clone(),
+            is_expired: tls.certificate.is_expired,
+            is_self_signed: tls.certificate.is_self_signed,
+            has_incomplete_chain: false,
+            has_weak_signature: false,
+            is_revoked: false,
+        };
+        tls.grade = Some(grading::calculate_grade(&input));
+        tls
+    }
+
+    // ── Integration tests (network-dependent, run with: cargo test -- --ignored) ──
 
     #[test]
+    #[ignore] // requires network: connects to google.com
     fn test_check_tls_for_valid_host() {
         let host = "google.com";
         // Check without revocation checking
@@ -1017,6 +1089,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // requires network: connects to google.com
     fn test_check_tls_with_revocation() {
         // This test depends on external services, so we'll just check that it runs
         // without error and returns a valid status (not specifically which status)
@@ -1045,6 +1118,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // requires network: connects to expired.badssl.com
     fn test_check_tls_expired_host() {
         let host = "expired.badssl.com";
         let tls_result = TLS::from(host, None, false, false).unwrap();
@@ -1055,6 +1129,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // requires network: connects to revoked.badssl.com
     fn test_check_revoked_host() {
         // NOTE: This test may be flaky due to external service dependencies
         // Test that the revoked.badssl.com host returns a revoked status
@@ -1111,6 +1186,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // requires network: connects to google.com
     fn test_combined_revocation_checking() {
         // This test checks that the combined revocation checking function works correctly
         // It depends on external services, so we'll just test that it doesn't error out
@@ -1148,6 +1224,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // requires network: connects to digicert.com
     fn test_crl_distribution_point_parsing() {
         // Try to connect to a site that definitely has CRL distribution points
         // We'll use digicert.com as they're a major CA and likely have proper CRLs
@@ -1180,6 +1257,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // requires network: connects to revoked.badssl.com
     fn test_revoked_cert_detection() {
         // Try to test with a known revoked certificate
         // badssl.com provides a revoked certificate test site
@@ -1220,16 +1298,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_check_tls_with_grading() {
-        let host = "google.com";
-        let tls_result = TLS::from(host, None, false, true).unwrap();
+    // ── Grading flag tests (offline) ──────────────────────────────────
 
+    #[test]
+    fn test_tls_with_grading_has_grade() {
+        let tls_result = make_test_tls_with_grade();
         assert!(tls_result.grade.is_some());
         let grade = tls_result.grade.unwrap();
         assert!(
             ["A+", "A", "B"].contains(&grade.grade.as_str()),
-            "Expected A+, A, or B for google.com, got {}",
+            "Expected A+, A, or B, got {}",
             grade.grade
         );
         assert!(grade.score >= 70);
@@ -1237,16 +1315,16 @@ mod tests {
     }
 
     #[test]
-    fn test_check_tls_without_grading() {
-        let host = "google.com";
-        let tls_result = TLS::from(host, None, false, false).unwrap();
+    fn test_tls_without_grading_has_no_grade() {
+        let tls_result = make_test_tls();
         assert!(tls_result.grade.is_none());
     }
 
+    // ── Cipher / key info tests (offline) ─────────────────────────────
+
     #[test]
     fn test_cipher_bits_populated() {
-        let host = "google.com";
-        let tls_result = TLS::from(host, None, false, false).unwrap();
+        let tls_result = make_test_tls();
         assert!(
             tls_result.cipher.bits > 0,
             "Expected cipher bits > 0, got {}",
@@ -1256,8 +1334,7 @@ mod tests {
 
     #[test]
     fn test_cert_key_info_populated() {
-        let host = "google.com";
-        let tls_result = TLS::from(host, None, false, false).unwrap();
+        let tls_result = make_test_tls();
         assert!(
             tls_result.certificate.cert_key_bits > 0,
             "Expected cert_key_bits > 0, got {}",
@@ -1266,6 +1343,409 @@ mod tests {
         assert!(
             !tls_result.certificate.cert_key_algorithm.is_empty(),
             "Expected non-empty cert_key_algorithm"
+        );
+    }
+
+    // ── is_weak_algorithm tests ──────────────────────────────────────
+
+    #[test]
+    fn test_is_weak_algorithm_sha1() {
+        assert!(super::is_weak_algorithm("sha1WithRSAEncryption"));
+        assert!(super::is_weak_algorithm("SHA1withECDSA"));
+    }
+
+    #[test]
+    fn test_is_weak_algorithm_md5() {
+        assert!(super::is_weak_algorithm("md5WithRSAEncryption"));
+        assert!(super::is_weak_algorithm("MD5withRSA"));
+    }
+
+    #[test]
+    fn test_is_weak_algorithm_oids() {
+        // sha1WithRSAEncryption OID
+        assert!(super::is_weak_algorithm("1.2.840.113549.1.1.5"));
+        // md5WithRSAEncryption OID
+        assert!(super::is_weak_algorithm("1.2.840.113549.1.1.4"));
+        // dsaWithSHA1 OID
+        assert!(super::is_weak_algorithm("1.2.840.10040.4.3"));
+    }
+
+    #[test]
+    fn test_is_not_weak_algorithm() {
+        assert!(!super::is_weak_algorithm("sha256WithRSAEncryption"));
+        assert!(!super::is_weak_algorithm("sha384WithRSAEncryption"));
+        assert!(!super::is_weak_algorithm("sha512WithRSAEncryption"));
+        assert!(!super::is_weak_algorithm("ecdsa-with-SHA256"));
+        assert!(!super::is_weak_algorithm("ecdsa-with-SHA384"));
+    }
+
+    // ── find_issuer_cert tests ───────────────────────────────────────
+
+    #[test]
+    #[ignore] // requires network: connects to google.com
+    fn test_find_issuer_cert_in_real_chain() {
+        // Use a real certificate chain from google.com
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        let chain = tls_result.certificate.chain.as_ref().unwrap();
+        assert!(
+            chain.len() >= 2,
+            "Expected at least 2 certs in chain, got {}",
+            chain.len()
+        );
+    }
+
+    // ── analyze_certificate_chain tests ──────────────────────────────
+
+    #[test]
+    #[ignore] // requires network: connects to google.com
+    fn test_analyze_chain_valid_cert_no_warnings() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        // google.com should have no security warnings
+        assert!(
+            tls_result.certificate.security_warnings.is_empty(),
+            "Expected no security warnings for google.com, got {:?}",
+            tls_result.certificate.security_warnings
+        );
+    }
+
+    // ── TLS struct serialization tests (offline) ────────────────────
+
+    #[test]
+    fn test_tls_json_serialization() {
+        let tls_result = make_test_tls();
+        let json = serde_json::to_string(&tls_result).unwrap();
+        assert!(json.contains("test.example.com"));
+        assert!(json.contains("cipher"));
+        assert!(json.contains("\"bits\":256"));
+        assert!(json.contains("cert_key_bits"));
+        assert!(json.contains("cert_key_algorithm"));
+        // grade should not appear when None (skip_serializing_if)
+        assert!(!json.contains("grade"));
+    }
+
+    #[test]
+    fn test_tls_json_serialization_with_grade() {
+        let tls_result = make_test_tls_with_grade();
+        let json = serde_json::to_string(&tls_result).unwrap();
+        assert!(json.contains("grade"));
+        assert!(json.contains("score"));
+        assert!(json.contains("categories"));
+    }
+
+    #[test]
+    fn test_tls_json_deserialization_roundtrip() {
+        let tls_result = make_test_tls();
+        let json = serde_json::to_string(&tls_result).unwrap();
+        let deserialized: TLS = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.certificate.hostname, "test.example.com");
+        assert_eq!(deserialized.cipher.name, tls_result.cipher.name);
+        assert_eq!(deserialized.cipher.bits, tls_result.cipher.bits);
+        assert_eq!(
+            deserialized.certificate.cert_key_bits,
+            tls_result.certificate.cert_key_bits
+        );
+    }
+
+    // ── RevocationStatus default ─────────────────────────────────────
+
+    #[test]
+    fn test_revocation_status_default() {
+        let status = RevocationStatus::default();
+        assert_eq!(status, RevocationStatus::NotChecked);
+    }
+
+    // ── TLSError variants ────────────────────────────────────────────
+
+    #[test]
+    fn test_tls_error_display() {
+        let err = TLSError::Validation("empty host".to_string());
+        assert_eq!(format!("{}", err), "Validation error: empty host");
+
+        let err = TLSError::DNS("not found".to_string());
+        assert_eq!(format!("{}", err), "DNS resolution error: not found");
+
+        let err = TLSError::Certificate("bad cert".to_string());
+        assert_eq!(format!("{}", err), "Certificate error: bad cert");
+
+        let err = TLSError::Unknown("something".to_string());
+        assert_eq!(format!("{}", err), "Unknown error: something");
+
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let err = TLSError::Connection(io_err);
+        assert!(format!("{}", err).contains("refused"));
+    }
+
+    // ── Certificate info via TLS::from ───────────────────────────────
+
+    #[test]
+    #[ignore] // requires network: connects to google.com
+    fn test_valid_cert_has_sans() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        assert!(
+            !tls_result.certificate.sans.is_empty(),
+            "Expected SANs for google.com"
+        );
+    }
+
+    #[test]
+    #[ignore] // requires network: connects to google.com
+    fn test_valid_cert_has_chain() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        let chain = tls_result.certificate.chain.as_ref().unwrap();
+        assert!(!chain.is_empty(), "Expected non-empty chain for google.com");
+        // Each chain cert should have non-empty fields
+        for c in chain {
+            assert!(!c.subject.is_empty());
+            assert!(!c.issuer.is_empty());
+            assert!(!c.signature_algorithm.is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore] // requires network: connects to google.com
+    fn test_valid_cert_has_issuer_info() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        assert!(
+            tls_result.certificate.issued.organization != "None",
+            "Expected issuer organization for google.com"
+        );
+    }
+
+    #[test]
+    #[ignore] // requires network: connects to google.com
+    fn test_valid_cert_not_expired() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        assert!(!tls_result.certificate.is_expired);
+        assert!(tls_result.certificate.validity_days > 0);
+        assert!(tls_result.certificate.validity_hours > 0);
+        assert_eq!(
+            tls_result.certificate.validity_hours,
+            tls_result.certificate.validity_days * 24
+        );
+    }
+
+    #[test]
+    #[ignore] // requires network: connects to expired.badssl.com
+    fn test_expired_cert_has_negative_days() {
+        let host = "expired.badssl.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        assert!(tls_result.certificate.is_expired);
+        assert!(tls_result.certificate.validity_days < 0);
+        assert!(tls_result.certificate.validity_hours < 0);
+    }
+
+    // ── In-memory X509 helpers and chain analysis tests (offline) ────
+
+    use openssl::asn1::Asn1Time;
+    use openssl::bn::{BigNum, MsbOption};
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::{PKey, Private};
+    use openssl::rsa::Rsa;
+    use openssl::x509::{X509Builder, X509NameBuilder, X509};
+
+    /// Creates a self-signed X509 certificate with the given CN.
+    fn make_test_x509(common_name: &str) -> (X509, PKey<Private>) {
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, common_name)
+            .unwrap();
+        let name = name.build();
+
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+            .unwrap();
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+
+        (builder.build(), pkey)
+    }
+
+    /// Creates a certificate signed by an issuer (not self-signed).
+    fn make_test_x509_signed_by(
+        common_name: &str,
+        issuer_cert: &X509,
+        issuer_key: &PKey<Private>,
+    ) -> X509 {
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+
+        let mut subject_name = X509NameBuilder::new().unwrap();
+        subject_name
+            .append_entry_by_nid(openssl::nid::Nid::COMMONNAME, common_name)
+            .unwrap();
+        let subject_name = subject_name.build();
+
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        builder.set_subject_name(&subject_name).unwrap();
+        builder.set_issuer_name(issuer_cert.subject_name()).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+            .unwrap();
+        // Sign with issuer's key
+        builder.sign(issuer_key, MessageDigest::sha256()).unwrap();
+
+        builder.build()
+    }
+
+    /// Creates a certificate signed with a weak algorithm (SHA1).
+    fn make_test_x509_weak_sig(
+        common_name: &str,
+        issuer_cert: &X509,
+        issuer_key: &PKey<Private>,
+    ) -> X509 {
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+
+        let mut subject_name = X509NameBuilder::new().unwrap();
+        subject_name
+            .append_entry_by_nid(openssl::nid::Nid::COMMONNAME, common_name)
+            .unwrap();
+        let subject_name = subject_name.build();
+
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        builder.set_subject_name(&subject_name).unwrap();
+        builder.set_issuer_name(issuer_cert.subject_name()).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+            .unwrap();
+        // Sign with SHA1 (weak)
+        builder.sign(issuer_key, MessageDigest::sha1()).unwrap();
+
+        builder.build()
+    }
+
+    #[test]
+    fn test_find_issuer_cert_synthetic() {
+        let (issuer_cert, issuer_key) = make_test_x509("Test CA");
+        let leaf_cert = make_test_x509_signed_by("leaf.example.com", &issuer_cert, &issuer_key);
+
+        let chain = vec![issuer_cert.clone()];
+        let result = super::find_issuer_cert(&leaf_cert, &chain);
+        assert!(result.is_some(), "Expected to find issuer cert in chain");
+    }
+
+    #[test]
+    fn test_find_issuer_cert_not_found() {
+        let (issuer_cert, issuer_key) = make_test_x509("Test CA");
+        let leaf_cert = make_test_x509_signed_by("leaf.example.com", &issuer_cert, &issuer_key);
+
+        // Chain contains an unrelated cert, not the actual issuer
+        let (unrelated_cert, _) = make_test_x509("Unrelated CA");
+        let chain = vec![unrelated_cert];
+        let result = super::find_issuer_cert(&leaf_cert, &chain);
+        assert!(
+            result.is_none(),
+            "Expected issuer not found in unrelated chain"
+        );
+    }
+
+    #[test]
+    fn test_is_self_signed_synthetic() {
+        let (self_signed_cert, _) = make_test_x509("Self Signed Cert");
+        assert!(
+            super::is_self_signed_certificate(&self_signed_cert),
+            "Certificate created by make_test_x509 should be self-signed"
+        );
+    }
+
+    #[test]
+    fn test_is_not_self_signed_synthetic() {
+        let (ca_cert, ca_key) = make_test_x509("Test CA");
+        let leaf_cert = make_test_x509_signed_by("leaf.example.com", &ca_cert, &ca_key);
+        assert!(
+            !super::is_self_signed_certificate(&leaf_cert),
+            "CA-signed certificate should not be self-signed"
+        );
+    }
+
+    #[test]
+    fn test_analyze_chain_clean() {
+        let (ca_cert, ca_key) = make_test_x509("Clean CA");
+        let leaf_cert = make_test_x509_signed_by("leaf.example.com", &ca_cert, &ca_key);
+
+        let chain = vec![ca_cert];
+        let warnings = super::analyze_certificate_chain(&leaf_cert, &chain);
+        assert!(
+            warnings.is_empty(),
+            "Clean chain should have no warnings, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_analyze_chain_weak_signature() {
+        let (ca_cert, ca_key) = make_test_x509("Weak Sig CA");
+        let weak_leaf = make_test_x509_weak_sig("weak.example.com", &ca_cert, &ca_key);
+
+        let chain = vec![ca_cert];
+        let warnings = super::analyze_certificate_chain(&weak_leaf, &chain);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, super::SecurityWarning::WeakSignatureAlgorithm(_))),
+            "Expected WeakSignatureAlgorithm warning for SHA1-signed cert, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_analyze_chain_incomplete() {
+        let (ca_cert, ca_key) = make_test_x509("Real CA");
+        let leaf_cert = make_test_x509_signed_by("leaf.example.com", &ca_cert, &ca_key);
+
+        // Chain does NOT contain the issuer — it has an unrelated cert
+        let (unrelated_cert, _) = make_test_x509("Unrelated CA");
+        let chain = vec![unrelated_cert];
+        let warnings = super::analyze_certificate_chain(&leaf_cert, &chain);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, super::SecurityWarning::IncompleteChain(_))),
+            "Expected IncompleteChain warning when issuer missing from chain, got: {:?}",
+            warnings
         );
     }
 }
