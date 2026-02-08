@@ -45,6 +45,8 @@ pub struct Config {
     pub prometheus: Option<PrometheusConfig>,
     /// Enable TLS configuration grading
     pub grade: Option<bool>,
+    /// Minimum number of days a certificate must remain valid (0 = disabled)
+    pub min_validity: Option<i32>,
 }
 
 /// Prometheus integration configuration.
@@ -114,6 +116,7 @@ impl Config {
                 address: Some("http://localhost:9091".to_string()),
             }),
             grade: Some(false),
+            min_validity: Some(0),
         }
     }
 
@@ -166,6 +169,9 @@ impl Config {
         if other.grade.is_some() {
             self.grade = other.grade;
         }
+        if other.min_validity.is_some() {
+            self.min_validity = other.min_validity;
+        }
         self
     }
 
@@ -183,10 +189,13 @@ impl Config {
     /// * `prometheus` - Enable Prometheus metrics
     /// * `prometheus_address` - Prometheus push gateway address
     /// * `check_revocation` - Enable certificate revocation checking
+    /// * `grade` - Enable TLS configuration grading
+    /// * `min_validity` - Minimum days a certificate must remain valid (0 = disabled)
     ///
     /// # Returns
     ///
     /// A `Config` struct with only the specified CLI values set.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_cli_args(
         addresses: Option<Vec<String>>,
         output: Option<String>,
@@ -195,6 +204,7 @@ impl Config {
         prometheus_address: Option<String>,
         check_revocation: Option<bool>,
         grade: Option<bool>,
+        min_validity: Option<i32>,
     ) -> Self {
         Config {
             hosts: addresses,
@@ -206,6 +216,7 @@ impl Config {
                 address: prometheus_address,
             }),
             grade,
+            min_validity,
         }
     }
 
@@ -242,6 +253,7 @@ impl Config {
                 address: Some("http://localhost:9091".to_string()),
             }),
             grade: Some(false),
+            min_validity: Some(30),
         };
 
         toml::to_string_pretty(&example)
@@ -324,6 +336,7 @@ mod tests {
                 address: Some("http://base:9091".to_string()),
             }),
             grade: Some(false),
+            min_validity: Some(0),
         };
 
         let override_config = Config {
@@ -336,6 +349,7 @@ mod tests {
                 address: None,
             }),
             grade: Some(true),
+            min_validity: Some(30),
         };
 
         let merged = base_config.merge_with(override_config);
@@ -379,6 +393,7 @@ mod tests {
             Some("http://cli:9091".to_string()),
             Some(true),
             Some(true),
+            Some(45),
         );
 
         assert_eq!(config.hosts, Some(vec!["cli.com".to_string()]));
@@ -386,6 +401,7 @@ mod tests {
         assert_eq!(config.exit_code, Some(true));
         assert_eq!(config.check_revocation, Some(true));
         assert_eq!(config.grade, Some(true));
+        assert_eq!(config.min_validity, Some(45));
 
         let prometheus = config.prometheus.unwrap();
         assert_eq!(prometheus.enabled, Some(true));
@@ -467,6 +483,7 @@ mod tests {
                 address: Some("http://base:9091".to_string()),
             }),
             grade: Some(true),
+            min_validity: Some(60),
         };
         let empty_override = Config {
             hosts: None,
@@ -475,6 +492,7 @@ mod tests {
             check_revocation: None,
             prometheus: None,
             grade: None,
+            min_validity: None,
         };
         let merged = base.merge_with(empty_override);
         assert_eq!(merged.hosts, Some(vec!["base.com".to_string()]));
@@ -482,6 +500,7 @@ mod tests {
         assert_eq!(merged.exit_code, Some(true));
         assert_eq!(merged.check_revocation, Some(true));
         assert_eq!(merged.grade, Some(true));
+        assert_eq!(merged.min_validity, Some(60));
         assert!(merged.prometheus.is_some());
     }
 
@@ -494,6 +513,7 @@ mod tests {
             check_revocation: None,
             prometheus: None,
             grade: None,
+            min_validity: None,
         };
         let with_prom = Config {
             hosts: None,
@@ -505,6 +525,7 @@ mod tests {
                 address: Some("http://new:9091".to_string()),
             }),
             grade: None,
+            min_validity: None,
         };
         let merged = base.merge_with(with_prom);
         let prom = merged.prometheus.unwrap();
@@ -544,5 +565,62 @@ mod tests {
         let example = Config::example_toml();
         let parsed: Config = toml::from_str(&example).unwrap();
         assert!(parsed.grade.is_some());
+    }
+
+    // ── min_validity config tests ────────────────────────────────────
+
+    #[test]
+    fn test_config_default_min_validity() {
+        let config = Config::default();
+        assert_eq!(config.min_validity, Some(0));
+    }
+
+    #[test]
+    fn test_config_merge_min_validity() {
+        let base = Config::default();
+        let override_config = Config {
+            hosts: None,
+            output: None,
+            exit_code: None,
+            check_revocation: None,
+            prometheus: None,
+            grade: None,
+            min_validity: Some(90),
+        };
+        let merged = base.merge_with(override_config);
+        assert_eq!(merged.min_validity, Some(90));
+    }
+
+    #[test]
+    fn test_config_from_toml_with_min_validity() {
+        let toml_content = r#"
+            hosts = ["example.com"]
+            min_validity = 60
+        "#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(toml_content.as_bytes()).unwrap();
+
+        let config = Config::from_file(temp_file.path()).unwrap();
+        assert_eq!(config.min_validity, Some(60));
+    }
+
+    #[test]
+    fn test_config_from_toml_without_min_validity_defaults_none() {
+        let toml_content = r#"
+            hosts = ["example.com"]
+        "#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(toml_content.as_bytes()).unwrap();
+
+        let config = Config::from_file(temp_file.path()).unwrap();
+        assert_eq!(config.min_validity, None);
+    }
+
+    #[test]
+    fn test_example_toml_contains_min_validity() {
+        let example = Config::example_toml();
+        assert!(example.contains("min_validity"));
+        let parsed: Config = toml::from_str(&example).unwrap();
+        assert_eq!(parsed.min_validity, Some(30));
     }
 }
