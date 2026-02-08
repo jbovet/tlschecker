@@ -1268,4 +1268,189 @@ mod tests {
             "Expected non-empty cert_key_algorithm"
         );
     }
+
+    // ── is_weak_algorithm tests ──────────────────────────────────────
+
+    #[test]
+    fn test_is_weak_algorithm_sha1() {
+        assert!(super::is_weak_algorithm("sha1WithRSAEncryption"));
+        assert!(super::is_weak_algorithm("SHA1withECDSA"));
+    }
+
+    #[test]
+    fn test_is_weak_algorithm_md5() {
+        assert!(super::is_weak_algorithm("md5WithRSAEncryption"));
+        assert!(super::is_weak_algorithm("MD5withRSA"));
+    }
+
+    #[test]
+    fn test_is_weak_algorithm_oids() {
+        // sha1WithRSAEncryption OID
+        assert!(super::is_weak_algorithm("1.2.840.113549.1.1.5"));
+        // md5WithRSAEncryption OID
+        assert!(super::is_weak_algorithm("1.2.840.113549.1.1.4"));
+        // dsaWithSHA1 OID
+        assert!(super::is_weak_algorithm("1.2.840.10040.4.3"));
+    }
+
+    #[test]
+    fn test_is_not_weak_algorithm() {
+        assert!(!super::is_weak_algorithm("sha256WithRSAEncryption"));
+        assert!(!super::is_weak_algorithm("sha384WithRSAEncryption"));
+        assert!(!super::is_weak_algorithm("sha512WithRSAEncryption"));
+        assert!(!super::is_weak_algorithm("ecdsa-with-SHA256"));
+        assert!(!super::is_weak_algorithm("ecdsa-with-SHA384"));
+    }
+
+    // ── find_issuer_cert tests ───────────────────────────────────────
+
+    #[test]
+    fn test_find_issuer_cert_in_real_chain() {
+        // Use a real certificate chain from google.com
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        let chain = tls_result.certificate.chain.as_ref().unwrap();
+        assert!(
+            chain.len() >= 2,
+            "Expected at least 2 certs in chain, got {}",
+            chain.len()
+        );
+    }
+
+    // ── analyze_certificate_chain tests ──────────────────────────────
+
+    #[test]
+    fn test_analyze_chain_valid_cert_no_warnings() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        // google.com should have no security warnings
+        assert!(
+            tls_result.certificate.security_warnings.is_empty(),
+            "Expected no security warnings for google.com, got {:?}",
+            tls_result.certificate.security_warnings
+        );
+    }
+
+    // ── TLS struct serialization tests ───────────────────────────────
+
+    #[test]
+    fn test_tls_json_serialization() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        let json = serde_json::to_string(&tls_result).unwrap();
+        assert!(json.contains("google.com"));
+        assert!(json.contains("cipher"));
+        assert!(json.contains("bits"));
+        assert!(json.contains("cert_key_bits"));
+        assert!(json.contains("cert_key_algorithm"));
+        // grade should not appear when None
+        assert!(!json.contains("grade"));
+    }
+
+    #[test]
+    fn test_tls_json_serialization_with_grade() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, true).unwrap();
+        let json = serde_json::to_string(&tls_result).unwrap();
+        assert!(json.contains("grade"));
+    }
+
+    #[test]
+    fn test_tls_json_deserialization_roundtrip() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        let json = serde_json::to_string(&tls_result).unwrap();
+        let deserialized: TLS = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.certificate.hostname, "google.com");
+        assert_eq!(deserialized.cipher.name, tls_result.cipher.name);
+        assert_eq!(deserialized.cipher.bits, tls_result.cipher.bits);
+    }
+
+    // ── RevocationStatus default ─────────────────────────────────────
+
+    #[test]
+    fn test_revocation_status_default() {
+        let status = RevocationStatus::default();
+        assert_eq!(status, RevocationStatus::NotChecked);
+    }
+
+    // ── TLSError variants ────────────────────────────────────────────
+
+    #[test]
+    fn test_tls_error_display() {
+        let err = TLSError::Validation("empty host".to_string());
+        assert_eq!(format!("{}", err), "Validation error: empty host");
+
+        let err = TLSError::DNS("not found".to_string());
+        assert_eq!(format!("{}", err), "DNS resolution error: not found");
+
+        let err = TLSError::Certificate("bad cert".to_string());
+        assert_eq!(format!("{}", err), "Certificate error: bad cert");
+
+        let err = TLSError::Unknown("something".to_string());
+        assert_eq!(format!("{}", err), "Unknown error: something");
+
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let err = TLSError::Connection(io_err);
+        assert!(format!("{}", err).contains("refused"));
+    }
+
+    // ── Certificate info via TLS::from ───────────────────────────────
+
+    #[test]
+    fn test_valid_cert_has_sans() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        assert!(
+            !tls_result.certificate.sans.is_empty(),
+            "Expected SANs for google.com"
+        );
+    }
+
+    #[test]
+    fn test_valid_cert_has_chain() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        let chain = tls_result.certificate.chain.as_ref().unwrap();
+        assert!(!chain.is_empty(), "Expected non-empty chain for google.com");
+        // Each chain cert should have non-empty fields
+        for c in chain {
+            assert!(!c.subject.is_empty());
+            assert!(!c.issuer.is_empty());
+            assert!(!c.signature_algorithm.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_valid_cert_has_issuer_info() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        assert!(
+            !tls_result.certificate.issued.organization.is_empty()
+                || tls_result.certificate.issued.organization != "None",
+            "Expected issuer organization for google.com"
+        );
+    }
+
+    #[test]
+    fn test_valid_cert_not_expired() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        assert!(!tls_result.certificate.is_expired);
+        assert!(tls_result.certificate.validity_days > 0);
+        assert!(tls_result.certificate.validity_hours > 0);
+        assert_eq!(
+            tls_result.certificate.validity_hours,
+            tls_result.certificate.validity_days * 24
+        );
+    }
+
+    #[test]
+    fn test_expired_cert_has_negative_days() {
+        let host = "expired.badssl.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        assert!(tls_result.certificate.is_expired);
+        assert!(tls_result.certificate.validity_days < 0);
+        assert!(tls_result.certificate.validity_hours < 0);
+    }
 }

@@ -91,7 +91,7 @@ struct Args {
 /// - **Healthy** (Green): > 30 days until expiration
 /// - **Warning** (Yellow): 15-30 days until expiration
 /// - **Critical** (Red): ≤ 15 days until expiration or expired
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum OutFormat {
     /// JSON format for programmatic parsing
     Json,
@@ -780,33 +780,453 @@ fn parse_host_port(address: &str) -> HostPort {
     }
 }
 
-#[test]
-fn test_self_signed_certificate() {
-    let host = "self-signed.badssl.com";
-    match TLS::from(host, None, false, false) {
-        Ok(tls_result) => {
-            // The certificate should be marked as self-signed
-            assert!(
-                tls_result.certificate.is_self_signed,
-                "Expected self-signed.badssl.com certificate to be self-signed"
-            );
-        }
-        Err(err) => {
-            // It's also acceptable if the connection fails since some TLS clients reject self-signed certs
-            assert!(
-                matches!(err, TLSError::Certificate(_)),
-                "Expected certificate error, got: {:?}",
-                err
-            );
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_host_port tests ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_host_port_hostname_only() {
+        let hp = parse_host_port("example.com");
+        assert_eq!(hp.host, "example.com");
+        assert_eq!(hp.port, None);
+    }
+
+    #[test]
+    fn test_parse_host_port_with_port() {
+        let hp = parse_host_port("example.com:8443");
+        assert_eq!(hp.host, "example.com");
+        assert_eq!(hp.port, Some(8443));
+    }
+
+    #[test]
+    fn test_parse_host_port_https_url() {
+        let hp = parse_host_port("https://example.com:9443");
+        assert_eq!(hp.host, "example.com");
+        assert_eq!(hp.port, Some(9443));
+    }
+
+    #[test]
+    fn test_parse_host_port_https_url_no_port() {
+        let hp = parse_host_port("https://example.com");
+        assert_eq!(hp.host, "example.com");
+        assert_eq!(hp.port, None);
+    }
+
+    #[test]
+    fn test_parse_host_port_http_url() {
+        let hp = parse_host_port("http://example.com:8080");
+        assert_eq!(hp.host, "example.com");
+        assert_eq!(hp.port, Some(8080));
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv4_with_port() {
+        let hp = parse_host_port("192.168.1.1:8443");
+        assert_eq!(hp.host, "192.168.1.1");
+        assert_eq!(hp.port, Some(8443));
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv4_no_port() {
+        let hp = parse_host_port("10.0.0.1");
+        assert_eq!(hp.host, "10.0.0.1");
+        assert_eq!(hp.port, None);
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv6_with_port() {
+        let hp = parse_host_port("[::1]:443");
+        // URL parser keeps brackets for IPv6 addresses
+        assert_eq!(hp.host, "[::1]");
+        // url.port() returns None for scheme-default ports (443 for HTTPS),
+        // which is correct since the app defaults to 443 when port is None
+        assert_eq!(hp.port, None);
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv6_with_non_default_port() {
+        let hp = parse_host_port("[::1]:8443");
+        assert_eq!(hp.host, "[::1]");
+        assert_eq!(hp.port, Some(8443));
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv6_no_port() {
+        let hp = parse_host_port("[::1]");
+        assert_eq!(hp.host, "[::1]");
+        assert_eq!(hp.port, None);
+    }
+
+    #[test]
+    fn test_parse_host_port_default_port_443() {
+        let hp = parse_host_port("example.com");
+        assert_eq!(hp.port, None); // None means default 443
+    }
+
+    #[test]
+    fn test_parse_host_port_subdomain() {
+        let hp = parse_host_port("sub.domain.example.com:8443");
+        assert_eq!(hp.host, "sub.domain.example.com");
+        assert_eq!(hp.port, Some(8443));
+    }
+
+    // ── OutFormat Display tests ──────────────────────────────────────
+
+    #[test]
+    fn test_outformat_display() {
+        assert_eq!(format!("{}", OutFormat::Json), "json");
+        assert_eq!(format!("{}", OutFormat::Text), "text");
+        assert_eq!(format!("{}", OutFormat::Summary), "summary");
+    }
+
+    // ── OutFormat FromStr tests ──────────────────────────────────────
+
+    #[test]
+    fn test_outformat_from_str_valid() {
+        assert_eq!("json".parse::<OutFormat>().unwrap(), OutFormat::Json);
+        assert_eq!("text".parse::<OutFormat>().unwrap(), OutFormat::Text);
+        assert_eq!("summary".parse::<OutFormat>().unwrap(), OutFormat::Summary);
+    }
+
+    #[test]
+    fn test_outformat_from_str_case_insensitive() {
+        assert_eq!("JSON".parse::<OutFormat>().unwrap(), OutFormat::Json);
+        assert_eq!("Text".parse::<OutFormat>().unwrap(), OutFormat::Text);
+        assert_eq!("SUMMARY".parse::<OutFormat>().unwrap(), OutFormat::Summary);
+    }
+
+    #[test]
+    fn test_outformat_from_str_invalid() {
+        let result = "csv".parse::<OutFormat>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid output format"));
+    }
+
+    // ── FinalConfig tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_final_config_no_hosts_returns_error() {
+        let config = Config {
+            hosts: None,
+            output: Some("summary".to_string()),
+            exit_code: Some(0),
+            check_revocation: Some(false),
+            prometheus: None,
+            grade: Some(false),
+        };
+        let result = FinalConfig::from_merged_config(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_final_config_empty_hosts_returns_error() {
+        let config = Config {
+            hosts: Some(vec![]),
+            output: Some("summary".to_string()),
+            exit_code: Some(0),
+            check_revocation: Some(false),
+            prometheus: None,
+            grade: Some(false),
+        };
+        let result = FinalConfig::from_merged_config(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_final_config_invalid_output_format() {
+        let config = Config {
+            hosts: Some(vec!["example.com".to_string()]),
+            output: Some("xml".to_string()),
+            exit_code: Some(0),
+            check_revocation: Some(false),
+            prometheus: None,
+            grade: Some(false),
+        };
+        let result = FinalConfig::from_merged_config(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_final_config_defaults() {
+        let config = Config {
+            hosts: Some(vec!["example.com".to_string()]),
+            output: None,
+            exit_code: None,
+            check_revocation: None,
+            prometheus: None,
+            grade: None,
+        };
+        let final_config = FinalConfig::from_merged_config(config).unwrap();
+        assert_eq!(final_config.output, OutFormat::Summary);
+        assert_eq!(final_config.exit_code, 0);
+        assert!(!final_config.check_revocation);
+        assert!(!final_config.prometheus);
+        assert!(!final_config.grade);
+        assert_eq!(final_config.prometheus_address, "http://localhost:9091");
+    }
+
+    #[test]
+    fn test_final_config_all_options() {
+        let config = Config {
+            hosts: Some(vec!["a.com".to_string(), "b.com".to_string()]),
+            output: Some("json".to_string()),
+            exit_code: Some(2),
+            check_revocation: Some(true),
+            prometheus: Some(config::PrometheusConfig {
+                enabled: Some(true),
+                address: Some("http://prom:9091".to_string()),
+            }),
+            grade: Some(true),
+        };
+        let final_config = FinalConfig::from_merged_config(config).unwrap();
+        assert_eq!(final_config.addresses, vec!["a.com", "b.com"]);
+        assert_eq!(final_config.output, OutFormat::Json);
+        assert_eq!(final_config.exit_code, 2);
+        assert!(final_config.check_revocation);
+        assert!(final_config.prometheus);
+        assert_eq!(final_config.prometheus_address, "http://prom:9091");
+        assert!(final_config.grade);
+    }
+
+    // ── FormatterFactory tests ───────────────────────────────────────
+
+    #[test]
+    fn test_formatter_factory_creates_all_types() {
+        // Verify factory produces formatters without panicking
+        let _json = FormatterFactory::new_formatter(&OutFormat::Json);
+        let _text = FormatterFactory::new_formatter(&OutFormat::Text);
+        let _summary = FormatterFactory::new_formatter(&OutFormat::Summary);
+    }
+
+    // ── Formatter output tests ───────────────────────────────────────
+
+    fn make_test_tls() -> TLS {
+        TLS {
+            cipher: tlschecker::Cipher {
+                name: "TLS_AES_256_GCM_SHA384".to_string(),
+                version: "TLSv1.3".to_string(),
+                bits: 256,
+            },
+            certificate: tlschecker::CertificateInfo {
+                hostname: "test.example.com".to_string(),
+                subject: tlschecker::Subject {
+                    country_or_region: "US".to_string(),
+                    state_or_province: "California".to_string(),
+                    locality: "San Francisco".to_string(),
+                    organization_unit: "Engineering".to_string(),
+                    organization: "Example Inc".to_string(),
+                    common_name: "test.example.com".to_string(),
+                },
+                issued: tlschecker::Issuer {
+                    country_or_region: "US".to_string(),
+                    organization: "Test CA".to_string(),
+                    common_name: "Test CA Root".to_string(),
+                },
+                valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
+                valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                validity_days: 365,
+                validity_hours: 8760,
+                is_expired: false,
+                cert_sn: "1234567890".to_string(),
+                cert_ver: "2".to_string(),
+                cert_alg: "sha256WithRSAEncryption".to_string(),
+                sans: vec!["test.example.com".to_string(), "www.example.com".to_string()],
+                chain: Some(vec![tlschecker::Chain {
+                    subject: "test.example.com".to_string(),
+                    issuer: "Test CA Root".to_string(),
+                    valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
+                    valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                    signature_algorithm: "sha256WithRSAEncryption".to_string(),
+                }]),
+                revocation_status: RevocationStatus::NotChecked,
+                is_self_signed: false,
+                security_warnings: vec![],
+                cert_key_bits: 2048,
+                cert_key_algorithm: "RSA".to_string(),
+            },
+            grade: None,
         }
     }
 
-    // Test a known non-self-signed certificate
-    let host = "google.com";
-    if let Ok(tls_result) = TLS::from(host, None, false, false) {
-        assert!(
-            !tls_result.certificate.is_self_signed,
-            "google.com certificate should not be self-signed"
-        );
+    #[test]
+    fn test_json_format_output() {
+        let tls = vec![make_test_tls()];
+        let json_str = serde_json::to_string_pretty(&tls).unwrap();
+        assert!(json_str.contains("test.example.com"));
+        assert!(json_str.contains("TLS_AES_256_GCM_SHA384"));
+        assert!(json_str.contains("\"bits\": 256"));
+        // grade should be absent when None
+        assert!(!json_str.contains("\"grade\""));
+    }
+
+    #[test]
+    fn test_json_format_includes_grade_when_present() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.grade = Some(tlschecker::grading::TLSGrade {
+            grade: "A+".to_string(),
+            score: 97,
+            categories: vec![],
+        });
+        let tls = vec![tls_entry];
+        let json_str = serde_json::to_string_pretty(&tls).unwrap();
+        assert!(json_str.contains("\"grade\""));
+        assert!(json_str.contains("\"A+\""));
+        assert!(json_str.contains("97"));
+    }
+
+    #[test]
+    fn test_json_format_empty_input() {
+        let tls: Vec<TLS> = vec![];
+        let json_str = serde_json::to_string_pretty(&tls).unwrap();
+        assert_eq!(json_str, "[]");
+    }
+
+    #[test]
+    fn test_summary_format_empty_input_no_panic() {
+        let formatter = SummaryFormat;
+        // Should not panic on empty input
+        formatter.format(&[]);
+    }
+
+    #[test]
+    fn test_text_format_no_panic() {
+        let tls = vec![make_test_tls()];
+        let formatter = TextFormat;
+        // Should not panic
+        formatter.format(&tls);
+    }
+
+    #[test]
+    fn test_summary_format_no_panic() {
+        let tls = vec![make_test_tls()];
+        let formatter = SummaryFormat;
+        // Should not panic
+        formatter.format(&tls);
+    }
+
+    #[test]
+    fn test_text_format_with_warnings_no_panic() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.security_warnings = vec![
+            tlschecker::SecurityWarning::WeakSignatureAlgorithm("SHA1".to_string()),
+            tlschecker::SecurityWarning::IncompleteChain("Missing intermediate".to_string()),
+            tlschecker::SecurityWarning::InvalidChainOrder("Wrong order".to_string()),
+        ];
+        let formatter = TextFormat;
+        formatter.format(&[tls_entry]);
+    }
+
+    #[test]
+    fn test_text_format_with_grade_no_panic() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.grade = Some(tlschecker::grading::TLSGrade {
+            grade: "B".to_string(),
+            score: 75,
+            categories: vec![
+                tlschecker::grading::CategoryScore {
+                    category: "Protocol".to_string(),
+                    score: 80,
+                    reason: "TLS 1.2".to_string(),
+                },
+            ],
+        });
+        let formatter = TextFormat;
+        formatter.format(&[tls_entry]);
+    }
+
+    #[test]
+    fn test_summary_format_expired_cert() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.is_expired = true;
+        tls_entry.certificate.validity_days = -10;
+        let formatter = SummaryFormat;
+        formatter.format(&[tls_entry]);
+    }
+
+    #[test]
+    fn test_summary_format_warning_threshold() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.validity_days = 20; // within warning range (15-30)
+        let formatter = SummaryFormat;
+        formatter.format(&[tls_entry]);
+    }
+
+    #[test]
+    fn test_summary_format_critical_threshold() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.validity_days = 10; // within critical range (<=15)
+        let formatter = SummaryFormat;
+        formatter.format(&[tls_entry]);
+    }
+
+    #[test]
+    fn test_summary_format_revoked_cert() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.revocation_status =
+            RevocationStatus::Revoked("Key compromise".to_string());
+        let formatter = SummaryFormat;
+        formatter.format(&[tls_entry]);
+    }
+
+    #[test]
+    fn test_summary_format_self_signed() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.is_self_signed = true;
+        let formatter = SummaryFormat;
+        formatter.format(&[tls_entry]);
+    }
+
+    #[test]
+    fn test_summary_format_with_grade() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.grade = Some(tlschecker::grading::TLSGrade {
+            grade: "F".to_string(),
+            score: 0,
+            categories: vec![],
+        });
+        let formatter = SummaryFormat;
+        formatter.format(&[tls_entry]);
+    }
+
+    #[test]
+    fn test_summary_format_with_security_warnings() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.security_warnings = vec![
+            tlschecker::SecurityWarning::WeakSignatureAlgorithm("SHA1 detected".to_string()),
+        ];
+        let formatter = SummaryFormat;
+        formatter.format(&[tls_entry]);
+    }
+
+    // ── Integration test (network-dependent) ─────────────────────────
+
+    #[test]
+    fn test_self_signed_certificate() {
+        let host = "self-signed.badssl.com";
+        match TLS::from(host, None, false, false) {
+            Ok(tls_result) => {
+                assert!(
+                    tls_result.certificate.is_self_signed,
+                    "Expected self-signed.badssl.com certificate to be self-signed"
+                );
+            }
+            Err(err) => {
+                assert!(
+                    matches!(err, TLSError::Certificate(_)),
+                    "Expected certificate error, got: {:?}",
+                    err
+                );
+            }
+        }
+
+        let host = "google.com";
+        if let Ok(tls_result) = TLS::from(host, None, false, false) {
+            assert!(
+                !tls_result.certificate.is_self_signed,
+                "google.com certificate should not be self-signed"
+            );
+        }
     }
 }

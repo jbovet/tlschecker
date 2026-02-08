@@ -420,4 +420,129 @@ mod tests {
         assert!(parsed.output.is_some());
         assert!(parsed.prometheus.is_some());
     }
+
+    // ── ConfigError Display tests ────────────────────────────────────
+
+    #[test]
+    fn test_config_error_io_display() {
+        let err = ConfigError::Io("file not found".to_string());
+        assert_eq!(format!("{}", err), "IO Error: file not found");
+    }
+
+    #[test]
+    fn test_config_error_parse_display() {
+        let err = ConfigError::Parse("invalid syntax".to_string());
+        assert_eq!(format!("{}", err), "Parse Error: invalid syntax");
+    }
+
+    #[test]
+    fn test_config_error_validation_display() {
+        let err = ConfigError::Validation("no hosts".to_string());
+        assert_eq!(format!("{}", err), "Validation Error: no hosts");
+    }
+
+    // ── Config file not found ────────────────────────────────────────
+
+    #[test]
+    fn test_config_from_nonexistent_file() {
+        let result = Config::from_file("/nonexistent/path/to/config.toml");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConfigError::Io(_) => {} // Expected
+            other => panic!("Expected Io error, got {:?}", other),
+        }
+    }
+
+    // ── Config merge edge cases ──────────────────────────────────────
+
+    #[test]
+    fn test_config_merge_none_does_not_override() {
+        let base = Config {
+            hosts: Some(vec!["base.com".to_string()]),
+            output: Some("json".to_string()),
+            exit_code: Some(1),
+            check_revocation: Some(true),
+            prometheus: Some(PrometheusConfig {
+                enabled: Some(true),
+                address: Some("http://base:9091".to_string()),
+            }),
+            grade: Some(true),
+        };
+        let empty_override = Config {
+            hosts: None,
+            output: None,
+            exit_code: None,
+            check_revocation: None,
+            prometheus: None,
+            grade: None,
+        };
+        let merged = base.merge_with(empty_override);
+        assert_eq!(merged.hosts, Some(vec!["base.com".to_string()]));
+        assert_eq!(merged.output, Some("json".to_string()));
+        assert_eq!(merged.exit_code, Some(1));
+        assert_eq!(merged.check_revocation, Some(true));
+        assert_eq!(merged.grade, Some(true));
+        assert!(merged.prometheus.is_some());
+    }
+
+    #[test]
+    fn test_config_merge_prometheus_into_none() {
+        let base = Config {
+            hosts: None,
+            output: None,
+            exit_code: None,
+            check_revocation: None,
+            prometheus: None,
+            grade: None,
+        };
+        let with_prom = Config {
+            hosts: None,
+            output: None,
+            exit_code: None,
+            check_revocation: None,
+            prometheus: Some(PrometheusConfig {
+                enabled: Some(true),
+                address: Some("http://new:9091".to_string()),
+            }),
+            grade: None,
+        };
+        let merged = base.merge_with(with_prom);
+        let prom = merged.prometheus.unwrap();
+        assert_eq!(prom.enabled, Some(true));
+        assert_eq!(prom.address, Some("http://new:9091".to_string()));
+    }
+
+    // ── TOML with grade field ────────────────────────────────────────
+
+    #[test]
+    fn test_config_from_toml_with_grade() {
+        let toml_content = r#"
+            hosts = ["example.com"]
+            grade = true
+        "#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(toml_content.as_bytes()).unwrap();
+
+        let config = Config::from_file(temp_file.path()).unwrap();
+        assert_eq!(config.grade, Some(true));
+    }
+
+    #[test]
+    fn test_config_from_toml_without_grade_defaults_none() {
+        let toml_content = r#"
+            hosts = ["example.com"]
+        "#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(toml_content.as_bytes()).unwrap();
+
+        let config = Config::from_file(temp_file.path()).unwrap();
+        assert_eq!(config.grade, None);
+    }
+
+    #[test]
+    fn test_example_toml_contains_grade() {
+        let example = Config::example_toml();
+        let parsed: Config = toml::from_str(&example).unwrap();
+        assert!(parsed.grade.is_some());
+    }
 }
