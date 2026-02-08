@@ -88,7 +88,7 @@ fn score_key_exchange(cipher_name: &str) -> (u8, String) {
     } else if cipher_name.contains("RSA") {
         (30, "RSA key exchange - No forward secrecy".into())
     } else {
-        (40, format!("Unknown key exchange in: {}", cipher_name))
+        (20, format!("Unknown key exchange in: {}", cipher_name))
     }
 }
 
@@ -225,12 +225,7 @@ pub fn calculate_grade(input: &GradingInput) -> TLSGrade {
     if input.is_expired || input.is_revoked {
         composite = 0;
     }
-    if input.protocol_version.contains("SSLv3")
-        || (input.protocol_version.contains("TLSv1")
-            && !input.protocol_version.contains("TLSv1.1")
-            && !input.protocol_version.contains("TLSv1.2")
-            && !input.protocol_version.contains("TLSv1.3"))
-    {
+    if protocol_score <= 20 {
         composite = composite.min(35);
     }
     if input.is_self_signed {
@@ -458,6 +453,6 @@ mod tests {
         assert_eq!(score_key_exchange("ECDHE-RSA-AES256-GCM-SHA384").0, 100);
         assert_eq!(score_key_exchange("TLS_AES_256_GCM_SHA384").0, 100);
         assert_eq!(score_key_exchange("DHE-RSA-AES256-GCM-SHA384").0, 80);
-        assert_eq!(score_key_exchange("AES256-GCM-SHA384").0, 40); // unknown
+        assert_eq!(score_key_exchange("AES256-GCM-SHA384").0, 20); // unknown
     }
 }
