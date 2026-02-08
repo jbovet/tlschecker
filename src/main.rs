@@ -24,38 +24,51 @@ use tracing::error;
 #[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
-    /// A space-delimited hosts list to be checked
+    /// Hosts to check, e.g. example.com example.com:8443
     #[clap(value_parser)]
     addresses: Vec<String>,
 
-    /// Configuration file path (TOML format)
+    /// Path to a TOML configuration file
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Generate example configuration file
+    /// Print an example configuration file to stdout and exit
     #[arg(long)]
     generate_config: bool,
 
-    /// Enable verbose to see what is going on
+    /// Output format for certificate results
     #[arg(short, value_enum)]
     output: Option<OutFormat>,
 
-    /// Exits with code 0 even when certificate expired is detected
+    /// Exit with this code when expired or revoked certificates are found.
+    ///
+    /// Defaults to 0 (always succeed). Set to 1 for CI/CD pipelines
+    /// that should fail on certificate issues.
     #[arg(long)]
     exit_code: Option<i32>,
 
-    /// Enable prometheus push gateway metrics
+    /// Push certificate metrics to a Prometheus Push Gateway
     #[arg(long)]
     prometheus: Option<bool>,
 
-    /// Prometheus push gateway address
-    /// Default is http://localhost:9091
+    /// Prometheus Push Gateway URL [default: http://localhost:9091]
     #[arg(long)]
     prometheus_address: Option<String>,
 
-    /// Enable certificate revocation checking
+    /// Check certificate revocation status via OCSP and CRL.
+    ///
+    /// Queries OCSP responders first, then falls back to CRL
+    /// distribution points. Adds latency due to network requests.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     check_revocation: Option<bool>,
+
+    /// Enable TLS configuration grading (A+ to F).
+    ///
+    /// Evaluates protocol version, cipher strength, key exchange,
+    /// certificate key size, and trust chain to produce a composite
+    /// letter grade for each host.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    grade: Option<bool>,
 }
 
 /// Output format for certificate information.
@@ -144,12 +157,8 @@ struct SummaryFormat;
 
 impl Formatter for TextFormat {
     fn format(&self, tls: &[TLS]) {
-        let certificates = tls
-            .iter()
-            .map(|c| c.certificate.clone())
-            .collect::<Vec<_>>();
-
-        for cert in certificates {
+        for rs in tls {
+            let cert = &rs.certificate;
             println!("--------------------------------------");
             println!("Hostname: {}", cert.hostname);
             println!("Issued domain: {}", cert.subject.common_name);
@@ -173,11 +182,14 @@ impl Formatter for TextFormat {
             println!("Certificate version: {}", cert.cert_ver);
             println!("Certificate algorithm: {}", cert.cert_alg);
             println!("Certificate S/N: {}", cert.cert_sn);
+            println!("Certificate key: {} {}-bit", cert.cert_key_algorithm, cert.cert_key_bits);
+            println!("Cipher suite: {} ({}-bit)", rs.cipher.name, rs.cipher.bits);
+            println!("Protocol: {}", rs.cipher.version);
 
             // Add revocation status information
             println!(
                 "Revocation Status: {}",
-                match cert.revocation_status {
+                match &cert.revocation_status {
                     RevocationStatus::Good => "Good (Not Revoked)".to_string(),
                     RevocationStatus::Revoked(reason) => format!("Revoked ({})", reason),
                     RevocationStatus::Unknown => "Unknown (Could not determine)".to_string(),
@@ -200,6 +212,15 @@ impl Formatter for TextFormat {
                             println!("  ⚠️  INVALID CHAIN ORDER: {}", msg);
                         }
                     }
+                }
+            }
+
+            // Display TLS grade if available
+            if let Some(ref grade) = rs.grade {
+                println!("\nTLS Configuration Grade: {} (Score: {}/100)", grade.grade, grade.score);
+                println!("  Category Breakdown:");
+                for cat in &grade.categories {
+                    println!("    {}: {}/100 - {}", cat.category, cat.score, cat.reason);
                 }
             }
 
@@ -249,6 +270,7 @@ impl Formatter for SummaryFormat {
                 "Days before expired",
                 "Hours before expired",
                 "Status",
+                "Grade",
             ]);
 
         for rs in tls {
@@ -309,6 +331,24 @@ impl Formatter for SummaryFormat {
                     .set_alignment(CellAlignment::Center),
             };
 
+            let grade_cell = match &rs.grade {
+                Some(grade) => {
+                    let color = match grade.grade.as_str() {
+                        "A+" | "A" => Color::Green,
+                        "B" => Color::Yellow,
+                        "C" | "D" | "F" => Color::Red,
+                        _ => Color::White,
+                    };
+                    Cell::new(&grade.grade)
+                        .add_attribute(Attribute::Bold)
+                        .fg(color)
+                        .set_alignment(CellAlignment::Center)
+                }
+                None => Cell::new("-")
+                    .fg(Color::DarkGrey)
+                    .set_alignment(CellAlignment::Center),
+            };
+
             table.add_row(vec![
                 Cell::new(&rs.certificate.hostname)
                     .add_attribute(Attribute::Bold)
@@ -328,6 +368,7 @@ impl Formatter for SummaryFormat {
                 Cell::new(rs.certificate.validity_days).set_alignment(CellAlignment::Center),
                 Cell::new(rs.certificate.validity_hours).set_alignment(CellAlignment::Center),
                 custom_cell,
+                grade_cell,
             ]);
         }
         println!("{table}");
@@ -418,6 +459,7 @@ struct FinalConfig {
     prometheus: bool,
     prometheus_address: String,
     check_revocation: bool,
+    grade: bool,
 }
 
 impl FinalConfig {
@@ -453,6 +495,7 @@ impl FinalConfig {
                 .address
                 .unwrap_or_else(|| "http://localhost:9091".to_string()),
             check_revocation: config.check_revocation.unwrap_or(false),
+            grade: config.grade.unwrap_or(false),
         })
     }
 }
@@ -498,15 +541,17 @@ fn main() -> Result<()> {
     let (sender, receiver) = sync_channel(size);
     let hosts_len = hosts_and_ports.len();
     let check_revocation = final_config.check_revocation;
+    let calculate_grade = final_config.grade;
 
     thread::spawn(move || {
         for host_port in hosts_and_ports {
             let thread_tx = sender.clone();
             let check_revocation = check_revocation;
+            let calculate_grade = calculate_grade;
             let handle = thread::spawn(move || {
                 let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
 
-                match TLS::from(&host_port.host, host_port.port, check_revocation) {
+                match TLS::from(&host_port.host, host_port.port, check_revocation, calculate_grade) {
                     Ok(cert) => {
                         thread_tx.send(cert).unwrap();
                     }
@@ -642,6 +687,7 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
         cli.prometheus,
         cli.prometheus_address.clone(),
         cli.check_revocation,
+        cli.grade,
     );
 
     config = config.merge_with(cli_config);
@@ -737,7 +783,7 @@ fn parse_host_port(address: &str) -> HostPort {
 #[test]
 fn test_self_signed_certificate() {
     let host = "self-signed.badssl.com";
-    match TLS::from(host, None, false) {
+    match TLS::from(host, None, false, false) {
         Ok(tls_result) => {
             // The certificate should be marked as self-signed
             assert!(
@@ -757,7 +803,7 @@ fn test_self_signed_certificate() {
 
     // Test a known non-self-signed certificate
     let host = "google.com";
-    if let Ok(tls_result) = TLS::from(host, None, false) {
+    if let Ok(tls_result) = TLS::from(host, None, false, false) {
         assert!(
             !tls_result.certificate.is_self_signed,
             "google.com certificate should not be self-signed"

@@ -14,13 +14,18 @@
 //! use tlschecker::TLS;
 //!
 //! // Check a certificate without revocation checking
-//! let result = TLS::from("example.com", None, false)?;
+//! let result = TLS::from("example.com", None, false, false)?;
 //! println!("Certificate expires in {} days", result.certificate.validity_days);
 //!
-//! // Check with revocation checking enabled
-//! let result = TLS::from("example.com", Some(443), true)?;
+//! // Check with revocation checking and grading enabled
+//! let result = TLS::from("example.com", Some(443), true, true)?;
+//! if let Some(grade) = &result.grade {
+//!     println!("TLS Grade: {} (Score: {}/100)", grade.grade, grade.score);
+//! }
 //! # Ok::<(), tlschecker::TLSError>(())
 //! ```
+
+pub mod grading;
 
 use std::fmt::Debug;
 use std::ops::Deref;
@@ -97,6 +102,9 @@ pub struct TLS {
     pub cipher: Cipher,
     /// Detailed certificate information
     pub certificate: CertificateInfo,
+    /// TLS configuration grade (populated when --grade is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grade: Option<grading::TLSGrade>,
 }
 
 /// TLS cipher suite information.
@@ -109,6 +117,8 @@ pub struct Cipher {
     pub name: String,
     /// TLS protocol version (e.g., "TLSv1.3", "TLSv1.2")
     pub version: String,
+    /// Cipher suite key length in bits
+    pub bits: i32,
 }
 
 /// Comprehensive X.509 certificate information.
@@ -150,6 +160,10 @@ pub struct CertificateInfo {
     pub is_self_signed: bool,
     /// Security warnings identified during analysis
     pub security_warnings: Vec<SecurityWarning>,
+    /// Public key size in bits
+    pub cert_key_bits: u32,
+    /// Public key algorithm (e.g., "RSA", "EC")
+    pub cert_key_algorithm: String,
 }
 
 /// Certificate issuer (Certificate Authority) information.
@@ -587,7 +601,12 @@ pub fn check_crl_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus,
 
 impl TLS {
     #[instrument]
-    pub fn from(host: &str, port: Option<u16>, check_revocation: bool) -> Result<TLS, TLSError> {
+    pub fn from(
+        host: &str,
+        port: Option<u16>,
+        check_revocation: bool,
+        calculate_grade: bool,
+    ) -> Result<TLS, TLSError> {
         use openssl::nid::Nid;
         use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
         use std::net::{TcpStream, ToSocketAddrs};
@@ -632,6 +651,10 @@ impl TLS {
                 .current_cipher()
                 .map(|c| c.version().to_string())
                 .unwrap_or_else(|| "Unknown".to_string()),
+            bits: ssl
+                .current_cipher()
+                .map(|c| c.bits().secret)
+                .unwrap_or(0),
         };
 
         // Get the peer certificate chain
@@ -677,6 +700,21 @@ impl TLS {
             peer_cert_chain.iter().map(|cert| cert.to_owned()).collect();
         let security_warnings = analyze_certificate_chain(&x509_ref, &cert_chain);
 
+        // Extract public key information
+        let public_key = x509_ref
+            .public_key()
+            .map_err(|e| TLSError::Certificate(e.to_string()))?;
+        let cert_key_bits = public_key.bits();
+        let cert_key_algorithm = match public_key.id() {
+            openssl::pkey::Id::RSA => "RSA".to_string(),
+            openssl::pkey::Id::EC => "EC".to_string(),
+            openssl::pkey::Id::DSA => "DSA".to_string(),
+            openssl::pkey::Id::DH => "DH".to_string(),
+            openssl::pkey::Id::ED25519 => "ED25519".to_string(),
+            openssl::pkey::Id::ED448 => "ED448".to_string(),
+            _ => "Unknown".to_string(),
+        };
+
         let certificate = CertificateInfo {
             hostname: host.to_string(),
             subject: data.subject,
@@ -694,11 +732,40 @@ impl TLS {
             revocation_status: data.revocation_status,
             is_self_signed: data.is_self_signed,
             security_warnings,
+            cert_key_bits,
+            cert_key_algorithm: cert_key_algorithm.clone(),
+        };
+
+        // Calculate TLS grade if requested
+        let grade = if calculate_grade {
+            let grading_input = grading::GradingInput {
+                protocol_version: cipher.version.clone(),
+                cipher_name: cipher.name.clone(),
+                cipher_bits: cipher.bits,
+                cert_key_bits: certificate.cert_key_bits,
+                cert_key_algorithm,
+                is_expired: certificate.is_expired,
+                is_self_signed: certificate.is_self_signed,
+                has_incomplete_chain: certificate.security_warnings.iter().any(|w| {
+                    matches!(w, SecurityWarning::IncompleteChain(_))
+                }),
+                has_weak_signature: certificate.security_warnings.iter().any(|w| {
+                    matches!(w, SecurityWarning::WeakSignatureAlgorithm(_))
+                }),
+                is_revoked: matches!(
+                    certificate.revocation_status,
+                    RevocationStatus::Revoked(_)
+                ),
+            };
+            Some(grading::calculate_grade(&grading_input))
+        } else {
+            None
         };
 
         Ok(TLS {
             cipher,
             certificate,
+            grade,
         })
     }
 }
@@ -822,6 +889,8 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         revocation_status: RevocationStatus::NotChecked,
         is_self_signed: is_self_signed_certificate(cert_ref),
         security_warnings: Vec::new(),
+        cert_key_bits: 0,
+        cert_key_algorithm: String::new(),
     }
 }
 
@@ -937,7 +1006,7 @@ mod tests {
     fn test_check_tls_for_valid_host() {
         let host = "google.com";
         // Check without revocation checking
-        let tls_result = TLS::from(host, None, true).unwrap();
+        let tls_result = TLS::from(host, None, true, false).unwrap();
 
         assert!(!tls_result.certificate.is_expired);
         assert_eq!(tls_result.certificate.hostname, host);
@@ -952,7 +1021,7 @@ mod tests {
         // This test depends on external services, so we'll just check that it runs
         // without error and returns a valid status (not specifically which status)
         let host = "google.com";
-        let tls_result = TLS::from(host, None, true).unwrap();
+        let tls_result = TLS::from(host, None, true, false).unwrap();
 
         match tls_result.certificate.revocation_status {
             RevocationStatus::Good | RevocationStatus::Unknown => {
@@ -978,7 +1047,7 @@ mod tests {
     #[test]
     fn test_check_tls_expired_host() {
         let host = "expired.badssl.com";
-        let tls_result = TLS::from(host, None, false).unwrap();
+        let tls_result = TLS::from(host, None, false, false).unwrap();
 
         assert!(tls_result.certificate.is_expired);
         assert!(tls_result.certificate.validity_days < 0);
@@ -992,7 +1061,7 @@ mod tests {
         // If the OCSP responder is unavailable, this might return Unknown instead
         let host = "revoked.badssl.com";
 
-        match TLS::from(host, None, true) {
+        match TLS::from(host, None, true, false) {
             Ok(tls_result) => {
                 // The badssl.com site should either show as revoked or unknown
                 // depending on whether the OCSP responder is working
@@ -1030,14 +1099,14 @@ mod tests {
     #[test]
     fn test_empty_hostname() {
         let host = "";
-        let result = TLS::from(host, None, false).err().unwrap();
+        let result = TLS::from(host, None, false, false).err().unwrap();
         assert!(matches!(result, TLSError::Validation(msg) if msg == "Hostname cannot be empty"));
     }
 
     #[test]
     fn test_whitespace_hostname() {
         let host = "  ";
-        let result = TLS::from(host, None, false).err().unwrap();
+        let result = TLS::from(host, None, false, false).err().unwrap();
         assert!(matches!(result, TLSError::Validation(msg) if msg == "Hostname cannot be empty"));
     }
 
@@ -1048,7 +1117,7 @@ mod tests {
         // rather than checking specific result values
 
         let host = "google.com";
-        match TLS::from(host, None, true) {
+        match TLS::from(host, None, true, false) {
             Ok(tls_result) => {
                 // Just check that we get a valid status type
                 match tls_result.certificate.revocation_status {
@@ -1083,7 +1152,7 @@ mod tests {
         // Try to connect to a site that definitely has CRL distribution points
         // We'll use digicert.com as they're a major CA and likely have proper CRLs
         let host = "digicert.com";
-        match TLS::from(host, None, true) {
+        match TLS::from(host, None, true, false) {
             Ok(tls_result) => {
                 // The test passes if we get any valid status
                 match tls_result.certificate.revocation_status {
@@ -1116,7 +1185,7 @@ mod tests {
         // badssl.com provides a revoked certificate test site
         let host = "revoked.badssl.com";
 
-        match TLS::from(host, None, true) {
+        match TLS::from(host, None, true, false) {
             Ok(tls_result) => {
                 // The certificate should either be detected as revoked or unknown
                 // depending on whether the revocation checking services are available
@@ -1149,5 +1218,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_check_tls_with_grading() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, true).unwrap();
+
+        assert!(tls_result.grade.is_some());
+        let grade = tls_result.grade.unwrap();
+        assert!(
+            ["A+", "A", "B"].contains(&grade.grade.as_str()),
+            "Expected A+, A, or B for google.com, got {}",
+            grade.grade
+        );
+        assert!(grade.score >= 70);
+        assert_eq!(grade.categories.len(), 5);
+    }
+
+    #[test]
+    fn test_check_tls_without_grading() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        assert!(tls_result.grade.is_none());
+    }
+
+    #[test]
+    fn test_cipher_bits_populated() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        assert!(
+            tls_result.cipher.bits > 0,
+            "Expected cipher bits > 0, got {}",
+            tls_result.cipher.bits
+        );
+    }
+
+    #[test]
+    fn test_cert_key_info_populated() {
+        let host = "google.com";
+        let tls_result = TLS::from(host, None, false, false).unwrap();
+        assert!(
+            tls_result.certificate.cert_key_bits > 0,
+            "Expected cert_key_bits > 0, got {}",
+            tls_result.certificate.cert_key_bits
+        );
+        assert!(
+            !tls_result.certificate.cert_key_algorithm.is_empty(),
+            "Expected non-empty cert_key_algorithm"
+        );
     }
 }

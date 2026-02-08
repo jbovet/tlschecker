@@ -50,6 +50,13 @@ lazy_static! {
         "certificate revocation status"
     )
     .unwrap();
+
+    /// Gauge metric tracking TLS configuration grade score (0-100).
+    static ref TLSCHECKER_GRADE_SCORE: Gauge = register_gauge!(
+        "tlschecker_grade_score",
+        "TLS configuration grade score (0-100)"
+    )
+    .unwrap();
 }
 
 /// Pushes TLS certificate metrics to a Prometheus Push Gateway.
@@ -98,6 +105,11 @@ pub fn prometheus_metrics(results: Vec<TLS>, prometheus_address: String) {
         };
         TLSCHECKER_REVOCATION_STATUS.set(revocation_value);
 
+        // Set grade score metric if grading was performed
+        if let Some(ref grade) = tls.grade {
+            TLSCHECKER_GRADE_SCORE.set(f64::from(grade.score));
+        }
+
         let metric_families = prometheus::gather();
         let prometheus_client = prometheus::push_metrics(
             "tlschecker",
@@ -110,6 +122,7 @@ pub fn prometheus_metrics(results: Vec<TLS>, prometheus_address: String) {
                 "issuer".to_owned() => tls.certificate.issued.organization.to_owned(),
                 "expired".to_owned() => tls.certificate.is_expired.to_string(),
                 "revoked".to_owned() => (matches!(tls.certificate.revocation_status, RevocationStatus::Revoked(_))).to_string(),
+                "grade".to_owned() => tls.grade.as_ref().map_or("N/A".to_string(), |g| g.grade.clone()),
             },
             &format!("{}/metrics/job", prometheus_address),
             metric_families,
