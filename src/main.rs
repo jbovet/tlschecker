@@ -129,12 +129,16 @@ impl std::str::FromStr for OutFormat {
 /// Implementations of this trait define how certificate data is presented
 /// to the user in different formats (Text, JSON, Summary).
 trait Formatter {
-    /// Formats and outputs the given TLS certificate data.
+    /// Formats the given TLS certificate data into a displayable string.
     ///
     /// # Arguments
     ///
     /// * `tls` - Slice of TLS structs containing certificate information
-    fn format(&self, tls: &[TLS]);
+    ///
+    /// # Returns
+    ///
+    /// A formatted string ready for display.
+    fn format(&self, tls: &[TLS]) -> String;
 }
 
 /// Text formatter - outputs detailed certificate information.
@@ -156,38 +160,41 @@ struct JsonFormat;
 struct SummaryFormat;
 
 impl Formatter for TextFormat {
-    fn format(&self, tls: &[TLS]) {
+    fn format(&self, tls: &[TLS]) -> String {
+        use std::fmt::Write;
+        let mut output = String::new();
+
         for rs in tls {
             let cert = &rs.certificate;
-            println!("--------------------------------------");
-            println!("Hostname: {}", cert.hostname);
-            println!("Issued domain: {}", cert.subject.common_name);
-            println!("Subject Name :");
-            println!("\tCountry or Region: {}", cert.subject.country_or_region);
-            println!("\tState or Province: {}", cert.subject.state_or_province);
-            println!("\tLocality: {}", cert.subject.locality);
-            println!("\tOrganizational Unit: {}", cert.subject.organization_unit);
-            println!("\tOrganization: {}", cert.subject.organization);
-            println!("\tCommon Name: {}", cert.subject.common_name);
-            println!("Issuer Name:");
-            println!("\tCountry or Region: {}", cert.issued.country_or_region);
-            println!("\tOrganization: {}", cert.issued.organization);
-            println!("\tCommon Name: {}", cert.issued.common_name);
-            println!("Valid from: {}", cert.valid_from);
-            println!("Valid to: {}", cert.valid_to);
-            println!("Days left: {}", cert.validity_days);
-            println!("Hours left: {}", cert.validity_hours);
-            println!("Self-signed: {}", cert.is_self_signed);
-            println!("Expired: {}", cert.is_expired);
-            println!("Certificate version: {}", cert.cert_ver);
-            println!("Certificate algorithm: {}", cert.cert_alg);
-            println!("Certificate S/N: {}", cert.cert_sn);
-            println!("Certificate key: {} {}-bit", cert.cert_key_algorithm, cert.cert_key_bits);
-            println!("Cipher suite: {} ({}-bit)", rs.cipher.name, rs.cipher.bits);
-            println!("Protocol: {}", rs.cipher.version);
+            writeln!(output, "--------------------------------------").unwrap();
+            writeln!(output, "Hostname: {}", cert.hostname).unwrap();
+            writeln!(output, "Issued domain: {}", cert.subject.common_name).unwrap();
+            writeln!(output, "Subject Name :").unwrap();
+            writeln!(output, "\tCountry or Region: {}", cert.subject.country_or_region).unwrap();
+            writeln!(output, "\tState or Province: {}", cert.subject.state_or_province).unwrap();
+            writeln!(output, "\tLocality: {}", cert.subject.locality).unwrap();
+            writeln!(output, "\tOrganizational Unit: {}", cert.subject.organization_unit).unwrap();
+            writeln!(output, "\tOrganization: {}", cert.subject.organization).unwrap();
+            writeln!(output, "\tCommon Name: {}", cert.subject.common_name).unwrap();
+            writeln!(output, "Issuer Name:").unwrap();
+            writeln!(output, "\tCountry or Region: {}", cert.issued.country_or_region).unwrap();
+            writeln!(output, "\tOrganization: {}", cert.issued.organization).unwrap();
+            writeln!(output, "\tCommon Name: {}", cert.issued.common_name).unwrap();
+            writeln!(output, "Valid from: {}", cert.valid_from).unwrap();
+            writeln!(output, "Valid to: {}", cert.valid_to).unwrap();
+            writeln!(output, "Days left: {}", cert.validity_days).unwrap();
+            writeln!(output, "Hours left: {}", cert.validity_hours).unwrap();
+            writeln!(output, "Self-signed: {}", cert.is_self_signed).unwrap();
+            writeln!(output, "Expired: {}", cert.is_expired).unwrap();
+            writeln!(output, "Certificate version: {}", cert.cert_ver).unwrap();
+            writeln!(output, "Certificate algorithm: {}", cert.cert_alg).unwrap();
+            writeln!(output, "Certificate S/N: {}", cert.cert_sn).unwrap();
+            writeln!(output, "Certificate key: {} {}-bit", cert.cert_key_algorithm, cert.cert_key_bits).unwrap();
+            writeln!(output, "Cipher suite: {} ({}-bit)", rs.cipher.name, rs.cipher.bits).unwrap();
+            writeln!(output, "Protocol: {}", rs.cipher.version).unwrap();
 
-            // Add revocation status information
-            println!(
+            writeln!(
+                output,
                 "Revocation Status: {}",
                 match &cert.revocation_status {
                     RevocationStatus::Good => "Good (Not Revoked)".to_string(),
@@ -195,65 +202,68 @@ impl Formatter for TextFormat {
                     RevocationStatus::Unknown => "Unknown (Could not determine)".to_string(),
                     RevocationStatus::NotChecked => "Not Checked".to_string(),
                 }
-            );
+            )
+            .unwrap();
 
-            // Display security warnings if any
             if !cert.security_warnings.is_empty() {
-                println!("\nSecurity Warnings:");
+                writeln!(output, "\nSecurity Warnings:").unwrap();
                 for warning in &cert.security_warnings {
                     match warning {
                         tlschecker::SecurityWarning::WeakSignatureAlgorithm(msg) => {
-                            println!("  ⚠️  WEAK ALGORITHM: {}", msg);
+                            writeln!(output, "  WEAK ALGORITHM: {}", msg).unwrap();
                         }
                         tlschecker::SecurityWarning::IncompleteChain(msg) => {
-                            println!("  ⚠️  INCOMPLETE CHAIN: {}", msg);
+                            writeln!(output, "  INCOMPLETE CHAIN: {}", msg).unwrap();
                         }
                         tlschecker::SecurityWarning::InvalidChainOrder(msg) => {
-                            println!("  ⚠️  INVALID CHAIN ORDER: {}", msg);
+                            writeln!(output, "  INVALID CHAIN ORDER: {}", msg).unwrap();
                         }
                     }
                 }
             }
 
-            // Display TLS grade if available
             if let Some(ref grade) = rs.grade {
-                println!("\nTLS Configuration Grade: {} (Score: {}/100)", grade.grade, grade.score);
-                println!("  Category Breakdown:");
+                writeln!(output, "\nTLS Configuration Grade: {} (Score: {}/100)", grade.grade, grade.score).unwrap();
+                writeln!(output, "  Category Breakdown:").unwrap();
                 for cat in &grade.categories {
-                    println!("    {}: {}/100 - {}", cat.category, cat.score, cat.reason);
+                    writeln!(output, "    {}: {}/100 - {}", cat.category, cat.score, cat.reason).unwrap();
                 }
             }
 
-            println!("Subject Alternative Names:");
+            writeln!(output, "Subject Alternative Names:").unwrap();
             for san in &cert.sans {
-                println!("\tDNS Name: {}", san);
+                writeln!(output, "\tDNS Name: {}", san).unwrap();
             }
 
             match &cert.chain {
                 Some(chains) => {
-                    println!("Additional Certificates (if supplied):");
+                    writeln!(output, "Additional Certificates (if supplied):").unwrap();
                     for (i, c) in chains.iter().enumerate() {
-                        println!("Chain #{:?}", i + 1);
-                        println!("\tSubject: {:?}", c.subject);
-                        println!("\tValid from: {:?}", c.valid_from);
-                        println!("\tValid until: {:?}", c.valid_to);
-                        println!("\tIssuer: {:?}", c.issuer);
-                        println!("\tSignature algorithm: {:?}", c.signature_algorithm);
+                        writeln!(output, "Chain #{:?}", i + 1).unwrap();
+                        writeln!(output, "\tSubject: {:?}", c.subject).unwrap();
+                        writeln!(output, "\tValid from: {:?}", c.valid_from).unwrap();
+                        writeln!(output, "\tValid until: {:?}", c.valid_to).unwrap();
+                        writeln!(output, "\tIssuer: {:?}", c.issuer).unwrap();
+                        writeln!(output, "\tSignature algorithm: {:?}", c.signature_algorithm).unwrap();
                     }
                 }
                 None => todo!(),
             }
         }
+        output
     }
 }
 
 /// Implement Formatter trait for SummaryFormat
 impl Formatter for SummaryFormat {
-    fn format(&self, tls: &[TLS]) {
+    fn format(&self, tls: &[TLS]) -> String {
+        use std::fmt::Write;
+
         if tls.is_empty() {
-            return;
+            return String::new();
         }
 
+        let mut output = String::new();
         let mut table = Table::new();
         table
             .set_content_arrangement(ContentArrangement::Dynamic)
@@ -300,7 +310,6 @@ impl Formatter for SummaryFormat {
                     .set_alignment(CellAlignment::Center),
             };
 
-            // Add revocation status cell
             let revocation_cell = match &rs.certificate.revocation_status {
                 RevocationStatus::Good => Cell::new("Valid")
                     .add_attribute(Attribute::Bold)
@@ -371,7 +380,7 @@ impl Formatter for SummaryFormat {
                 grade_cell,
             ]);
         }
-        println!("{table}");
+        writeln!(output, "{table}").unwrap();
 
         // Display security warnings if any certificates have them
         let certs_with_warnings: Vec<&TLS> = tls
@@ -380,34 +389,32 @@ impl Formatter for SummaryFormat {
             .collect();
 
         if !certs_with_warnings.is_empty() {
-            println!("\n⚠️  Security Warnings:");
+            writeln!(output, "\nSecurity Warnings:").unwrap();
             for rs in certs_with_warnings {
-                println!("\n  Host: {}", rs.certificate.hostname);
+                writeln!(output, "\n  Host: {}", rs.certificate.hostname).unwrap();
                 for warning in &rs.certificate.security_warnings {
                     match warning {
                         tlschecker::SecurityWarning::WeakSignatureAlgorithm(msg) => {
-                            println!("    - WEAK ALGORITHM: {}", msg);
+                            writeln!(output, "    - WEAK ALGORITHM: {}", msg).unwrap();
                         }
                         tlschecker::SecurityWarning::IncompleteChain(msg) => {
-                            println!("    - INCOMPLETE CHAIN: {}", msg);
+                            writeln!(output, "    - INCOMPLETE CHAIN: {}", msg).unwrap();
                         }
                         tlschecker::SecurityWarning::InvalidChainOrder(msg) => {
-                            println!("    - INVALID CHAIN ORDER: {}", msg);
+                            writeln!(output, "    - INVALID CHAIN ORDER: {}", msg).unwrap();
                         }
                     }
                 }
             }
         }
+        output
     }
 }
 
 /// Implement Formatter trait for JsonFormat
 impl Formatter for JsonFormat {
-    fn format(&self, tls: &[TLS]) {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&tls).expect("Failed to format certificates as JSON")
-        );
+    fn format(&self, tls: &[TLS]) -> String {
+        serde_json::to_string_pretty(&tls).expect("Failed to format certificates as JSON")
     }
 }
 /// Factory for creating formatter instances.
@@ -627,7 +634,7 @@ fn main() -> Result<()> {
         OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
         OutFormat::Summary => FormatterFactory::new_formatter(&OutFormat::Summary),
     };
-    formatter.format(&results);
+    print!("{}", formatter.format(&results));
 
     if final_config.prometheus {
         metrics::prom::prometheus_metrics(results, final_config.prometheus_address);
@@ -1053,12 +1060,12 @@ mod tests {
     #[test]
     fn test_json_format_output() {
         let tls = vec![make_test_tls()];
-        let json_str = serde_json::to_string_pretty(&tls).unwrap();
-        assert!(json_str.contains("test.example.com"));
-        assert!(json_str.contains("TLS_AES_256_GCM_SHA384"));
-        assert!(json_str.contains("\"bits\": 256"));
-        // grade should be absent when None
-        assert!(!json_str.contains("\"grade\""));
+        let output = JsonFormat.format(&tls);
+        assert!(output.contains("test.example.com"));
+        assert!(output.contains("TLS_AES_256_GCM_SHA384"));
+        assert!(output.contains("\"bits\": 256"));
+        // grade should be absent when None (skip_serializing_if)
+        assert!(!output.contains("\"grade\""));
     }
 
     #[test]
@@ -1069,57 +1076,73 @@ mod tests {
             score: 97,
             categories: vec![],
         });
-        let tls = vec![tls_entry];
-        let json_str = serde_json::to_string_pretty(&tls).unwrap();
-        assert!(json_str.contains("\"grade\""));
-        assert!(json_str.contains("\"A+\""));
-        assert!(json_str.contains("97"));
+        let output = JsonFormat.format(&[tls_entry]);
+        assert!(output.contains("\"grade\""));
+        assert!(output.contains("\"A+\""));
+        assert!(output.contains("97"));
     }
 
     #[test]
     fn test_json_format_empty_input() {
-        let tls: Vec<TLS> = vec![];
-        let json_str = serde_json::to_string_pretty(&tls).unwrap();
-        assert_eq!(json_str, "[]");
+        let output = JsonFormat.format(&[]);
+        assert_eq!(output, "[]");
     }
 
     #[test]
-    fn test_summary_format_empty_input_no_panic() {
-        let formatter = SummaryFormat;
-        // Should not panic on empty input
-        formatter.format(&[]);
+    fn test_summary_format_empty_input_returns_empty() {
+        let output = SummaryFormat.format(&[]);
+        assert!(output.is_empty());
     }
 
     #[test]
-    fn test_text_format_no_panic() {
+    fn test_text_format_contains_all_fields() {
         let tls = vec![make_test_tls()];
-        let formatter = TextFormat;
-        // Should not panic
-        formatter.format(&tls);
+        let output = TextFormat.format(&tls);
+        assert!(output.contains("Hostname: test.example.com"));
+        assert!(output.contains("Issued domain: test.example.com"));
+        assert!(output.contains("Organization: Example Inc"));
+        assert!(output.contains("Common Name: Test CA Root"));
+        assert!(output.contains("Days left: 365"));
+        assert!(output.contains("Hours left: 8760"));
+        assert!(output.contains("Self-signed: false"));
+        assert!(output.contains("Expired: false"));
+        assert!(output.contains("Certificate algorithm: sha256WithRSAEncryption"));
+        assert!(output.contains("Certificate key: RSA 2048-bit"));
+        assert!(output.contains("Cipher suite: TLS_AES_256_GCM_SHA384 (256-bit)"));
+        assert!(output.contains("Protocol: TLSv1.3"));
+        assert!(output.contains("Revocation Status: Not Checked"));
+        assert!(output.contains("DNS Name: test.example.com"));
+        assert!(output.contains("DNS Name: www.example.com"));
     }
 
     #[test]
-    fn test_summary_format_no_panic() {
+    fn test_summary_format_contains_host_data() {
         let tls = vec![make_test_tls()];
-        let formatter = SummaryFormat;
-        // Should not panic
-        formatter.format(&tls);
+        let output = SummaryFormat.format(&tls);
+        assert!(output.contains("test.example.com"));
+        assert!(output.contains("TLS_AES_256_GCM_SHA384"));
+        assert!(output.contains("TLSv1.3"));
+        assert!(output.contains("Test CA"));
+        assert!(output.contains("Healthy"));
     }
 
     #[test]
-    fn test_text_format_with_warnings_no_panic() {
+    fn test_text_format_with_warnings() {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.security_warnings = vec![
             tlschecker::SecurityWarning::WeakSignatureAlgorithm("SHA1".to_string()),
             tlschecker::SecurityWarning::IncompleteChain("Missing intermediate".to_string()),
             tlschecker::SecurityWarning::InvalidChainOrder("Wrong order".to_string()),
         ];
-        let formatter = TextFormat;
-        formatter.format(&[tls_entry]);
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(output.contains("Security Warnings:"));
+        assert!(output.contains("WEAK ALGORITHM: SHA1"));
+        assert!(output.contains("INCOMPLETE CHAIN: Missing intermediate"));
+        assert!(output.contains("INVALID CHAIN ORDER: Wrong order"));
     }
 
     #[test]
-    fn test_text_format_with_grade_no_panic() {
+    fn test_text_format_with_grade() {
         let mut tls_entry = make_test_tls();
         tls_entry.grade = Some(tlschecker::grading::TLSGrade {
             grade: "B".to_string(),
@@ -1132,8 +1155,10 @@ mod tests {
                 },
             ],
         });
-        let formatter = TextFormat;
-        formatter.format(&[tls_entry]);
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(output.contains("TLS Configuration Grade: B (Score: 75/100)"));
+        assert!(output.contains("Category Breakdown:"));
+        assert!(output.contains("Protocol: 80/100 - TLS 1.2"));
     }
 
     #[test]
@@ -1141,24 +1166,24 @@ mod tests {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.is_expired = true;
         tls_entry.certificate.validity_days = -10;
-        let formatter = SummaryFormat;
-        formatter.format(&[tls_entry]);
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Critical"));
     }
 
     #[test]
     fn test_summary_format_warning_threshold() {
         let mut tls_entry = make_test_tls();
-        tls_entry.certificate.validity_days = 20; // within warning range (15-30)
-        let formatter = SummaryFormat;
-        formatter.format(&[tls_entry]);
+        tls_entry.certificate.validity_days = 20;
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Warning"));
     }
 
     #[test]
     fn test_summary_format_critical_threshold() {
         let mut tls_entry = make_test_tls();
-        tls_entry.certificate.validity_days = 10; // within critical range (<=15)
-        let formatter = SummaryFormat;
-        formatter.format(&[tls_entry]);
+        tls_entry.certificate.validity_days = 10;
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Critical"));
     }
 
     #[test]
@@ -1166,16 +1191,16 @@ mod tests {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.revocation_status =
             RevocationStatus::Revoked("Key compromise".to_string());
-        let formatter = SummaryFormat;
-        formatter.format(&[tls_entry]);
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Revoked"));
     }
 
     #[test]
     fn test_summary_format_self_signed() {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.is_self_signed = true;
-        let formatter = SummaryFormat;
-        formatter.format(&[tls_entry]);
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Yes")); // self-signed = Yes
     }
 
     #[test]
@@ -1186,8 +1211,8 @@ mod tests {
             score: 0,
             categories: vec![],
         });
-        let formatter = SummaryFormat;
-        formatter.format(&[tls_entry]);
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("F"));
     }
 
     #[test]
@@ -1196,13 +1221,15 @@ mod tests {
         tls_entry.certificate.security_warnings = vec![
             tlschecker::SecurityWarning::WeakSignatureAlgorithm("SHA1 detected".to_string()),
         ];
-        let formatter = SummaryFormat;
-        formatter.format(&[tls_entry]);
+        let output = SummaryFormat.format(&[tls_entry]);
+        assert!(output.contains("Security Warnings:"));
+        assert!(output.contains("WEAK ALGORITHM: SHA1 detected"));
     }
 
     // ── Integration test (network-dependent) ─────────────────────────
 
     #[test]
+    #[ignore] // requires network: connects to badssl.com and google.com
     fn test_self_signed_certificate() {
         let host = "self-signed.badssl.com";
         match TLS::from(host, None, false, false) {
