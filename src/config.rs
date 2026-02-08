@@ -15,7 +15,7 @@
 //! ```toml
 //! hosts = ["example.com", "example.com:8443"]
 //! output = "summary"
-//! exit_code = 1
+//! exit_code = true
 //! check_revocation = true
 //!
 //! [prometheus]
@@ -37,8 +37,8 @@ pub struct Config {
     pub hosts: Option<Vec<String>>,
     /// Output format: json, text, summary
     pub output: Option<String>,
-    /// Exit code to use when certificates are expired/revoked
-    pub exit_code: Option<i32>,
+    /// Enable non-zero exit code when certificate issues are found
+    pub exit_code: Option<bool>,
     /// Enable certificate revocation checking
     pub check_revocation: Option<bool>,
     /// Prometheus configuration
@@ -95,7 +95,7 @@ impl Config {
     ///
     /// - `hosts`: None (must be provided)
     /// - `output`: "summary"
-    /// - `exit_code`: 0 (don't fail on expired certificates)
+    /// - `exit_code`: false (don't fail on certificate issues)
     /// - `check_revocation`: false
     /// - `prometheus.enabled`: false
     /// - `prometheus.address`: "http://localhost:9091"
@@ -107,7 +107,7 @@ impl Config {
         Config {
             hosts: None,
             output: Some("summary".to_string()),
-            exit_code: Some(0),
+            exit_code: Some(false),
             check_revocation: Some(false),
             prometheus: Some(PrometheusConfig {
                 enabled: Some(false),
@@ -179,7 +179,7 @@ impl Config {
     ///
     /// * `addresses` - List of hosts to check
     /// * `output` - Output format (json, text, summary)
-    /// * `exit_code` - Exit code for failures
+    /// * `exit_code` - Enable exit code on certificate issues
     /// * `prometheus` - Enable Prometheus metrics
     /// * `prometheus_address` - Prometheus push gateway address
     /// * `check_revocation` - Enable certificate revocation checking
@@ -190,7 +190,7 @@ impl Config {
     pub fn from_cli_args(
         addresses: Option<Vec<String>>,
         output: Option<String>,
-        exit_code: Option<i32>,
+        exit_code: Option<bool>,
         prometheus: Option<bool>,
         prometheus_address: Option<String>,
         check_revocation: Option<bool>,
@@ -235,7 +235,7 @@ impl Config {
                 "expired.badssl.com".to_string(),
             ]),
             output: Some("summary".to_string()),
-            exit_code: Some(1),
+            exit_code: Some(true),
             check_revocation: Some(true),
             prometheus: Some(PrometheusConfig {
                 enabled: Some(true),
@@ -283,7 +283,7 @@ mod tests {
         let toml_content = r#"
             hosts = ["jpbd.dev", "google.cl"]
             output = "json"
-            exit_code = 1
+            exit_code = true
             check_revocation = true
 
             [prometheus]
@@ -301,7 +301,7 @@ mod tests {
             Some(vec!["jpbd.dev".to_string(), "google.cl".to_string()])
         );
         assert_eq!(config.output, Some("json".to_string()));
-        assert_eq!(config.exit_code, Some(1));
+        assert_eq!(config.exit_code, Some(true));
         assert_eq!(config.check_revocation, Some(true));
 
         let prometheus = config.prometheus.unwrap();
@@ -317,7 +317,7 @@ mod tests {
         let base_config = Config {
             hosts: Some(vec!["base.com".to_string()]),
             output: Some("text".to_string()),
-            exit_code: Some(0),
+            exit_code: Some(false),
             check_revocation: Some(false),
             prometheus: Some(PrometheusConfig {
                 enabled: Some(false),
@@ -329,7 +329,7 @@ mod tests {
         let override_config = Config {
             hosts: Some(vec!["override.com".to_string()]),
             output: None,
-            exit_code: Some(1),
+            exit_code: Some(true),
             check_revocation: Some(true),
             prometheus: Some(PrometheusConfig {
                 enabled: Some(true),
@@ -343,7 +343,7 @@ mod tests {
         // Override config should take precedence where specified
         assert_eq!(merged.hosts, Some(vec!["override.com".to_string()]));
         assert_eq!(merged.output, Some("text".to_string())); // From base (not overridden)
-        assert_eq!(merged.exit_code, Some(1)); // Overridden
+        assert_eq!(merged.exit_code, Some(true)); // Overridden
         assert_eq!(merged.check_revocation, Some(true)); // Overridden
 
         let prometheus = merged.prometheus.unwrap();
@@ -358,7 +358,7 @@ mod tests {
 
         assert_eq!(config.hosts, None);
         assert_eq!(config.output, Some("summary".to_string()));
-        assert_eq!(config.exit_code, Some(0));
+        assert_eq!(config.exit_code, Some(false));
         assert_eq!(config.check_revocation, Some(false));
 
         let prometheus = config.prometheus.unwrap();
@@ -374,7 +374,7 @@ mod tests {
         let config = Config::from_cli_args(
             Some(vec!["cli.com".to_string()]),
             Some("json".to_string()),
-            Some(2),
+            Some(true),
             Some(true),
             Some("http://cli:9091".to_string()),
             Some(true),
@@ -383,7 +383,7 @@ mod tests {
 
         assert_eq!(config.hosts, Some(vec!["cli.com".to_string()]));
         assert_eq!(config.output, Some("json".to_string()));
-        assert_eq!(config.exit_code, Some(2));
+        assert_eq!(config.exit_code, Some(true));
         assert_eq!(config.check_revocation, Some(true));
         assert_eq!(config.grade, Some(true));
 
@@ -460,7 +460,7 @@ mod tests {
         let base = Config {
             hosts: Some(vec!["base.com".to_string()]),
             output: Some("json".to_string()),
-            exit_code: Some(1),
+            exit_code: Some(true),
             check_revocation: Some(true),
             prometheus: Some(PrometheusConfig {
                 enabled: Some(true),
@@ -479,7 +479,7 @@ mod tests {
         let merged = base.merge_with(empty_override);
         assert_eq!(merged.hosts, Some(vec!["base.com".to_string()]));
         assert_eq!(merged.output, Some("json".to_string()));
-        assert_eq!(merged.exit_code, Some(1));
+        assert_eq!(merged.exit_code, Some(true));
         assert_eq!(merged.check_revocation, Some(true));
         assert_eq!(merged.grade, Some(true));
         assert!(merged.prometheus.is_some());

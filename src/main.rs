@@ -40,12 +40,13 @@ struct Args {
     #[arg(short, value_enum)]
     output: Option<OutFormat>,
 
-    /// Exit with this code when expired or revoked certificates are found.
+    /// Exit with code 1 when certificate issues are found.
     ///
-    /// Defaults to 0 (always succeed). Set to 1 for CI/CD pipelines
-    /// that should fail on certificate issues.
-    #[arg(long)]
-    exit_code: Option<i32>,
+    /// Issues include: expired certificates, revoked certificates,
+    /// or certificates below the --min-validity threshold.
+    /// Disabled by default (always exits 0).
+    #[arg(long, default_value_t = false)]
+    exit_code: bool,
 
     /// Push certificate metrics to a Prometheus Push Gateway
     #[arg(long)]
@@ -462,7 +463,7 @@ struct HostPort {
 struct FinalConfig {
     addresses: Vec<String>,
     output: OutFormat,
-    exit_code: i32,
+    exit_code: bool,
     prometheus: bool,
     prometheus_address: String,
     check_revocation: bool,
@@ -496,7 +497,7 @@ impl FinalConfig {
         Ok(FinalConfig {
             addresses,
             output,
-            exit_code: config.exit_code.unwrap_or(0),
+            exit_code: config.exit_code.unwrap_or(false),
             prometheus: prometheus_config.enabled.unwrap_or(false),
             prometheus_address: prometheus_config
                 .address
@@ -690,7 +691,7 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
     let cli_config = Config::from_cli_args(
         cli_addresses,
         cli.output.as_ref().map(|o| o.to_string()),
-        cli.exit_code,
+        if cli.exit_code { Some(true) } else { None },
         cli.prometheus,
         cli.prometheus_address.clone(),
         cli.check_revocation,
@@ -703,24 +704,25 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
     FinalConfig::from_merged_config(config)
 }
 
-/// Exits the program with the appropriate exit code.
+/// Exits the program with code 1 when certificate issues are detected.
 ///
 /// This function implements conditional exit behavior based on whether
-/// any certificates failed validation (expired or revoked).
+/// any certificates failed validation (expired, revoked, or below
+/// the minimum validity threshold).
 ///
 /// # Arguments
 ///
-/// * `exit_code` - The exit code to use when failures are detected
+/// * `exit_code` - Whether to enable non-zero exit codes on failure
 /// * `failed_result` - Whether any certificate checks failed
 ///
 /// # Behavior
 ///
-/// - If `failed_result` is `true` and `exit_code` is non-zero, exits with `exit_code`
+/// - If `exit_code` is `true` and `failed_result` is `true`, exits with code 1
 /// - Otherwise, exits normally with code 0
 /// - Useful for CI/CD pipelines where exit code indicates build success/failure
-fn exit(exit_code: i32, failed_result: bool) {
-    if exit_code != 0 && failed_result {
-        std::process::exit(exit_code)
+fn exit(exit_code: bool, failed_result: bool) {
+    if exit_code && failed_result {
+        std::process::exit(1)
     }
 }
 
@@ -918,7 +920,7 @@ mod tests {
         let config = Config {
             hosts: None,
             output: Some("summary".to_string()),
-            exit_code: Some(0),
+            exit_code: Some(false),
             check_revocation: Some(false),
             prometheus: None,
             grade: Some(false),
@@ -932,7 +934,7 @@ mod tests {
         let config = Config {
             hosts: Some(vec![]),
             output: Some("summary".to_string()),
-            exit_code: Some(0),
+            exit_code: Some(false),
             check_revocation: Some(false),
             prometheus: None,
             grade: Some(false),
@@ -946,7 +948,7 @@ mod tests {
         let config = Config {
             hosts: Some(vec!["example.com".to_string()]),
             output: Some("xml".to_string()),
-            exit_code: Some(0),
+            exit_code: Some(false),
             check_revocation: Some(false),
             prometheus: None,
             grade: Some(false),
@@ -967,7 +969,7 @@ mod tests {
         };
         let final_config = FinalConfig::from_merged_config(config).unwrap();
         assert_eq!(final_config.output, OutFormat::Summary);
-        assert_eq!(final_config.exit_code, 0);
+        assert!(!final_config.exit_code);
         assert!(!final_config.check_revocation);
         assert!(!final_config.prometheus);
         assert!(!final_config.grade);
@@ -979,7 +981,7 @@ mod tests {
         let config = Config {
             hosts: Some(vec!["a.com".to_string(), "b.com".to_string()]),
             output: Some("json".to_string()),
-            exit_code: Some(2),
+            exit_code: Some(true),
             check_revocation: Some(true),
             prometheus: Some(config::PrometheusConfig {
                 enabled: Some(true),
@@ -990,7 +992,7 @@ mod tests {
         let final_config = FinalConfig::from_merged_config(config).unwrap();
         assert_eq!(final_config.addresses, vec!["a.com", "b.com"]);
         assert_eq!(final_config.output, OutFormat::Json);
-        assert_eq!(final_config.exit_code, 2);
+        assert!(final_config.exit_code);
         assert!(final_config.check_revocation);
         assert!(final_config.prometheus);
         assert_eq!(final_config.prometheus_address, "http://prom:9091");
