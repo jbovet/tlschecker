@@ -148,6 +148,22 @@ Because this performs many short handshakes (one per version/cipher), it is slow
 
 `--scan` implies `--grade` (the scan is surfaced through the grade, including in the summary table). Scan results feed the analysis: supporting an obsolete/deprecated protocol or accepting a weak cipher produces security warnings (see below) and lowers the grade. This makes the grade reflect the server's *full* posture rather than only the single negotiated connection (e.g. a server that negotiates TLS 1.3 but still allows TLS 1.0 will no longer score an A).
 
+### Certificate Transparency Lookup
+
+Modern browsers reject publicly-trusted certificates that are not logged in [Certificate Transparency](https://certificate.transparency.dev/) logs, and the same logs are what defenders watch for mis-issuance. With `--ct-check`, tlschecker looks the presented leaf up in public CT logs via [crt.sh](https://crt.sh), matched by its SHA-256 fingerprint (an exact, per-certificate lookup):
+
+```sh
+➜ tlschecker --ct-check example.com
+```
+
+This performs a network request to an external service (crt.sh), so it is opt-in and adds latency. The result is **tri-state**, like revocation status:
+
+- **Logged** — the exact certificate was found in CT. The `text`/`json` output include a direct `crt.sh` link; the summary table shows `✓`.
+- **Not logged** — definitively absent from CT. Reported as a security warning (see below) and shown as `✗` in the summary. A publicly-trusted certificate that is not logged will be rejected by modern browsers.
+- **Unknown** — crt.sh was unreachable or rate-limited, so the status could not be determined (`?` in the summary). This is kept distinct from "not logged" so an outage is never mistaken for a problem; the reason is logged to **stderr** (stdout stays clean for `… -o json | jq`).
+
+When `--ct-check` is used, the summary table gains a `CT` column (`✓`/`✗`/`?`); without it the column is hidden. Being absent from CT does **not** affect the grade — many legitimate internal/private certificates are intentionally absent from public CT logs, so what that means is left to you rather than the grade.
+
 ### Security Warnings
 
 In addition to revocation and grading, tlschecker surfaces certificate problems as security warnings in all output formats:
@@ -159,6 +175,7 @@ In addition to revocation and grading, tlschecker surfaces certificate problems 
 - **Expiring intermediate** — an intermediate certificate in the chain has expired or expires within 30 days
 - **Weak protocol** (`--scan`) — the server still supports an obsolete (SSLv3) or deprecated (TLS 1.0/1.1) protocol version
 - **Weak cipher** (`--scan`) — the server accepts a weak cipher suite (RC4, DES/3DES, NULL, EXPORT, anonymous, ...)
+- **Not in CT log** (`--ct-check`) — the presented certificate was not found in any public Certificate Transparency log
 
 A hostname mismatch, support for an obsolete protocol (SSLv3/TLS 1.0), or acceptance of a weak cipher each cap the TLS grade at C, the same as a self-signed certificate.
 

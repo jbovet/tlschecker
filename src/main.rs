@@ -15,7 +15,7 @@ use url::Url;
 use anyhow::Result;
 use config::{Config, ConfigError};
 use tlschecker::TLSError;
-use tracing::error;
+use tracing::{error, warn};
 
 /// Experimental TLS/SSL certificate checker.
 ///
@@ -93,6 +93,17 @@ struct Args {
     /// sent, instead of the normal formatted report.
     #[arg(long)]
     export_pem: bool,
+
+    /// Look the presented leaf certificate up in public Certificate
+    /// Transparency logs (via crt.sh).
+    ///
+    /// Confirms whether the certificate has been logged in CT — a requirement
+    /// modern browsers enforce for publicly-trusted certificates. Performs a
+    /// network request to an external service, so it adds latency and is
+    /// opt-in. Results appear in text and JSON output. A certificate absent
+    /// from CT is reported as a security warning but does not affect the grade.
+    #[arg(long)]
+    ct_check: bool,
 }
 
 /// Output format for certificate information.
@@ -286,6 +297,25 @@ impl Formatter for TextFormat {
                         tlschecker::SecurityWarning::WeakCipher(msg) => {
                             writeln!(output, "  WEAK CIPHER: {}", msg).unwrap();
                         }
+                        tlschecker::SecurityWarning::NotInCertificateTransparency(msg) => {
+                            writeln!(output, "  NOT IN CT LOG: {}", msg).unwrap();
+                        }
+                    }
+                }
+            }
+
+            if let Some(ref ct) = rs.ct {
+                writeln!(output, "\nCertificate Transparency:").unwrap();
+                match ct {
+                    tlschecker::ct::CtStatus::Logged { crtsh_url, .. } => {
+                        writeln!(output, "  Logged: yes").unwrap();
+                        writeln!(output, "  crt.sh: {}", crtsh_url).unwrap();
+                    }
+                    tlschecker::ct::CtStatus::NotLogged => {
+                        writeln!(output, "  Logged: no").unwrap();
+                    }
+                    tlschecker::ct::CtStatus::Unknown => {
+                        writeln!(output, "  Logged: unknown (could not query crt.sh)").unwrap();
                     }
                 }
             }
@@ -360,6 +390,10 @@ impl Formatter for SummaryFormat {
         // least one host; otherwise it would just be a column full of "-".
         let show_grade = tls.iter().any(|t| t.grade.is_some());
 
+        // Likewise, only show the CT column when a CT lookup was requested
+        // (`--ct-check`) for at least one host. `ct.is_some()` ⇔ requested.
+        let show_ct = tls.iter().any(|t| t.ct.is_some());
+
         let mut output = String::new();
         let mut table = Table::new();
         let mut header = vec![
@@ -376,6 +410,9 @@ impl Formatter for SummaryFormat {
         ];
         if show_grade {
             header.push("Grade");
+        }
+        if show_ct {
+            header.push("CT");
         }
         table
             .set_content_arrangement(ContentArrangement::Dynamic)
@@ -482,6 +519,28 @@ impl Formatter for SummaryFormat {
                 row.push(grade_cell);
             }
 
+            if show_ct {
+                let ct_cell = match &rs.ct {
+                    Some(tlschecker::ct::CtStatus::Logged { .. }) => Cell::new("✓")
+                        .add_attribute(Attribute::Bold)
+                        .fg(Color::Green)
+                        .set_alignment(CellAlignment::Center),
+                    Some(tlschecker::ct::CtStatus::NotLogged) => Cell::new("✗")
+                        .add_attribute(Attribute::Bold)
+                        .fg(Color::Red)
+                        .set_alignment(CellAlignment::Center),
+                    Some(tlschecker::ct::CtStatus::Unknown) => Cell::new("?")
+                        .add_attribute(Attribute::Bold)
+                        .fg(Color::Yellow)
+                        .set_alignment(CellAlignment::Center),
+                    // Lookup not requested for this host (mixed-input runs).
+                    None => Cell::new("-")
+                        .fg(Color::DarkGrey)
+                        .set_alignment(CellAlignment::Center),
+                };
+                row.push(ct_cell);
+            }
+
             table.add_row(row);
         }
         writeln!(output, "{table}").unwrap();
@@ -518,6 +577,9 @@ impl Formatter for SummaryFormat {
                         }
                         tlschecker::SecurityWarning::WeakCipher(msg) => {
                             writeln!(output, "    - WEAK CIPHER: {}", msg).unwrap();
+                        }
+                        tlschecker::SecurityWarning::NotInCertificateTransparency(msg) => {
+                            writeln!(output, "    - NOT IN CT LOG: {}", msg).unwrap();
                         }
                     }
                 }
@@ -626,8 +688,12 @@ impl FinalConfig {
 }
 
 fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing. Diagnostics (errors, warnings) go to stderr so stdout
+    // stays a clean machine-readable stream — e.g. `-o json ... | jq` is not
+    // corrupted by log lines.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
 
     let cli = Args::parse();
 
@@ -667,6 +733,7 @@ fn main() -> Result<()> {
     let hosts_len = hosts_and_ports.len();
     let check_revocation = final_config.check_revocation;
     let do_scan = cli.scan;
+    let do_ct = cli.ct_check;
     // `--scan` implies `--grade`: a scan is only surfaced in the summary table
     // via the grade, and the grade is most meaningful when it reflects the full
     // scanned posture, so enable grading whenever scanning.
@@ -678,6 +745,7 @@ fn main() -> Result<()> {
             let check_revocation = check_revocation;
             let calculate_grade = calculate_grade;
             let do_scan = do_scan;
+            let do_ct = do_ct;
             let handle = thread::spawn(move || {
                 let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
 
@@ -696,6 +764,26 @@ fn main() -> Result<()> {
                                 // recompute the grade to reflect full posture.
                                 cert.apply_scan(scan);
                             }
+                        }
+                        if do_ct {
+                            // Look the leaf up in public CT logs (crt.sh, by
+                            // SHA-256 fingerprint). A failed/inconclusive lookup
+                            // is non-fatal: the reason is logged to stderr and the
+                            // result is recorded as `Unknown` rather than dropped,
+                            // so "could not check" is never mistaken for "absent".
+                            let ct = match tlschecker::ct::check_ct_status(
+                                &cert.certificate.cert_sha256,
+                            ) {
+                                Ok(ct) => ct,
+                                Err(e) => {
+                                    warn!(
+                                        "CT lookup could not be completed for {}{}: {}",
+                                        host_port.host, port_display, e
+                                    );
+                                    tlschecker::ct::CtStatus::Unknown
+                                }
+                            };
+                            cert.apply_ct(ct);
                         }
                         thread_tx.send(cert).unwrap();
                     }
@@ -1283,6 +1371,7 @@ mod tests {
             },
             grade: None,
             scan: None,
+            ct: None,
         }
     }
 
@@ -1548,6 +1637,67 @@ mod tests {
         let output = SummaryFormat.format(&[tls_entry]);
         assert!(output.contains("Security Warnings:"));
         assert!(output.contains("WEAK ALGORITHM: SHA1 detected"));
+    }
+
+    // ── Certificate Transparency (--ct-check) rendering ────────────
+    #[test]
+    fn test_text_format_shows_ct_block_when_logged() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.apply_ct(tlschecker::ct::CtStatus::Logged {
+            crtsh_id: 12345,
+            crtsh_url: "https://crt.sh/?id=12345".to_string(),
+        });
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(output.contains("Certificate Transparency:"));
+        assert!(output.contains("Logged: yes"));
+        assert!(output.contains("crt.sh: https://crt.sh/?id=12345"));
+    }
+
+    #[test]
+    fn test_text_format_ct_unknown_has_no_warning() {
+        // "Could not check" must render as unknown and produce NO warning.
+        let mut tls_entry = make_test_tls();
+        tls_entry.apply_ct(tlschecker::ct::CtStatus::Unknown);
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(output.contains("Logged: unknown"));
+        assert!(!output.contains("NOT IN CT LOG"));
+    }
+
+    #[test]
+    fn test_not_logged_surfaces_warning_in_both_formatters() {
+        let mut tls_entry = make_test_tls();
+        // A certificate absent from CT logs is reported as a warning.
+        tls_entry.apply_ct(tlschecker::ct::CtStatus::NotLogged);
+        let text = TextFormat.format(&[tls_entry.clone()]);
+        assert!(text.contains("NOT IN CT LOG"));
+        assert!(text.contains("Logged: no"));
+        let summary = SummaryFormat.format(&[tls_entry]);
+        assert!(summary.contains("NOT IN CT LOG"));
+    }
+
+    // ── Conditional CT column in the summary table ─────────────────
+    #[test]
+    fn test_summary_shows_ct_column_when_checked() {
+        let mut logged = make_test_tls();
+        logged.apply_ct(tlschecker::ct::CtStatus::Logged {
+            crtsh_id: 1,
+            crtsh_url: "https://crt.sh/?id=1".to_string(),
+        });
+        let output = SummaryFormat.format(&[logged]);
+        // Column header present, and the logged ✓ marker rendered for a cert
+        // that produces no warning (the summary-positive-case gap, now fixed).
+        assert!(output.contains("CT"));
+        assert!(output.contains("✓"));
+    }
+
+    #[test]
+    fn test_summary_hides_ct_column_when_not_checked() {
+        // Without --ct-check, ct is None and the column is omitted.
+        let output = SummaryFormat.format(&[make_test_tls()]);
+        assert!(
+            !output.contains(" CT "),
+            "CT column should be hidden when no host was CT-checked"
+        );
     }
 
     // ── should_grade (scan implies grade) ──────────────────────────

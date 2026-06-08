@@ -25,6 +25,7 @@
 //! # Ok::<(), tlschecker::TLSError>(())
 //! ```
 
+pub mod ct;
 pub mod grading;
 pub mod probe;
 
@@ -84,6 +85,9 @@ pub enum SecurityWarning {
     WeakProtocol(String),
     /// The server accepts a weak cipher suite (discovered via `--scan`)
     WeakCipher(String),
+    /// The presented certificate was not found in any public Certificate
+    /// Transparency log (discovered via `--ct-check`)
+    NotInCertificateTransparency(String),
 }
 
 /// Represents a certificate in the certificate chain.
@@ -119,6 +123,9 @@ pub struct TLS {
     /// Protocol/cipher enumeration results (populated when --scan is enabled)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan: Option<probe::TlsScan>,
+    /// Certificate Transparency lookup result (populated when --ct-check is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ct: Option<ct::CtStatus>,
 }
 
 /// TLS cipher suite information.
@@ -1106,6 +1113,7 @@ impl TLS {
             certificate,
             grade,
             scan: None,
+            ct: None,
         })
     }
 
@@ -1124,6 +1132,31 @@ impl TLS {
             self.grade = Some(grading::calculate_grade(&input));
         }
         self.scan = Some(scan);
+    }
+
+    /// Incorporates a Certificate Transparency lookup into this result.
+    ///
+    /// Only a *definitive* [`ct::CtStatus::NotLogged`] appends a
+    /// [`SecurityWarning::NotInCertificateTransparency`] (a publicly-trusted
+    /// certificate that is not logged will be rejected by modern browsers). A
+    /// [`ct::CtStatus::Unknown`] ("could not check") deliberately produces **no**
+    /// warning — an outage must not be reported as a problem. The
+    /// [`ct::CtStatus`] is then stored for output.
+    ///
+    /// CT inclusion is informational and does **not** cap the grade: many
+    /// legitimately private/internal certificates are intentionally absent
+    /// from public CT logs, so callers — not the grade — decide what that
+    /// means for a given host.
+    pub fn apply_ct(&mut self, ct: ct::CtStatus) {
+        if matches!(ct, ct::CtStatus::NotLogged) {
+            self.certificate
+                .security_warnings
+                .push(SecurityWarning::NotInCertificateTransparency(
+                    "Certificate was not found in any public Certificate Transparency log"
+                        .to_string(),
+                ));
+        }
+        self.ct = Some(ct);
     }
 }
 
@@ -1438,6 +1471,7 @@ mod tests {
             },
             grade: None,
             scan: None,
+            ct: None,
         }
     }
 
