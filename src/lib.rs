@@ -767,10 +767,21 @@ pub fn check_ocsp_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus
         // a "good" response and mask a revoked certificate. If verification
         // fails we skip this responder and ultimately fall back to CRL checking
         // (returning `Unknown`) rather than trusting a potentially forged status.
-        let certs = match openssl::stack::Stack::<X509>::new() {
+        //
+        // The `certs` stack supplies *untrusted* intermediates used only to
+        // build the path from the response's signer to the trusted issuer in
+        // `store`. Many CAs use a delegated OCSP responder whose certificate is
+        // issued by the CA: without the chain intermediates available, that
+        // path can't be built and a perfectly valid response would fail to
+        // verify (degrading to `Unknown`). Trust is still anchored solely by
+        // `store` (the issuer), so providing these does not weaken the check.
+        let mut certs = match openssl::stack::Stack::<X509>::new() {
             Ok(certs) => certs,
             Err(_) => continue,
         };
+        for c in chain {
+            let _ = certs.push(c.to_owned());
+        }
         if basic_resp
             .verify(&certs, &store, openssl::ocsp::OcspFlag::empty())
             .is_err()
