@@ -148,6 +148,20 @@ Because this performs many short handshakes (one per version/cipher), it is slow
 
 `--scan` implies `--grade` (the scan is surfaced through the grade, including in the summary table). Scan results feed the analysis: supporting an obsolete/deprecated protocol or accepting a weak cipher produces security warnings (see below) and lowers the grade. This makes the grade reflect the server's *full* posture rather than only the single negotiated connection (e.g. a server that negotiates TLS 1.3 but still allows TLS 1.0 will no longer score an A).
 
+### Embedded SCTs (offline Certificate Transparency)
+
+Every check also reads the leaf's **embedded Signed Certificate Timestamps** (SCTs) — the signed promises a CA receives when it submits a certificate to Certificate Transparency logs (RFC 6962). Their presence is offline proof that the certificate was submitted to CT, and unlike the `--ct-check` lookup below it needs **no network** and is always on:
+
+```sh
+➜ tlschecker -o text example.com
+...
+Embedded SCTs (Certificate Transparency): 2
+  - log cb38f715897c84a1445f5bc1ddfbc96ef29a59cd470a690585b0cb14c31458e7 at 2026-05-18T19:35:22Z
+  - log d809553b944f7affc816196f944f85abb0f8fc5e8755260f15d12e72bb454b14 at 2026-05-18T19:35:22Z
+```
+
+SCTs appear in `text` and `json` output only when present. They complement `--ct-check`: the lookup confirms *inclusion* against crt.sh, while embedded SCTs prove *submission* and stay available even when crt.sh is unreachable — so a `--ct-check` result of `Unknown` will note any embedded SCTs as offline evidence.
+
 ### Certificate Transparency Lookup
 
 Modern browsers reject publicly-trusted certificates that are not logged in [Certificate Transparency](https://certificate.transparency.dev/) logs, and the same logs are what defenders watch for mis-issuance. With `--ct-check`, tlschecker looks the presented leaf up in public CT logs via [crt.sh](https://crt.sh), matched by its SHA-256 fingerprint (an exact, per-certificate lookup):
