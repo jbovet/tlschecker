@@ -304,6 +304,20 @@ impl Formatter for TextFormat {
                 }
             }
 
+            // Embedded SCTs are read offline from the leaf and always available;
+            // shown only when present.
+            if !cert.scts.is_empty() {
+                writeln!(
+                    output,
+                    "\nEmbedded SCTs (Certificate Transparency): {}",
+                    cert.scts.len()
+                )
+                .unwrap();
+                for sct in &cert.scts {
+                    writeln!(output, "  - log {} at {}", sct.log_id, sct.timestamp).unwrap();
+                }
+            }
+
             if let Some(ref ct) = rs.ct {
                 writeln!(output, "\nCertificate Transparency:").unwrap();
                 match ct {
@@ -316,6 +330,15 @@ impl Formatter for TextFormat {
                     }
                     tlschecker::ct::CtStatus::Unknown => {
                         writeln!(output, "  Logged: unknown (could not query crt.sh)").unwrap();
+                        // Offline evidence still applies even when crt.sh is down.
+                        if !cert.scts.is_empty() {
+                            writeln!(
+                                output,
+                                "  Note: {} embedded SCT(s) present — certificate was submitted to CT logs",
+                                cert.scts.len()
+                            )
+                            .unwrap();
+                        }
                     }
                 }
             }
@@ -1367,6 +1390,7 @@ mod tests {
                 cert_key_algorithm: "RSA".to_string(),
                 cert_sha256: "AB:CD:EF".to_string(),
                 cert_sha1: "12:34:56".to_string(),
+                scts: Vec::new(),
                 pem: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n".to_string(),
             },
             grade: None,
@@ -1673,6 +1697,43 @@ mod tests {
         assert!(text.contains("Logged: no"));
         let summary = SummaryFormat.format(&[tls_entry]);
         assert!(summary.contains("NOT IN CT LOG"));
+    }
+
+    // ── Embedded SCTs (offline, always-on) ────────────────────────
+    fn sample_sct() -> tlschecker::sct::Sct {
+        tlschecker::sct::Sct {
+            version: 0,
+            log_id: "ab".repeat(32),
+            timestamp_ms: 1_234_567_890_000,
+            timestamp: "2009-02-13T23:31:30Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_text_format_shows_embedded_scts() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.scts = vec![sample_sct()];
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(output.contains("Embedded SCTs (Certificate Transparency): 1"));
+        assert!(output.contains(&"ab".repeat(32)));
+        assert!(output.contains("2009-02-13T23:31:30Z"));
+    }
+
+    #[test]
+    fn test_text_format_omits_sct_block_when_none() {
+        let output = TextFormat.format(&[make_test_tls()]); // scts empty
+        assert!(!output.contains("Embedded SCTs"));
+    }
+
+    #[test]
+    fn test_ct_unknown_notes_embedded_scts() {
+        // Offline SCT evidence is surfaced even when crt.sh could not be queried.
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.scts = vec![sample_sct()];
+        tls_entry.apply_ct(tlschecker::ct::CtStatus::Unknown);
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(output.contains("Logged: unknown"));
+        assert!(output.contains("embedded SCT(s) present"));
     }
 
     // ── Conditional CT column in the summary table ─────────────────

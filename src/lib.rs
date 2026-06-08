@@ -28,6 +28,7 @@
 pub mod ct;
 pub mod grading;
 pub mod probe;
+pub mod sct;
 
 use std::fmt::Debug;
 use std::ops::Deref;
@@ -189,6 +190,10 @@ pub struct CertificateInfo {
     pub cert_sha256: String,
     /// SHA-1 fingerprint of the DER-encoded certificate (colon-separated hex)
     pub cert_sha1: String,
+    /// Signed Certificate Timestamps embedded in the leaf (offline proof the
+    /// certificate was submitted to CT logs). Empty when none are present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scts: Vec<sct::Sct>,
     /// PEM encoding of the presented certificate chain (leaf first).
     ///
     /// Populated for `--export-pem`. Not serialized: it is bulky and only
@@ -1093,6 +1098,7 @@ impl TLS {
             cert_key_algorithm,
             cert_sha256: data.cert_sha256,
             cert_sha1: data.cert_sha1,
+            scts: data.scts,
             pem,
         };
 
@@ -1284,6 +1290,7 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         cert_key_algorithm: String::new(),
         cert_sha256: fingerprint(cert_ref, openssl::hash::MessageDigest::sha256()),
         cert_sha1: fingerprint(cert_ref, openssl::hash::MessageDigest::sha1()),
+        scts: sct::embedded_scts(cert_ref),
         pem: String::new(),
     }
 }
@@ -1467,6 +1474,7 @@ mod tests {
                 cert_key_algorithm: "RSA".to_string(),
                 cert_sha256: "AB:CD".to_string(),
                 cert_sha1: "12:34".to_string(),
+                scts: Vec::new(),
                 pem: String::new(),
             },
             grade: None,
