@@ -26,6 +26,7 @@
 //! ```
 
 pub mod grading;
+pub mod probe;
 
 use std::fmt::Debug;
 use std::ops::Deref;
@@ -73,6 +74,16 @@ pub enum SecurityWarning {
     IncompleteChain(String),
     /// Certificate chain ordering is incorrect
     InvalidChainOrder(String),
+    /// The certificate is not valid for the hostname that was checked
+    /// (none of the Subject Alternative Names or the Common Name match)
+    HostnameMismatch(String),
+    /// An intermediate certificate in the chain has expired or is expiring soon
+    ExpiringIntermediate(String),
+    /// The server supports an obsolete or deprecated TLS protocol version
+    /// (discovered via `--scan`)
+    WeakProtocol(String),
+    /// The server accepts a weak cipher suite (discovered via `--scan`)
+    WeakCipher(String),
 }
 
 /// Represents a certificate in the certificate chain.
@@ -105,6 +116,9 @@ pub struct TLS {
     /// TLS configuration grade (populated when --grade is enabled)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grade: Option<grading::TLSGrade>,
+    /// Protocol/cipher enumeration results (populated when --scan is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan: Option<probe::TlsScan>,
 }
 
 /// TLS cipher suite information.
@@ -164,6 +178,16 @@ pub struct CertificateInfo {
     pub cert_key_bits: u32,
     /// Public key algorithm (e.g., "RSA", "EC")
     pub cert_key_algorithm: String,
+    /// SHA-256 fingerprint of the DER-encoded certificate (colon-separated hex)
+    pub cert_sha256: String,
+    /// SHA-1 fingerprint of the DER-encoded certificate (colon-separated hex)
+    pub cert_sha1: String,
+    /// PEM encoding of the presented certificate chain (leaf first).
+    ///
+    /// Populated for `--export-pem`. Not serialized: it is bulky and only
+    /// meaningful when explicitly exported, so it is skipped in JSON output.
+    #[serde(skip)]
+    pub pem: String,
 }
 
 /// Certificate issuer (Certificate Authority) information.
@@ -297,7 +321,192 @@ pub fn analyze_certificate_chain(cert: &X509, chain: &[X509]) -> Vec<SecurityWar
         }
     }
 
+    // Check chain ordering - each cert (except the last) should be directly
+    // followed by its issuer, as required when a server presents a chain.
+    if !is_chain_well_ordered(chain) {
+        warnings.push(SecurityWarning::InvalidChainOrder(
+            "Certificate chain is not in issuer order (each certificate should be \
+             followed by the certificate that issued it)"
+                .to_string(),
+        ));
+    }
+
+    // Check for intermediate certificates that have expired or are expiring soon.
+    // The leaf is reported separately via `is_expired`, and self-signed roots are
+    // skipped (clients ship their own trusted roots, so a presented root's expiry
+    // is not actionable).
+    let leaf_der = cert.to_der().ok();
+    for chain_cert in chain.iter() {
+        // Skip the leaf itself (its expiry is reported separately via
+        // `is_expired`). Compare as `Option`s so that if serialization fails the
+        // matching `None == None` still skips the leaf rather than analysing it
+        // a second time.
+        let chain_der = chain_cert.to_der().ok();
+        if chain_der == leaf_der {
+            continue;
+        }
+        if is_self_signed_certificate(chain_cert) {
+            continue; // skip roots
+        }
+        let subject = chain_cert
+            .subject_name()
+            .entries_by_nid(Nid::COMMONNAME)
+            .next()
+            .and_then(|e| e.data().as_utf8().ok().map(|s| s.to_string()))
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        if has_expired(chain_cert.not_after()) {
+            warnings.push(SecurityWarning::ExpiringIntermediate(format!(
+                "Intermediate certificate '{}' has expired ({})",
+                subject,
+                chain_cert.not_after()
+            )));
+        } else {
+            let days_left = get_validity_days(chain_cert.not_after());
+            if days_left < CHAIN_EXPIRY_WARNING_DAYS {
+                warnings.push(SecurityWarning::ExpiringIntermediate(format!(
+                    "Intermediate certificate '{}' expires in {} days ({})",
+                    subject,
+                    days_left,
+                    chain_cert.not_after()
+                )));
+            }
+        }
+    }
+
     warnings
+}
+
+/// Number of days before an intermediate certificate's expiry at which a
+/// warning is raised.
+const CHAIN_EXPIRY_WARNING_DAYS: i32 = 30;
+
+/// Checks whether a presented certificate chain is in correct issuer order.
+///
+/// A well-ordered chain has each certificate directly followed by the
+/// certificate that issued it (i.e. `chain[i].issuer == chain[i+1].subject`).
+/// A chain with fewer than two certificates is trivially considered ordered.
+///
+/// This only validates ordering of the certificates that are present; a missing
+/// issuer is reported separately as an incomplete chain.
+fn is_chain_well_ordered(chain: &[X509]) -> bool {
+    for pair in chain.windows(2) {
+        let issuer_name = pair[0].issuer_name();
+        let next_subject = pair[1].subject_name();
+        let in_order = issuer_name
+            .try_cmp(next_subject)
+            .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal);
+        if !in_order {
+            return false;
+        }
+    }
+    true
+}
+
+/// Determines whether `cert` is valid for `hostname`.
+///
+/// Matching follows the usual TLS rules: the Subject Alternative Name (SAN)
+/// DNS entries are checked first, and only if the certificate has no DNS SANs
+/// does it fall back to the Subject Common Name. Wildcard names such as
+/// `*.example.com` match exactly one label (`a.example.com` but not
+/// `a.b.example.com` or the bare `example.com`). Matching is case-insensitive.
+///
+/// # Arguments
+///
+/// * `hostname` - The hostname that was connected to
+/// * `cert` - The end-entity certificate presented by the server
+///
+/// # Returns
+///
+/// `true` if the certificate is valid for the hostname, `false` otherwise.
+pub fn cert_matches_hostname(hostname: &str, cert: &X509) -> bool {
+    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+    if hostname.is_empty() {
+        return false;
+    }
+
+    // An IP-address target must be matched against iPAddress SANs (RFC 6125),
+    // not DNS names. Compare the raw address bytes so that different textual
+    // forms (e.g. compressed vs. expanded IPv6) still match.
+    if let Ok(ip) = hostname.parse::<std::net::IpAddr>() {
+        let want: Vec<u8> = match ip {
+            std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+            std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+        };
+        let mut had_ip_san = false;
+        if let Some(general_names) = cert.subject_alt_names() {
+            for general_name in general_names {
+                if let Some(actual) = general_name.ipaddress() {
+                    had_ip_san = true;
+                    if actual == want.as_slice() {
+                        return true;
+                    }
+                }
+            }
+        }
+        // Fall back to a textual Common Name match only when the certificate
+        // carries no iPAddress SANs (common for self-signed/internal certs).
+        if !had_ip_san {
+            let cn = from_entries(cert.subject_name().entries_by_nid(Nid::COMMONNAME));
+            if cn != "None" && cn.trim_end_matches('.').to_ascii_lowercase() == hostname {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // DNS-name target: prefer SAN DNS entries.
+    let mut had_dns_san = false;
+    if let Some(general_names) = cert.subject_alt_names() {
+        for general_name in general_names {
+            if let Some(dns) = general_name.dnsname() {
+                had_dns_san = true;
+                if matches_dns_name(dns, &hostname) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Fall back to the Common Name only when there are no DNS SANs, mirroring
+    // modern client behaviour (SANs, when present, are authoritative).
+    if !had_dns_san {
+        let cn = from_entries(cert.subject_name().entries_by_nid(Nid::COMMONNAME));
+        if cn != "None" && matches_dns_name(&cn, &hostname) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Strips the brackets that wrap an IPv6 literal host (`"[::1]"` -> `"::1"`).
+///
+/// Hostnames and IPv4 literals are returned unchanged. Brackets are only
+/// removed when both the leading `[` and trailing `]` are present.
+pub(crate) fn unbracket_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// Matches a single certificate DNS name (which may be a wildcard) against a
+/// lower-cased hostname.
+fn matches_dns_name(pattern: &str, hostname: &str) -> bool {
+    let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
+
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        // Wildcard matches exactly one left-most label.
+        if suffix.is_empty() {
+            return false;
+        }
+        match hostname.split_once('.') {
+            Some((label, rest)) => !label.is_empty() && rest == suffix,
+            None => false,
+        }
+    } else {
+        pattern == hostname
+    }
 }
 
 /// Checks if a signature algorithm is considered weak.
@@ -316,6 +525,119 @@ fn is_weak_algorithm(algorithm: &str) -> bool {
     algorithm.contains("1.2.840.113549.1.1.5") ||  // sha1WithRSAEncryption
     algorithm.contains("1.2.840.113549.1.1.4") ||  // md5WithRSAEncryption
     algorithm.contains("1.2.840.10040.4.3") // dsaWithSHA1
+}
+
+/// Checks whether a cipher suite name denotes a weak cipher.
+///
+/// Flags RC4, (3)DES, NULL, EXPORT, MD5, and anonymous (ADH/AECDH) suites.
+fn is_weak_cipher(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    n.contains("RC4")
+        || n.contains("DES") // matches both DES and 3DES ("DES-CBC3-...")
+        || n.contains("NULL")
+        || n.contains("MD5")
+        || n.contains("EXP") // EXPORT-grade
+        || n.contains("ADH")
+        || n.contains("AECDH")
+        || n.contains("ANON")
+}
+
+/// Returns true if the scan shows support for an obsolete protocol that should
+/// cap the grade (SSLv3 or TLS 1.0).
+fn scan_supports_obsolete_protocol(scan: &probe::TlsScan) -> bool {
+    use probe::ProtoVersion;
+    scan.protocols
+        .iter()
+        .any(|p| p.supported && matches!(p.version, ProtoVersion::Ssl3 | ProtoVersion::Tls1_0))
+}
+
+/// Returns true if the scan shows the server accepting any weak cipher.
+fn scan_accepts_weak_cipher(scan: &probe::TlsScan) -> bool {
+    scan.protocols
+        .iter()
+        .any(|p| p.supported && p.ciphers.iter().any(|c| is_weak_cipher(c)))
+}
+
+/// Derives security warnings from protocol/cipher enumeration results.
+///
+/// Produces a [`SecurityWarning::WeakProtocol`] for each supported obsolete
+/// (SSLv3) or deprecated (TLS 1.0 / TLS 1.1) protocol version, and a single
+/// [`SecurityWarning::WeakCipher`] per distinct weak cipher the server accepts.
+///
+/// # Arguments
+///
+/// * `scan` - The protocol/cipher enumeration result
+///
+/// # Returns
+///
+/// A vector of `SecurityWarning` items describing weaknesses found.
+pub fn analyze_scan(scan: &probe::TlsScan) -> Vec<SecurityWarning> {
+    let mut warnings = Vec::new();
+
+    for proto in scan.protocols.iter().filter(|p| p.supported) {
+        match proto.version {
+            probe::ProtoVersion::Ssl3 => warnings.push(SecurityWarning::WeakProtocol(format!(
+                "Server supports obsolete protocol {} (known to be insecure)",
+                proto.version
+            ))),
+            probe::ProtoVersion::Tls1_0 | probe::ProtoVersion::Tls1_1 => {
+                warnings.push(SecurityWarning::WeakProtocol(format!(
+                    "Server supports deprecated protocol {}",
+                    proto.version
+                )))
+            }
+            _ => {}
+        }
+    }
+
+    // Collect distinct weak ciphers across all supported versions to avoid
+    // emitting the same cipher once per protocol.
+    let mut weak_ciphers: Vec<String> = Vec::new();
+    for proto in scan.protocols.iter().filter(|p| p.supported) {
+        for cipher in &proto.ciphers {
+            if is_weak_cipher(cipher) && !weak_ciphers.contains(cipher) {
+                weak_ciphers.push(cipher.clone());
+            }
+        }
+    }
+    for cipher in weak_ciphers {
+        warnings.push(SecurityWarning::WeakCipher(format!(
+            "Server accepts weak cipher {}",
+            cipher
+        )));
+    }
+
+    warnings
+}
+
+/// Builds the grading input from a connection's cipher and certificate info,
+/// plus optional protocol/cipher scan results.
+///
+/// Trust-related flags are derived from the certificate's accumulated security
+/// warnings; scan-derived flags (obsolete protocol / weak cipher) are taken
+/// from `scan` when present. Centralising this lets both the initial grade in
+/// [`TLS::from`] and the recomputed grade in [`TLS::apply_scan`] stay in sync.
+fn build_grading_input(
+    cipher: &Cipher,
+    certificate: &CertificateInfo,
+    scan: Option<&probe::TlsScan>,
+) -> grading::GradingInput {
+    let has = |pred: fn(&SecurityWarning) -> bool| certificate.security_warnings.iter().any(pred);
+    grading::GradingInput {
+        protocol_version: cipher.version.clone(),
+        cipher_name: cipher.name.clone(),
+        cipher_bits: cipher.bits,
+        cert_key_bits: certificate.cert_key_bits,
+        cert_key_algorithm: certificate.cert_key_algorithm.clone(),
+        is_expired: certificate.is_expired,
+        is_self_signed: certificate.is_self_signed,
+        has_incomplete_chain: has(|w| matches!(w, SecurityWarning::IncompleteChain(_))),
+        has_weak_signature: has(|w| matches!(w, SecurityWarning::WeakSignatureAlgorithm(_))),
+        has_hostname_mismatch: has(|w| matches!(w, SecurityWarning::HostnameMismatch(_))),
+        supports_obsolete_protocol: scan.map(scan_supports_obsolete_protocol).unwrap_or(false),
+        accepts_weak_cipher: scan.map(scan_accepts_weak_cipher).unwrap_or(false),
+        is_revoked: matches!(certificate.revocation_status, RevocationStatus::Revoked(_)),
+    }
 }
 
 /// Check OCSP status
@@ -427,10 +749,23 @@ pub fn check_ocsp_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus
 
         let store = store_builder.build();
 
-        // Skip verification of basic response if it fails - many OCSP responders
-        // don't provide all the certificates needed for complete verification
-        let certs = openssl::stack::Stack::<X509>::new().unwrap();
-        let _ = basic_resp.verify(&certs, &store, openssl::ocsp::OcspFlag::empty());
+        // Verify the OCSP response signature before trusting any status it
+        // reports. Per RFC 6960 an unsigned or improperly signed response
+        // must not be relied upon: doing so would let an on-path attacker forge
+        // a "good" response and mask a revoked certificate. If verification
+        // fails we skip this responder and ultimately fall back to CRL checking
+        // (returning `Unknown`) rather than trusting a potentially forged status.
+        let certs = match openssl::stack::Stack::<X509>::new() {
+            Ok(certs) => certs,
+            Err(_) => continue,
+        };
+        if basic_resp
+            .verify(&certs, &store, openssl::ocsp::OcspFlag::empty())
+            .is_err()
+        {
+            warn!("OCSP response signature verification failed; ignoring response from {responder_url}");
+            continue;
+        }
 
         // Check status
         // Create a new cert_id for each check since find_status consumes it
@@ -611,8 +946,10 @@ impl TLS {
         use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
         use std::net::{TcpStream, ToSocketAddrs};
 
-        // Trim any whitespace
-        let host = host.trim();
+        // Trim any whitespace, and strip brackets that wrap IPv6 literals
+        // (e.g. "[::1]" -> "::1") so address resolution and hostname matching
+        // both operate on a bare address.
+        let host = unbracket_host(host.trim());
 
         // Validate hostname is not empty
         if host.is_empty() {
@@ -628,8 +965,9 @@ impl TLS {
 
         // Use the provided port or default to 443
         let port = port.unwrap_or(443);
-        let remote = format!("{host}:{port}");
-        let socket_addr = remote
+        // Resolve via the (host, port) tuple rather than "{host}:{port}" so IPv6
+        // literals (e.g. "::1") work without bracket syntax.
+        let socket_addr = (host, port)
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| TLSError::DNS("Failed parse remote hostname".to_string()))?;
@@ -695,7 +1033,22 @@ impl TLS {
         // Analyze certificate chain for security issues
         let cert_chain: Vec<openssl::x509::X509> =
             peer_cert_chain.iter().map(|cert| cert.to_owned()).collect();
-        let security_warnings = analyze_certificate_chain(&x509_ref, &cert_chain);
+        let mut security_warnings = analyze_certificate_chain(&x509_ref, &cert_chain);
+
+        // Check that the certificate is actually valid for the host we connected to.
+        if !cert_matches_hostname(host, &x509_ref) {
+            security_warnings.push(SecurityWarning::HostnameMismatch(format!(
+                "Certificate is not valid for '{}' (no matching Subject Alternative Name or Common Name)",
+                host
+            )));
+        }
+
+        // Concatenate the presented chain (leaf first) as PEM for `--export-pem`.
+        let pem = cert_chain
+            .iter()
+            .filter_map(|c| c.to_pem().ok())
+            .filter_map(|der| String::from_utf8(der).ok())
+            .collect::<String>();
 
         // Extract public key information
         let public_key = x509_ref
@@ -730,30 +1083,20 @@ impl TLS {
             is_self_signed: data.is_self_signed,
             security_warnings,
             cert_key_bits,
-            cert_key_algorithm: cert_key_algorithm.clone(),
+            cert_key_algorithm,
+            cert_sha256: data.cert_sha256,
+            cert_sha1: data.cert_sha1,
+            pem,
         };
 
-        // Calculate TLS grade if requested
+        // Calculate TLS grade if requested. Scan-derived signals are folded in
+        // later by `apply_scan` when `--scan` is enabled.
         let grade = if calculate_grade {
-            let grading_input = grading::GradingInput {
-                protocol_version: cipher.version.clone(),
-                cipher_name: cipher.name.clone(),
-                cipher_bits: cipher.bits,
-                cert_key_bits: certificate.cert_key_bits,
-                cert_key_algorithm,
-                is_expired: certificate.is_expired,
-                is_self_signed: certificate.is_self_signed,
-                has_incomplete_chain: certificate
-                    .security_warnings
-                    .iter()
-                    .any(|w| matches!(w, SecurityWarning::IncompleteChain(_))),
-                has_weak_signature: certificate
-                    .security_warnings
-                    .iter()
-                    .any(|w| matches!(w, SecurityWarning::WeakSignatureAlgorithm(_))),
-                is_revoked: matches!(certificate.revocation_status, RevocationStatus::Revoked(_)),
-            };
-            Some(grading::calculate_grade(&grading_input))
+            Some(grading::calculate_grade(&build_grading_input(
+                &cipher,
+                &certificate,
+                None,
+            )))
         } else {
             None
         };
@@ -762,7 +1105,25 @@ impl TLS {
             cipher,
             certificate,
             grade,
+            scan: None,
         })
+    }
+
+    /// Incorporates protocol/cipher scan results into this result.
+    ///
+    /// Appends any [`SecurityWarning`]s derived from the scan (weak protocols /
+    /// ciphers) and, when a grade was already computed, recomputes it so the
+    /// grade reflects the server's full protocol and cipher posture rather than
+    /// just the single negotiated connection. Finally stores the scan itself.
+    pub fn apply_scan(&mut self, scan: probe::TlsScan) {
+        self.certificate
+            .security_warnings
+            .append(&mut analyze_scan(&scan));
+        if self.grade.is_some() {
+            let input = build_grading_input(&self.cipher, &self.certificate, Some(&scan));
+            self.grade = Some(grading::calculate_grade(&input));
+        }
+        self.scan = Some(scan);
     }
 }
 
@@ -860,11 +1221,12 @@ fn get_issuer(cert_ref: &X509) -> Issuer {
 /// The hostname field is set to "None" and should be populated by the caller.
 fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
     let mut sans = Vec::new();
-    match cert_ref.subject_alt_names() {
-        None => {}
-        Some(general_names) => {
-            for general_name in general_names {
-                sans.push(general_name.dnsname().unwrap().to_string());
+    if let Some(general_names) = cert_ref.subject_alt_names() {
+        for general_name in general_names {
+            // Only DNS-name SANs are relevant here; other types (IP address,
+            // email, URI, ...) are skipped rather than panicking.
+            if let Some(dns) = general_name.dnsname() {
+                sans.push(dns.to_string());
             }
         }
     }
@@ -887,6 +1249,25 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         security_warnings: Vec::new(),
         cert_key_bits: 0,
         cert_key_algorithm: String::new(),
+        cert_sha256: fingerprint(cert_ref, openssl::hash::MessageDigest::sha256()),
+        cert_sha1: fingerprint(cert_ref, openssl::hash::MessageDigest::sha1()),
+        pem: String::new(),
+    }
+}
+
+/// Computes a certificate fingerprint as colon-separated uppercase hex.
+///
+/// This is the standard fingerprint representation shown by browsers and
+/// `openssl x509 -fingerprint` (e.g., `AB:CD:EF:...`). Returns an empty
+/// string if the digest cannot be computed.
+fn fingerprint(cert_ref: &X509, digest: openssl::hash::MessageDigest) -> String {
+    match cert_ref.digest(digest) {
+        Ok(bytes) => bytes
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(":"),
+        Err(_) => String::new(),
     }
 }
 
@@ -997,7 +1378,11 @@ pub fn is_self_signed_certificate(cert: &X509) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::grading;
-    use crate::{CertificateInfo, Chain, Cipher, Issuer, RevocationStatus, Subject, TLSError, TLS};
+    use crate::probe::ProtoVersion;
+    use crate::{
+        CertificateInfo, Chain, Cipher, Issuer, RevocationStatus, SecurityWarning, Subject,
+        TLSError, TLS,
+    };
 
     /// Creates a synthetic TLS struct for offline testing.
     /// No network connection needed — all fields are populated with realistic data.
@@ -1047,8 +1432,12 @@ mod tests {
                 security_warnings: vec![],
                 cert_key_bits: 2048,
                 cert_key_algorithm: "RSA".to_string(),
+                cert_sha256: "AB:CD".to_string(),
+                cert_sha1: "12:34".to_string(),
+                pem: String::new(),
             },
             grade: None,
+            scan: None,
         }
     }
 
@@ -1065,6 +1454,9 @@ mod tests {
             is_self_signed: tls.certificate.is_self_signed,
             has_incomplete_chain: false,
             has_weak_signature: false,
+            has_hostname_mismatch: false,
+            supports_obsolete_protocol: false,
+            accepts_weak_cipher: false,
             is_revoked: false,
         };
         tls.grade = Some(grading::calculate_grade(&input));
@@ -1747,5 +2139,504 @@ mod tests {
             "Expected IncompleteChain warning when issuer missing from chain, got: {:?}",
             warnings
         );
+    }
+
+    /// Creates a self-signed cert with the given Subject Alternative Names.
+    fn make_test_x509_with_sans(common_name: &str, dns_names: &[&str]) -> X509 {
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, common_name)
+            .unwrap();
+        let name = name.build();
+
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+            .unwrap();
+        if !dns_names.is_empty() {
+            let mut san = openssl::x509::extension::SubjectAlternativeName::new();
+            for d in dns_names {
+                san.dns(d);
+            }
+            let ext = san.build(&builder.x509v3_context(None, None)).unwrap();
+            builder.append_extension(ext).unwrap();
+        }
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+        builder.build()
+    }
+
+    /// Creates a cert signed by an issuer that expires in `days` days.
+    fn make_test_x509_signed_by_expiring(
+        common_name: &str,
+        issuer_cert: &X509,
+        issuer_key: &PKey<Private>,
+        days: u32,
+    ) -> X509 {
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+
+        let mut subject_name = X509NameBuilder::new().unwrap();
+        subject_name
+            .append_entry_by_nid(openssl::nid::Nid::COMMONNAME, common_name)
+            .unwrap();
+        let subject_name = subject_name.build();
+
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        builder.set_subject_name(&subject_name).unwrap();
+        builder.set_issuer_name(issuer_cert.subject_name()).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(days).unwrap())
+            .unwrap();
+        builder.sign(issuer_key, MessageDigest::sha256()).unwrap();
+        builder.build()
+    }
+
+    // ── Feature 1: hostname / SAN matching ───────────────────────────
+
+    #[test]
+    fn test_matches_dns_name_exact_and_case_insensitive() {
+        assert!(super::matches_dns_name("example.com", "example.com"));
+        assert!(super::matches_dns_name("EXAMPLE.com", "example.com"));
+        assert!(super::matches_dns_name("example.com.", "example.com"));
+        assert!(!super::matches_dns_name("example.com", "other.com"));
+    }
+
+    #[test]
+    fn test_matches_dns_name_wildcard() {
+        assert!(super::matches_dns_name("*.example.com", "a.example.com"));
+        assert!(super::matches_dns_name("*.example.com", "www.example.com"));
+        // Wildcard matches exactly one label.
+        assert!(!super::matches_dns_name("*.example.com", "example.com"));
+        assert!(!super::matches_dns_name("*.example.com", "a.b.example.com"));
+        assert!(!super::matches_dns_name("*.example.com", "a.example.org"));
+        // Bare wildcard is not valid.
+        assert!(!super::matches_dns_name("*.", "a."));
+    }
+
+    #[test]
+    fn test_cert_matches_hostname_san() {
+        let cert = make_test_x509_with_sans("example.com", &["example.com", "*.example.com"]);
+        assert!(super::cert_matches_hostname("example.com", &cert));
+        assert!(super::cert_matches_hostname("www.example.com", &cert));
+        assert!(!super::cert_matches_hostname("example.org", &cert));
+    }
+
+    #[test]
+    fn test_cert_matches_hostname_cn_fallback() {
+        // No SANs -> falls back to CN.
+        let (cert, _) = make_test_x509("fallback.example.com");
+        assert!(super::cert_matches_hostname("fallback.example.com", &cert));
+        assert!(!super::cert_matches_hostname("other.example.com", &cert));
+    }
+
+    #[test]
+    fn test_cert_matches_hostname_san_ignores_cn() {
+        // When SANs are present, CN is not consulted.
+        let cert = make_test_x509_with_sans("cn.example.com", &["san.example.com"]);
+        assert!(super::cert_matches_hostname("san.example.com", &cert));
+        assert!(!super::cert_matches_hostname("cn.example.com", &cert));
+    }
+
+    /// Creates a self-signed cert with the given iPAddress SANs (plus optional
+    /// DNS SANs) so IP-address matching can be tested.
+    fn make_test_x509_with_ip_sans(common_name: &str, ips: &[&str], dns: &[&str]) -> X509 {
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, common_name)
+            .unwrap();
+        let name = name.build();
+
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+            .unwrap();
+        let mut san = openssl::x509::extension::SubjectAlternativeName::new();
+        for d in dns {
+            san.dns(d);
+        }
+        for ip in ips {
+            san.ip(ip);
+        }
+        let ext = san.build(&builder.x509v3_context(None, None)).unwrap();
+        builder.append_extension(ext).unwrap();
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+        builder.build()
+    }
+
+    #[test]
+    fn test_unbracket_host() {
+        assert_eq!(super::unbracket_host("[::1]"), "::1");
+        assert_eq!(
+            super::unbracket_host("[2606:4700:4700::1111]"),
+            "2606:4700:4700::1111"
+        );
+        assert_eq!(super::unbracket_host("example.com"), "example.com");
+        assert_eq!(super::unbracket_host("1.1.1.1"), "1.1.1.1");
+        // Unbalanced brackets are left untouched.
+        assert_eq!(super::unbracket_host("[::1"), "[::1");
+    }
+
+    #[test]
+    fn test_cert_matches_hostname_ip_san() {
+        // A cert valid for 127.0.0.1 (and example.com) must match the IP target.
+        let cert = make_test_x509_with_ip_sans("server", &["127.0.0.1"], &["example.com"]);
+        assert!(super::cert_matches_hostname("127.0.0.1", &cert));
+        // ... but not a different IP.
+        assert!(!super::cert_matches_hostname("10.0.0.1", &cert));
+        // The DNS SAN still works for its name.
+        assert!(super::cert_matches_hostname("example.com", &cert));
+    }
+
+    #[test]
+    fn test_cert_matches_hostname_ip_v6_san() {
+        let cert = make_test_x509_with_ip_sans("server", &["::1"], &[]);
+        // Different textual forms of the same address must match (byte compare).
+        assert!(super::cert_matches_hostname("::1", &cert));
+        assert!(super::cert_matches_hostname("0:0:0:0:0:0:0:1", &cert));
+        assert!(!super::cert_matches_hostname("::2", &cert));
+    }
+
+    #[test]
+    fn test_ip_target_dns_only_cert_is_mismatch() {
+        // An IP target against a DNS-only cert is correctly a mismatch (RFC 6125:
+        // IPs are not matched against DNS names).
+        let cert = make_test_x509_with_sans("example.com", &["example.com"]);
+        assert!(!super::cert_matches_hostname("127.0.0.1", &cert));
+    }
+
+    #[test]
+    fn test_ip_target_cn_fallback_when_no_ip_san() {
+        // Self-signed/internal certs sometimes put the IP only in the CN.
+        let (cert, _) = make_test_x509("10.0.0.5");
+        assert!(super::cert_matches_hostname("10.0.0.5", &cert));
+        assert!(!super::cert_matches_hostname("10.0.0.6", &cert));
+    }
+
+    #[test]
+    fn test_hostname_mismatch_emitted_via_from_is_not_possible_offline() {
+        // The HostnameMismatch warning is produced inside TLS::from, which needs
+        // a live connection; here we just assert the matching primitive behaves.
+        let cert = make_test_x509_with_sans("example.com", &["example.com"]);
+        assert!(!super::cert_matches_hostname("evil.com", &cert));
+    }
+
+    // ── Feature 2: chain ordering ────────────────────────────────────
+
+    #[test]
+    fn test_chain_well_ordered() {
+        let (ca_cert, ca_key) = make_test_x509("Order CA");
+        let leaf = make_test_x509_signed_by("leaf.example.com", &ca_cert, &ca_key);
+        // Correct order: leaf then its issuer.
+        let ordered = vec![leaf.clone(), ca_cert.clone()];
+        assert!(super::is_chain_well_ordered(&ordered));
+        // Single-element and empty chains are trivially ordered.
+        assert!(super::is_chain_well_ordered(&[leaf.clone()]));
+        assert!(super::is_chain_well_ordered(&[]));
+    }
+
+    #[test]
+    fn test_chain_misordered_detected() {
+        let (ca_cert, ca_key) = make_test_x509("Order CA");
+        let leaf = make_test_x509_signed_by("leaf.example.com", &ca_cert, &ca_key);
+        // Wrong order: CA before the leaf it issued.
+        let misordered = vec![ca_cert.clone(), leaf.clone()];
+        assert!(!super::is_chain_well_ordered(&misordered));
+
+        let warnings = super::analyze_certificate_chain(&leaf, &misordered);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, super::SecurityWarning::InvalidChainOrder(_))),
+            "Expected InvalidChainOrder warning, got: {:?}",
+            warnings
+        );
+    }
+
+    // ── Feature 3: intermediate expiry ───────────────────────────────
+
+    #[test]
+    fn test_expiring_intermediate_detected() {
+        let (root_cert, root_key) = make_test_x509("Expiry Root");
+        // Intermediate signed by root, expiring in 10 days (< 30 day threshold).
+        let intermediate =
+            make_test_x509_signed_by_expiring("Intermediate CA", &root_cert, &root_key, 10);
+        let leaf = make_test_x509_signed_by("leaf.example.com", &intermediate, &root_key);
+
+        let chain = vec![leaf.clone(), intermediate.clone()];
+        let warnings = super::analyze_certificate_chain(&leaf, &chain);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, super::SecurityWarning::ExpiringIntermediate(_))),
+            "Expected ExpiringIntermediate warning, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_expiring_leaf_not_reported_as_intermediate() {
+        // The leaf is part of the presented chain; even when it is expiring it
+        // must NOT be reported as an ExpiringIntermediate (its expiry is surfaced
+        // separately via is_expired).
+        let (ca_cert, ca_key) = make_test_x509("Dedup CA");
+        let leaf = make_test_x509_signed_by_expiring("leaf.example.com", &ca_cert, &ca_key, 10);
+
+        let chain = vec![leaf.clone(), ca_cert.clone()];
+        let warnings = super::analyze_certificate_chain(&leaf, &chain);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, super::SecurityWarning::ExpiringIntermediate(_))),
+            "Leaf should not be reported as an expiring intermediate, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_healthy_intermediate_no_expiry_warning() {
+        let (root_cert, root_key) = make_test_x509("Healthy Root");
+        // Intermediate valid for a year — no expiry warning expected.
+        let intermediate =
+            make_test_x509_signed_by_expiring("Healthy Intermediate", &root_cert, &root_key, 365);
+        let leaf = make_test_x509_signed_by("leaf.example.com", &intermediate, &root_key);
+
+        let chain = vec![leaf.clone(), intermediate.clone()];
+        let warnings = super::analyze_certificate_chain(&leaf, &chain);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, super::SecurityWarning::ExpiringIntermediate(_))),
+            "Did not expect ExpiringIntermediate warning, got: {:?}",
+            warnings
+        );
+    }
+
+    // ── Feature 7: fingerprints ──────────────────────────────────────
+
+    #[test]
+    fn test_fingerprint_format() {
+        let (cert, _) = make_test_x509("fp.example.com");
+        let sha256 = super::fingerprint(&cert, MessageDigest::sha256());
+        // 32 bytes -> 32 hex pairs joined by 31 colons = 95 chars.
+        assert_eq!(sha256.len(), 95, "sha256 fingerprint: {}", sha256);
+        assert!(sha256.split(':').all(|p| p.len() == 2));
+        assert!(sha256.chars().all(|c| c.is_ascii_hexdigit() || c == ':'));
+        // Uppercase hex.
+        assert_eq!(sha256, sha256.to_uppercase());
+
+        let sha1 = super::fingerprint(&cert, MessageDigest::sha1());
+        // 20 bytes -> 20 pairs + 19 colons = 59 chars.
+        assert_eq!(sha1.len(), 59, "sha1 fingerprint: {}", sha1);
+    }
+
+    #[test]
+    fn test_get_certificate_info_populates_fingerprints() {
+        let (cert, _) = make_test_x509("info.example.com");
+        let info = super::get_certificate_info(&cert);
+        assert!(!info.cert_sha256.is_empty());
+        assert!(!info.cert_sha1.is_empty());
+        assert_ne!(info.cert_sha256, info.cert_sha1);
+    }
+
+    // ── Feature 1 (scan → findings/grade): scan analysis ─────────────
+
+    fn proto(
+        version: crate::probe::ProtoVersion,
+        supported: bool,
+        ciphers: &[&str],
+    ) -> crate::probe::ProtocolSupport {
+        crate::probe::ProtocolSupport {
+            version,
+            supported,
+            ciphers: ciphers.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_is_weak_cipher() {
+        assert!(super::is_weak_cipher("RC4-SHA"));
+        assert!(super::is_weak_cipher("RC4-MD5"));
+        assert!(super::is_weak_cipher("DES-CBC3-SHA")); // 3DES
+        assert!(super::is_weak_cipher("DES-CBC-SHA")); // single DES
+        assert!(super::is_weak_cipher("ADH-AES128-SHA")); // anonymous
+        assert!(super::is_weak_cipher("EXP-RC2-CBC-MD5")); // export
+        assert!(super::is_weak_cipher("NULL-SHA"));
+
+        assert!(!super::is_weak_cipher("ECDHE-RSA-AES256-GCM-SHA384"));
+        assert!(!super::is_weak_cipher("AES128-GCM-SHA256"));
+        assert!(!super::is_weak_cipher("TLS_AES_256_GCM_SHA384"));
+    }
+
+    #[test]
+    fn test_analyze_scan_flags_weaknesses() {
+        let scan = crate::probe::TlsScan {
+            protocols: vec![
+                proto(ProtoVersion::Ssl3, true, &[]),
+                proto(ProtoVersion::Tls1_0, false, &[]),
+                proto(ProtoVersion::Tls1_1, true, &["ECDHE-RSA-AES128-SHA"]),
+                proto(
+                    ProtoVersion::Tls1_2,
+                    true,
+                    &["ECDHE-RSA-AES256-GCM-SHA384", "RC4-SHA", "DES-CBC3-SHA"],
+                ),
+                proto(ProtoVersion::Tls1_3, true, &["TLS_AES_256_GCM_SHA384"]),
+            ],
+        };
+        let warnings = super::analyze_scan(&scan);
+
+        // Obsolete + deprecated protocols flagged (SSLv3, TLSv1.1); supported
+        // modern versions not flagged; unsupported TLSv1.0 not flagged.
+        let protos: Vec<&String> = warnings
+            .iter()
+            .filter_map(|w| match w {
+                super::SecurityWarning::WeakProtocol(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert!(protos.iter().any(|m| m.contains("SSLv3")));
+        assert!(protos.iter().any(|m| m.contains("TLSv1.1")));
+        assert!(!protos.iter().any(|m| m.contains("TLSv1.0"))); // not supported
+        assert!(!protos.iter().any(|m| m.contains("TLSv1.2")));
+        assert!(!protos.iter().any(|m| m.contains("TLSv1.3")));
+
+        // Weak ciphers flagged once each; strong ones not flagged.
+        let ciphers: Vec<&String> = warnings
+            .iter()
+            .filter_map(|w| match w {
+                super::SecurityWarning::WeakCipher(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ciphers.len(),
+            2,
+            "expected RC4-SHA and DES-CBC3-SHA, got {:?}",
+            ciphers
+        );
+        assert!(ciphers.iter().any(|m| m.contains("RC4-SHA")));
+        assert!(ciphers.iter().any(|m| m.contains("DES-CBC3-SHA")));
+    }
+
+    #[test]
+    fn test_analyze_scan_clean_server_no_warnings() {
+        let scan = crate::probe::TlsScan {
+            protocols: vec![
+                proto(ProtoVersion::Ssl3, false, &[]),
+                proto(ProtoVersion::Tls1_0, false, &[]),
+                proto(ProtoVersion::Tls1_1, false, &[]),
+                proto(ProtoVersion::Tls1_2, true, &["ECDHE-RSA-AES256-GCM-SHA384"]),
+                proto(ProtoVersion::Tls1_3, true, &["TLS_AES_256_GCM_SHA384"]),
+            ],
+        };
+        assert!(super::analyze_scan(&scan).is_empty());
+    }
+
+    #[test]
+    fn test_apply_scan_downgrades_grade_and_appends_warnings() {
+        let mut tls = make_test_tls_with_grade();
+        // Sanity: starts as a strong grade.
+        assert!(tls.grade.as_ref().unwrap().score > 50);
+
+        let scan = crate::probe::TlsScan {
+            protocols: vec![
+                proto(ProtoVersion::Ssl3, true, &[]), // obsolete -> cap at 50
+                proto(ProtoVersion::Tls1_2, true, &["ECDHE-RSA-AES256-GCM-SHA384"]),
+            ],
+        };
+        tls.apply_scan(scan);
+
+        assert!(tls.scan.is_some());
+        assert!(
+            tls.certificate
+                .security_warnings
+                .iter()
+                .any(|w| matches!(w, SecurityWarning::WeakProtocol(_))),
+            "expected a WeakProtocol warning after apply_scan"
+        );
+        assert!(
+            tls.grade.as_ref().unwrap().score <= 50,
+            "expected grade capped at 50, got {}",
+            tls.grade.as_ref().unwrap().score
+        );
+    }
+
+    #[test]
+    fn test_apply_scan_weak_cipher_caps_grade() {
+        let mut tls = make_test_tls_with_grade();
+        let scan = crate::probe::TlsScan {
+            protocols: vec![proto(
+                ProtoVersion::Tls1_2,
+                true,
+                &["ECDHE-RSA-AES256-GCM-SHA384", "RC4-SHA"],
+            )],
+        };
+        tls.apply_scan(scan);
+        assert!(
+            tls.grade.as_ref().unwrap().score <= 50,
+            "weak cipher should cap grade at 50, got {}",
+            tls.grade.as_ref().unwrap().score
+        );
+        assert!(tls
+            .certificate
+            .security_warnings
+            .iter()
+            .any(|w| matches!(w, SecurityWarning::WeakCipher(_))));
+    }
+
+    #[test]
+    fn test_apply_scan_leaves_grade_none_when_not_graded() {
+        let mut tls = make_test_tls(); // grade: None
+        let scan = crate::probe::TlsScan {
+            protocols: vec![proto(ProtoVersion::Ssl3, true, &[])],
+        };
+        tls.apply_scan(scan);
+        assert!(tls.grade.is_none(), "apply_scan must not invent a grade");
+        assert!(tls.scan.is_some());
+        assert!(tls
+            .certificate
+            .security_warnings
+            .iter()
+            .any(|w| matches!(w, SecurityWarning::WeakProtocol(_))));
     }
 }

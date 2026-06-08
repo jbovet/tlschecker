@@ -77,6 +77,22 @@ struct Args {
     /// Example: --min-validity 30 fails if any cert expires within 30 days.
     #[arg(long)]
     min_validity: Option<i32>,
+
+    /// Enumerate all supported TLS protocol versions and cipher suites.
+    ///
+    /// Actively probes the server with many short handshakes (one per
+    /// version/cipher), so it is slower than a normal check. Results appear in
+    /// text and JSON output. Implies --grade, so the grade (and thus the scan)
+    /// is surfaced in the summary table.
+    #[arg(long)]
+    scan: bool,
+
+    /// Export the presented certificate chain as PEM and exit.
+    ///
+    /// Prints the leaf certificate followed by any intermediates the server
+    /// sent, instead of the normal formatted report.
+    #[arg(long)]
+    export_pem: bool,
 }
 
 /// Output format for certificate information.
@@ -178,14 +194,34 @@ impl Formatter for TextFormat {
             writeln!(output, "Hostname: {}", cert.hostname).unwrap();
             writeln!(output, "Issued domain: {}", cert.subject.common_name).unwrap();
             writeln!(output, "Subject Name :").unwrap();
-            writeln!(output, "\tCountry or Region: {}", cert.subject.country_or_region).unwrap();
-            writeln!(output, "\tState or Province: {}", cert.subject.state_or_province).unwrap();
+            writeln!(
+                output,
+                "\tCountry or Region: {}",
+                cert.subject.country_or_region
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "\tState or Province: {}",
+                cert.subject.state_or_province
+            )
+            .unwrap();
             writeln!(output, "\tLocality: {}", cert.subject.locality).unwrap();
-            writeln!(output, "\tOrganizational Unit: {}", cert.subject.organization_unit).unwrap();
+            writeln!(
+                output,
+                "\tOrganizational Unit: {}",
+                cert.subject.organization_unit
+            )
+            .unwrap();
             writeln!(output, "\tOrganization: {}", cert.subject.organization).unwrap();
             writeln!(output, "\tCommon Name: {}", cert.subject.common_name).unwrap();
             writeln!(output, "Issuer Name:").unwrap();
-            writeln!(output, "\tCountry or Region: {}", cert.issued.country_or_region).unwrap();
+            writeln!(
+                output,
+                "\tCountry or Region: {}",
+                cert.issued.country_or_region
+            )
+            .unwrap();
             writeln!(output, "\tOrganization: {}", cert.issued.organization).unwrap();
             writeln!(output, "\tCommon Name: {}", cert.issued.common_name).unwrap();
             writeln!(output, "Valid from: {}", cert.valid_from).unwrap();
@@ -197,8 +233,20 @@ impl Formatter for TextFormat {
             writeln!(output, "Certificate version: {}", cert.cert_ver).unwrap();
             writeln!(output, "Certificate algorithm: {}", cert.cert_alg).unwrap();
             writeln!(output, "Certificate S/N: {}", cert.cert_sn).unwrap();
-            writeln!(output, "Certificate key: {} {}-bit", cert.cert_key_algorithm, cert.cert_key_bits).unwrap();
-            writeln!(output, "Cipher suite: {} ({}-bit)", rs.cipher.name, rs.cipher.bits).unwrap();
+            writeln!(output, "SHA-256 Fingerprint: {}", cert.cert_sha256).unwrap();
+            writeln!(output, "SHA-1 Fingerprint: {}", cert.cert_sha1).unwrap();
+            writeln!(
+                output,
+                "Certificate key: {} {}-bit",
+                cert.cert_key_algorithm, cert.cert_key_bits
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "Cipher suite: {} ({}-bit)",
+                rs.cipher.name, rs.cipher.bits
+            )
+            .unwrap();
             writeln!(output, "Protocol: {}", rs.cipher.version).unwrap();
 
             writeln!(
@@ -226,15 +274,51 @@ impl Formatter for TextFormat {
                         tlschecker::SecurityWarning::InvalidChainOrder(msg) => {
                             writeln!(output, "  INVALID CHAIN ORDER: {}", msg).unwrap();
                         }
+                        tlschecker::SecurityWarning::HostnameMismatch(msg) => {
+                            writeln!(output, "  HOSTNAME MISMATCH: {}", msg).unwrap();
+                        }
+                        tlschecker::SecurityWarning::ExpiringIntermediate(msg) => {
+                            writeln!(output, "  EXPIRING INTERMEDIATE: {}", msg).unwrap();
+                        }
+                        tlschecker::SecurityWarning::WeakProtocol(msg) => {
+                            writeln!(output, "  WEAK PROTOCOL: {}", msg).unwrap();
+                        }
+                        tlschecker::SecurityWarning::WeakCipher(msg) => {
+                            writeln!(output, "  WEAK CIPHER: {}", msg).unwrap();
+                        }
+                    }
+                }
+            }
+
+            if let Some(ref scan) = rs.scan {
+                writeln!(output, "\nSupported Protocols & Ciphers:").unwrap();
+                for proto in &scan.protocols {
+                    if proto.supported {
+                        writeln!(output, "  {}: supported", proto.version).unwrap();
+                        for cipher in &proto.ciphers {
+                            writeln!(output, "    - {}", cipher).unwrap();
+                        }
+                    } else {
+                        writeln!(output, "  {}: not supported", proto.version).unwrap();
                     }
                 }
             }
 
             if let Some(ref grade) = rs.grade {
-                writeln!(output, "\nTLS Configuration Grade: {} (Score: {}/100)", grade.grade, grade.score).unwrap();
+                writeln!(
+                    output,
+                    "\nTLS Configuration Grade: {} (Score: {}/100)",
+                    grade.grade, grade.score
+                )
+                .unwrap();
                 writeln!(output, "  Category Breakdown:").unwrap();
                 for cat in &grade.categories {
-                    writeln!(output, "    {}: {}/100 - {}", cat.category, cat.score, cat.reason).unwrap();
+                    writeln!(
+                        output,
+                        "    {}: {}/100 - {}",
+                        cat.category, cat.score, cat.reason
+                    )
+                    .unwrap();
                 }
             }
 
@@ -252,7 +336,8 @@ impl Formatter for TextFormat {
                         writeln!(output, "\tValid from: {:?}", c.valid_from).unwrap();
                         writeln!(output, "\tValid until: {:?}", c.valid_to).unwrap();
                         writeln!(output, "\tIssuer: {:?}", c.issuer).unwrap();
-                        writeln!(output, "\tSignature algorithm: {:?}", c.signature_algorithm).unwrap();
+                        writeln!(output, "\tSignature algorithm: {:?}", c.signature_algorithm)
+                            .unwrap();
                     }
                 }
                 None => todo!(),
@@ -271,25 +356,32 @@ impl Formatter for SummaryFormat {
             return String::new();
         }
 
+        // Only show the Grade column when grading was actually performed for at
+        // least one host; otherwise it would just be a column full of "-".
+        let show_grade = tls.iter().any(|t| t.grade.is_some());
+
         let mut output = String::new();
         let mut table = Table::new();
+        let mut header = vec![
+            "Host",
+            "Cipher Suite",
+            "Protocol",
+            "Issuer",
+            "Expired",
+            "Self-Signed",
+            "Revocation",
+            "Days before expired",
+            "Hours before expired",
+            "Status",
+        ];
+        if show_grade {
+            header.push("Grade");
+        }
         table
             .set_content_arrangement(ContentArrangement::Dynamic)
             .apply_modifier(UTF8_ROUND_CORNERS)
             .load_preset(UTF8_FULL)
-            .set_header(vec![
-                "Host",
-                "Cipher Suite",
-                "Protocol",
-                "Issuer",
-                "Expired",
-                "Self-Signed",
-                "Revocation",
-                "Days before expired",
-                "Hours before expired",
-                "Status",
-                "Grade",
-            ]);
+            .set_header(header);
 
         for rs in tls {
             let custom_cell: Cell = match rs.certificate.validity_days {
@@ -348,25 +440,7 @@ impl Formatter for SummaryFormat {
                     .set_alignment(CellAlignment::Center),
             };
 
-            let grade_cell = match &rs.grade {
-                Some(grade) => {
-                    let color = match grade.grade.as_str() {
-                        "A+" | "A" => Color::Green,
-                        "B" => Color::Yellow,
-                        "C" | "D" | "F" => Color::Red,
-                        _ => Color::White,
-                    };
-                    Cell::new(&grade.grade)
-                        .add_attribute(Attribute::Bold)
-                        .fg(color)
-                        .set_alignment(CellAlignment::Center)
-                }
-                None => Cell::new("-")
-                    .fg(Color::DarkGrey)
-                    .set_alignment(CellAlignment::Center),
-            };
-
-            table.add_row(vec![
+            let mut row = vec![
                 Cell::new(&rs.certificate.hostname)
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Green),
@@ -385,8 +459,30 @@ impl Formatter for SummaryFormat {
                 Cell::new(rs.certificate.validity_days).set_alignment(CellAlignment::Center),
                 Cell::new(rs.certificate.validity_hours).set_alignment(CellAlignment::Center),
                 custom_cell,
-                grade_cell,
-            ]);
+            ];
+
+            if show_grade {
+                let grade_cell = match &rs.grade {
+                    Some(grade) => {
+                        let color = match grade.grade.as_str() {
+                            "A+" | "A" => Color::Green,
+                            "B" => Color::Yellow,
+                            "C" | "D" | "F" => Color::Red,
+                            _ => Color::White,
+                        };
+                        Cell::new(&grade.grade)
+                            .add_attribute(Attribute::Bold)
+                            .fg(color)
+                            .set_alignment(CellAlignment::Center)
+                    }
+                    None => Cell::new("-")
+                        .fg(Color::DarkGrey)
+                        .set_alignment(CellAlignment::Center),
+                };
+                row.push(grade_cell);
+            }
+
+            table.add_row(row);
         }
         writeln!(output, "{table}").unwrap();
 
@@ -410,6 +506,18 @@ impl Formatter for SummaryFormat {
                         }
                         tlschecker::SecurityWarning::InvalidChainOrder(msg) => {
                             writeln!(output, "    - INVALID CHAIN ORDER: {}", msg).unwrap();
+                        }
+                        tlschecker::SecurityWarning::HostnameMismatch(msg) => {
+                            writeln!(output, "    - HOSTNAME MISMATCH: {}", msg).unwrap();
+                        }
+                        tlschecker::SecurityWarning::ExpiringIntermediate(msg) => {
+                            writeln!(output, "    - EXPIRING INTERMEDIATE: {}", msg).unwrap();
+                        }
+                        tlschecker::SecurityWarning::WeakProtocol(msg) => {
+                            writeln!(output, "    - WEAK PROTOCOL: {}", msg).unwrap();
+                        }
+                        tlschecker::SecurityWarning::WeakCipher(msg) => {
+                            writeln!(output, "    - WEAK CIPHER: {}", msg).unwrap();
                         }
                     }
                 }
@@ -558,18 +666,37 @@ fn main() -> Result<()> {
     let (sender, receiver) = sync_channel(size);
     let hosts_len = hosts_and_ports.len();
     let check_revocation = final_config.check_revocation;
-    let calculate_grade = final_config.grade;
+    let do_scan = cli.scan;
+    // `--scan` implies `--grade`: a scan is only surfaced in the summary table
+    // via the grade, and the grade is most meaningful when it reflects the full
+    // scanned posture, so enable grading whenever scanning.
+    let calculate_grade = should_grade(final_config.grade, do_scan);
 
     thread::spawn(move || {
         for host_port in hosts_and_ports {
             let thread_tx = sender.clone();
             let check_revocation = check_revocation;
             let calculate_grade = calculate_grade;
+            let do_scan = do_scan;
             let handle = thread::spawn(move || {
                 let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
 
-                match TLS::from(&host_port.host, host_port.port, check_revocation, calculate_grade) {
-                    Ok(cert) => {
+                match TLS::from(
+                    &host_port.host,
+                    host_port.port,
+                    check_revocation,
+                    calculate_grade,
+                ) {
+                    Ok(mut cert) => {
+                        if do_scan {
+                            if let Ok(scan) =
+                                tlschecker::probe::scan_tls(&host_port.host, host_port.port)
+                            {
+                                // Fold scan-derived warnings into the result and
+                                // recompute the grade to reflect full posture.
+                                cert.apply_scan(scan);
+                            }
+                        }
                         thread_tx.send(cert).unwrap();
                     }
                     Err(err) => match err {
@@ -641,23 +768,34 @@ fn main() -> Result<()> {
 
     // Check certificates below minimum validity threshold
     if final_config.min_validity > 0 {
-        let below_min_validity = results
-            .iter()
-            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < final_config.min_validity);
+        let below_min_validity = results.iter().any(|c| {
+            !c.certificate.is_expired && c.certificate.validity_days < final_config.min_validity
+        });
         if below_min_validity {
             failed_result = true;
         }
     }
 
-    let formatter = match final_config.output {
-        OutFormat::Json => FormatterFactory::new_formatter(&OutFormat::Json),
-        OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
-        OutFormat::Summary => FormatterFactory::new_formatter(&OutFormat::Summary),
-    };
-    print!("{}", formatter.format(&results));
+    if cli.export_pem {
+        // Print the presented certificate chain(s) as PEM instead of a report.
+        for r in &results {
+            print!("{}", r.certificate.pem);
+        }
+    } else {
+        let formatter = match final_config.output {
+            OutFormat::Json => FormatterFactory::new_formatter(&OutFormat::Json),
+            OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
+            OutFormat::Summary => FormatterFactory::new_formatter(&OutFormat::Summary),
+        };
+        print!("{}", formatter.format(&results));
+    }
 
     if final_config.prometheus {
-        metrics::prom::prometheus_metrics(results, final_config.prometheus_address, final_config.min_validity);
+        metrics::prom::prometheus_metrics(
+            results,
+            final_config.prometheus_address,
+            final_config.min_validity,
+        );
     }
 
     exit(exit_code, failed_result);
@@ -743,6 +881,15 @@ fn exit(exit_code: i32, failed_result: bool) {
     if exit_code != 0 && failed_result {
         std::process::exit(exit_code)
     }
+}
+
+/// Whether a TLS grade should be computed for this run.
+///
+/// Grading is enabled when explicitly requested (`--grade`/config) or whenever a
+/// scan is performed (`--scan` implies `--grade`), since the scan's results are
+/// surfaced through the grade.
+fn should_grade(config_grade: bool, scan: bool) -> bool {
+    config_grade || scan
 }
 
 /// Parses a hostname/address specification that may include a port.
@@ -1114,7 +1261,10 @@ mod tests {
                 cert_sn: "1234567890".to_string(),
                 cert_ver: "2".to_string(),
                 cert_alg: "sha256WithRSAEncryption".to_string(),
-                sans: vec!["test.example.com".to_string(), "www.example.com".to_string()],
+                sans: vec![
+                    "test.example.com".to_string(),
+                    "www.example.com".to_string(),
+                ],
                 chain: Some(vec![tlschecker::Chain {
                     subject: "test.example.com".to_string(),
                     issuer: "Test CA Root".to_string(),
@@ -1127,8 +1277,12 @@ mod tests {
                 security_warnings: vec![],
                 cert_key_bits: 2048,
                 cert_key_algorithm: "RSA".to_string(),
+                cert_sha256: "AB:CD:EF".to_string(),
+                cert_sha1: "12:34:56".to_string(),
+                pem: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n".to_string(),
             },
             grade: None,
+            scan: None,
         }
     }
 
@@ -1217,18 +1371,83 @@ mod tests {
     }
 
     #[test]
+    fn test_text_format_new_warning_variants() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.security_warnings = vec![
+            tlschecker::SecurityWarning::HostnameMismatch("not valid for evil.com".to_string()),
+            tlschecker::SecurityWarning::ExpiringIntermediate("Int CA expires soon".to_string()),
+        ];
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(output.contains("HOSTNAME MISMATCH: not valid for evil.com"));
+        assert!(output.contains("EXPIRING INTERMEDIATE: Int CA expires soon"));
+    }
+
+    #[test]
+    fn test_text_format_includes_fingerprints() {
+        let output = TextFormat.format(&[make_test_tls()]);
+        assert!(output.contains("SHA-256 Fingerprint: AB:CD:EF"));
+        assert!(output.contains("SHA-1 Fingerprint: 12:34:56"));
+    }
+
+    #[test]
+    fn test_text_format_renders_scan() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.scan = Some(tlschecker::probe::TlsScan {
+            protocols: vec![
+                tlschecker::probe::ProtocolSupport {
+                    version: tlschecker::probe::ProtoVersion::Tls1_3,
+                    supported: true,
+                    ciphers: vec!["TLS_AES_256_GCM_SHA384".to_string()],
+                },
+                tlschecker::probe::ProtocolSupport {
+                    version: tlschecker::probe::ProtoVersion::Ssl3,
+                    supported: false,
+                    ciphers: vec![],
+                },
+            ],
+        });
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(output.contains("Supported Protocols & Ciphers:"));
+        assert!(output.contains("TLSv1.3: supported"));
+        assert!(output.contains("- TLS_AES_256_GCM_SHA384"));
+        assert!(output.contains("SSLv3: not supported"));
+    }
+
+    #[test]
+    fn test_json_format_includes_scan_when_present() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.scan = Some(tlschecker::probe::TlsScan {
+            protocols: vec![tlschecker::probe::ProtocolSupport {
+                version: tlschecker::probe::ProtoVersion::Tls1_2,
+                supported: true,
+                ciphers: vec!["ECDHE-RSA-AES256-GCM-SHA384".to_string()],
+            }],
+        });
+        let output = JsonFormat.format(&[tls_entry]);
+        assert!(output.contains("\"scan\""));
+        assert!(output.contains("TLSv1.2"));
+        // fingerprints serialize; pem is skipped.
+        assert!(output.contains("cert_sha256"));
+        assert!(!output.contains("\"pem\""));
+    }
+
+    #[test]
+    fn test_json_format_omits_scan_when_absent() {
+        let output = JsonFormat.format(&[make_test_tls()]);
+        assert!(!output.contains("\"scan\""));
+    }
+
+    #[test]
     fn test_text_format_with_grade() {
         let mut tls_entry = make_test_tls();
         tls_entry.grade = Some(tlschecker::grading::TLSGrade {
             grade: "B".to_string(),
             score: 75,
-            categories: vec![
-                tlschecker::grading::CategoryScore {
-                    category: "Protocol".to_string(),
-                    score: 80,
-                    reason: "TLS 1.2".to_string(),
-                },
-            ],
+            categories: vec![tlschecker::grading::CategoryScore {
+                category: "Protocol".to_string(),
+                score: 80,
+                reason: "TLS 1.2".to_string(),
+            }],
         });
         let output = TextFormat.format(&[tls_entry]);
         assert!(output.contains("TLS Configuration Grade: B (Score: 75/100)"));
@@ -1288,17 +1507,61 @@ mod tests {
         });
         let output = SummaryFormat.format(&[tls_entry]);
         assert!(output.contains("F"));
+        // When a grade is present, the Grade column header is shown.
+        assert!(output.contains("Grade"));
+    }
+
+    #[test]
+    fn test_summary_format_hides_grade_column_when_no_grade() {
+        // Default (ungraded) run: the Grade column should be omitted entirely
+        // rather than rendered as a column of "-".
+        let output = SummaryFormat.format(&[make_test_tls()]); // grade: None
+        assert!(
+            !output.contains("Grade"),
+            "Grade column should be hidden when no result has a grade"
+        );
+    }
+
+    #[test]
+    fn test_summary_format_shows_grade_column_when_any_graded() {
+        // Mixed input: if any host has a grade, the column is shown.
+        let ungraded = make_test_tls();
+        let mut graded = make_test_tls();
+        graded.certificate.hostname = "graded.example.com".to_string();
+        graded.grade = Some(tlschecker::grading::TLSGrade {
+            grade: "A+".to_string(),
+            score: 98,
+            categories: vec![],
+        });
+        let output = SummaryFormat.format(&[ungraded, graded]);
+        assert!(output.contains("Grade"));
+        assert!(output.contains("A+"));
     }
 
     #[test]
     fn test_summary_format_with_security_warnings() {
         let mut tls_entry = make_test_tls();
-        tls_entry.certificate.security_warnings = vec![
-            tlschecker::SecurityWarning::WeakSignatureAlgorithm("SHA1 detected".to_string()),
-        ];
+        tls_entry.certificate.security_warnings =
+            vec![tlschecker::SecurityWarning::WeakSignatureAlgorithm(
+                "SHA1 detected".to_string(),
+            )];
         let output = SummaryFormat.format(&[tls_entry]);
         assert!(output.contains("Security Warnings:"));
         assert!(output.contains("WEAK ALGORITHM: SHA1 detected"));
+    }
+
+    // ── should_grade (scan implies grade) ──────────────────────────
+
+    #[test]
+    fn test_should_grade_scan_implies_grade() {
+        // --scan alone enables grading.
+        assert!(should_grade(false, true));
+        // --grade alone enables grading.
+        assert!(should_grade(true, false));
+        // both.
+        assert!(should_grade(true, true));
+        // neither: no grade.
+        assert!(!should_grade(false, false));
     }
 
     // ── min_validity exit logic tests ──────────────────────────────

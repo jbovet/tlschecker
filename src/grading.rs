@@ -41,6 +41,11 @@ pub struct GradingInput {
     pub is_self_signed: bool,
     pub has_incomplete_chain: bool,
     pub has_weak_signature: bool,
+    pub has_hostname_mismatch: bool,
+    /// Server supports an obsolete protocol (SSLv3 / TLS 1.0), via `--scan`.
+    pub supports_obsolete_protocol: bool,
+    /// Server accepts a weak cipher suite, via `--scan`.
+    pub accepts_weak_cipher: bool,
     pub is_revoked: bool,
 }
 
@@ -138,6 +143,10 @@ fn score_certificate_trust(input: &GradingInput) -> (u8, String) {
         score = score.min(20);
         reasons.push("Self-signed certificate");
     }
+    if input.has_hostname_mismatch {
+        score = score.min(20);
+        reasons.push("Hostname mismatch");
+    }
     if input.has_weak_signature {
         score = score.min(30);
         reasons.push("Weak signature algorithm");
@@ -178,6 +187,9 @@ fn score_to_letter(score: u8) -> String {
 /// - Expired or Revoked cert: score forced to 0 (F)
 /// - SSLv3 or TLS 1.0: score capped at 35 (D max)
 /// - Self-signed cert: score capped at 50 (C max)
+/// - Hostname mismatch: score capped at 50 (C max)
+/// - Supports obsolete protocol (SSLv3/TLS 1.0) or accepts a weak cipher
+///   (from `--scan`): score capped at 50 (C max)
 pub fn calculate_grade(input: &GradingInput) -> TLSGrade {
     let (protocol_score, protocol_reason) = score_protocol(&input.protocol_version);
     let (cipher_score, cipher_reason) = score_cipher_bits(input.cipher_bits);
@@ -231,6 +243,12 @@ pub fn calculate_grade(input: &GradingInput) -> TLSGrade {
     if input.is_self_signed {
         composite = composite.min(50);
     }
+    if input.has_hostname_mismatch {
+        composite = composite.min(50);
+    }
+    if input.supports_obsolete_protocol || input.accepts_weak_cipher {
+        composite = composite.min(50);
+    }
 
     let grade = score_to_letter(composite);
 
@@ -256,6 +274,9 @@ mod tests {
             is_self_signed: false,
             has_incomplete_chain: false,
             has_weak_signature: false,
+            has_hostname_mismatch: false,
+            supports_obsolete_protocol: false,
+            accepts_weak_cipher: false,
             is_revoked: false,
         };
         overrides(&mut input);
@@ -310,6 +331,42 @@ mod tests {
             "Expected C, D, or F for self-signed, got {}",
             grade.grade
         );
+    }
+
+    #[test]
+    fn test_hostname_mismatch_capped_at_c() {
+        let input = make_input(|i| {
+            i.cert_key_bits = 4096;
+            i.has_hostname_mismatch = true;
+        });
+        let grade = calculate_grade(&input);
+        assert!(
+            grade.score <= 50,
+            "Expected score <= 50 for hostname mismatch, got {}",
+            grade.score
+        );
+        assert!(
+            ["C", "D", "F"].contains(&grade.grade.as_str()),
+            "Expected C, D, or F for hostname mismatch, got {}",
+            grade.grade
+        );
+    }
+
+    #[test]
+    fn test_hostname_mismatch_lowers_trust() {
+        let input = make_input(|i| i.has_hostname_mismatch = true);
+        let grade = calculate_grade(&input);
+        let trust = grade
+            .categories
+            .iter()
+            .find(|c| c.category == "Certificate Trust")
+            .unwrap();
+        assert!(
+            trust.score <= 20,
+            "Expected trust score <= 20 for hostname mismatch, got {}",
+            trust.score
+        );
+        assert!(trust.reason.contains("Hostname mismatch"));
     }
 
     #[test]
