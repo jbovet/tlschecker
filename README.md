@@ -122,6 +122,77 @@ A `tlschecker_revocation_status` metric is exported with the following values:
 
 Additionally, a `revoked` label is added to all metrics with a boolean value indicating whether the certificate is revoked.
 
+### Certificate Fingerprints
+
+Every check reports the SHA-256 and SHA-1 fingerprints of the leaf certificate (colon-separated uppercase hex, the same format as browsers and `openssl x509 -fingerprint`). They appear in `text` and `json` output and are useful for certificate pinning and comparison.
+
+### Exporting the Certificate Chain (PEM)
+
+Use `--export-pem` to print the presented certificate chain (leaf first, followed by any intermediates the server sent) as PEM instead of the normal report:
+
+```sh
+➜ tlschecker --export-pem example.com > example.pem
+```
+
+This works for multiple hosts too; each host's chain is printed in sequence.
+
+### TLS Protocol & Cipher Scanning
+
+By default tlschecker reports only the protocol and cipher that were negotiated for a single connection. With `--scan` it actively probes the server to enumerate **every** TLS protocol version (SSLv3 through TLS 1.3) and the cipher suites accepted at each version:
+
+```sh
+➜ tlschecker --scan example.com
+```
+
+Because this performs many short handshakes (one per version/cipher), it is slower than a normal check. Results are included in `text` and `json` output.
+
+`--scan` implies `--grade` (the scan is surfaced through the grade, including in the summary table). Scan results feed the analysis: supporting an obsolete/deprecated protocol or accepting a weak cipher produces security warnings (see below) and lowers the grade. This makes the grade reflect the server's *full* posture rather than only the single negotiated connection (e.g. a server that negotiates TLS 1.3 but still allows TLS 1.0 will no longer score an A).
+
+### Embedded SCTs (offline Certificate Transparency)
+
+Every check also reads the leaf's **embedded Signed Certificate Timestamps** (SCTs) — the signed promises a CA receives when it submits a certificate to Certificate Transparency logs (RFC 6962). Their presence is offline proof that the certificate was submitted to CT, and unlike the `--ct-check` lookup below it needs **no network** and is always on:
+
+```sh
+➜ tlschecker -o text example.com
+...
+Embedded SCTs (Certificate Transparency): 2
+  - log cb38f715897c84a1445f5bc1ddfbc96ef29a59cd470a690585b0cb14c31458e7 at 2026-05-18T19:35:22Z
+  - log d809553b944f7affc816196f944f85abb0f8fc5e8755260f15d12e72bb454b14 at 2026-05-18T19:35:22Z
+```
+
+SCTs appear in `text` and `json` output only when present. They complement `--ct-check`: the lookup confirms *inclusion* against crt.sh, while embedded SCTs prove *submission* and stay available even when crt.sh is unreachable — so a `--ct-check` result of `Unknown` will note any embedded SCTs as offline evidence.
+
+### Certificate Transparency Lookup
+
+Modern browsers reject publicly-trusted certificates that are not logged in [Certificate Transparency](https://certificate.transparency.dev/) logs, and the same logs are what defenders watch for mis-issuance. With `--ct-check`, tlschecker looks the presented leaf up in public CT logs via [crt.sh](https://crt.sh), matched by its SHA-256 fingerprint (an exact, per-certificate lookup):
+
+```sh
+➜ tlschecker --ct-check example.com
+```
+
+This performs a network request to an external service (crt.sh), so it is opt-in and adds latency. The result is **tri-state**, like revocation status:
+
+- **Logged** — the exact certificate was found in CT. The `text`/`json` output include a direct `crt.sh` link; the summary table shows `✓`.
+- **Not logged** — definitively absent from CT. Reported as a security warning (see below) and shown as `✗` in the summary. A publicly-trusted certificate that is not logged will be rejected by modern browsers.
+- **Unknown** — crt.sh was unreachable or rate-limited, so the status could not be determined (`?` in the summary). This is kept distinct from "not logged" so an outage is never mistaken for a problem; the reason is logged to **stderr** (stdout stays clean for `… -o json | jq`).
+
+When `--ct-check` is used, the summary table gains a `CT` column (`✓`/`✗`/`?`); without it the column is hidden. Being absent from CT does **not** affect the grade — many legitimate internal/private certificates are intentionally absent from public CT logs, so what that means is left to you rather than the grade.
+
+### Security Warnings
+
+In addition to revocation and grading, tlschecker surfaces certificate problems as security warnings in all output formats:
+
+- **Weak signature algorithm** — the certificate or a chain certificate is signed with SHA-1 or MD5
+- **Incomplete chain** — the certificate's issuer was not found in the presented chain
+- **Invalid chain order** — the chain is not in issuer order (each certificate should be followed by the one that issued it)
+- **Hostname mismatch** — the certificate is not valid for the hostname you checked (no matching SAN, with wildcard support, or Common Name)
+- **Expiring intermediate** — an intermediate certificate in the chain has expired or expires within 30 days
+- **Weak protocol** (`--scan`) — the server still supports an obsolete (SSLv3) or deprecated (TLS 1.0/1.1) protocol version
+- **Weak cipher** (`--scan`) — the server accepts a weak cipher suite (RC4, DES/3DES, NULL, EXPORT, anonymous, ...)
+- **Not in CT log** (`--ct-check`) — the presented certificate was not found in any public Certificate Transparency log
+
+A hostname mismatch, support for an obsolete protocol (SSLv3/TLS 1.0), or acceptance of a weak cipher each cap the TLS grade at C, the same as a self-signed certificate.
+
 ### Troubleshooting Connection Issues
 
 If you encounter connection problems, here are some common error messages and solutions:
