@@ -787,18 +787,17 @@ fn main() -> Result<()> {
                         // is non-fatal: the reason is logged to stderr and the
                         // result is recorded as `Unknown` rather than dropped,
                         // so "could not check" is never mistaken for "absent".
-                        let ct = match tlschecker::ct::check_ct_status(
-                            &cert.certificate.cert_sha256,
-                        ) {
-                            Ok(ct) => ct,
-                            Err(e) => {
-                                warn!(
-                                    "CT lookup could not be completed for {}{}: {}",
-                                    host_port.host, port_display, e
-                                );
-                                tlschecker::ct::CtStatus::Unknown
-                            }
-                        };
+                        let ct =
+                            match tlschecker::ct::check_ct_status(&cert.certificate.cert_sha256) {
+                                Ok(ct) => ct,
+                                Err(e) => {
+                                    warn!(
+                                        "CT lookup could not be completed for {}{}: {}",
+                                        host_port.host, port_display, e
+                                    );
+                                    tlschecker::ct::CtStatus::Unknown
+                                }
+                            };
                         cert.apply_ct(ct);
                     }
                     Some(cert)
