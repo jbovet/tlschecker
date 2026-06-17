@@ -1,4 +1,3 @@
-use std::sync::mpsc::sync_channel;
 use std::thread;
 mod config;
 mod metrics;
@@ -751,8 +750,6 @@ fn main() -> Result<()> {
         .map(|address| parse_host_port(address))
         .collect();
 
-    let size = hosts_and_ports.len();
-    let (sender, receiver) = sync_channel(size);
     let hosts_len = hosts_and_ports.len();
     let check_revocation = final_config.check_revocation;
     let do_scan = cli.scan;
@@ -762,55 +759,52 @@ fn main() -> Result<()> {
     // scanned posture, so enable grading whenever scanning.
     let calculate_grade = should_grade(final_config.grade, do_scan);
 
-    thread::spawn(move || {
-        for host_port in hosts_and_ports {
-            let thread_tx = sender.clone();
-            let check_revocation = check_revocation;
-            let calculate_grade = calculate_grade;
-            let do_scan = do_scan;
-            let do_ct = do_ct;
-            let handle = thread::spawn(move || {
-                let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
+    let mut handles = Vec::new();
 
-                match TLS::from(
-                    &host_port.host,
-                    host_port.port,
-                    check_revocation,
-                    calculate_grade,
-                ) {
-                    Ok(mut cert) => {
-                        if do_scan {
-                            if let Ok(scan) =
-                                tlschecker::probe::scan_tls(&host_port.host, host_port.port)
-                            {
-                                // Fold scan-derived warnings into the result and
-                                // recompute the grade to reflect full posture.
-                                cert.apply_scan(scan);
-                            }
+    for host_port in hosts_and_ports {
+        let handle = thread::spawn(move || {
+            let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
+
+            match TLS::from(
+                &host_port.host,
+                host_port.port,
+                check_revocation,
+                calculate_grade,
+            ) {
+                Ok(mut cert) => {
+                    if do_scan {
+                        if let Ok(scan) =
+                            tlschecker::probe::scan_tls(&host_port.host, host_port.port)
+                        {
+                            // Fold scan-derived warnings into the result and
+                            // recompute the grade to reflect full posture.
+                            cert.apply_scan(scan);
                         }
-                        if do_ct {
-                            // Look the leaf up in public CT logs (crt.sh, by
-                            // SHA-256 fingerprint). A failed/inconclusive lookup
-                            // is non-fatal: the reason is logged to stderr and the
-                            // result is recorded as `Unknown` rather than dropped,
-                            // so "could not check" is never mistaken for "absent".
-                            let ct = match tlschecker::ct::check_ct_status(
-                                &cert.certificate.cert_sha256,
-                            ) {
-                                Ok(ct) => ct,
-                                Err(e) => {
-                                    warn!(
-                                        "CT lookup could not be completed for {}{}: {}",
-                                        host_port.host, port_display, e
-                                    );
-                                    tlschecker::ct::CtStatus::Unknown
-                                }
-                            };
-                            cert.apply_ct(ct);
-                        }
-                        thread_tx.send(cert).unwrap();
                     }
-                    Err(err) => match err {
+                    if do_ct {
+                        // Look the leaf up in public CT logs (crt.sh, by
+                        // SHA-256 fingerprint). A failed/inconclusive lookup
+                        // is non-fatal: the reason is logged to stderr and the
+                        // result is recorded as `Unknown` rather than dropped,
+                        // so "could not check" is never mistaken for "absent".
+                        let ct = match tlschecker::ct::check_ct_status(
+                            &cert.certificate.cert_sha256,
+                        ) {
+                            Ok(ct) => ct,
+                            Err(e) => {
+                                warn!(
+                                    "CT lookup could not be completed for {}{}: {}",
+                                    host_port.host, port_display, e
+                                );
+                                tlschecker::ct::CtStatus::Unknown
+                            }
+                        };
+                        cert.apply_ct(ct);
+                    }
+                    Some(cert)
+                }
+                Err(err) => {
+                    match err {
                         TLSError::DNS(msg) => {
                             error!(
                                 "Cannot resolve hostname: {}{}",
@@ -843,17 +837,24 @@ fn main() -> Result<()> {
                             error!("Failed to check host: {}{}", host_port.host, port_display);
                             error!("  - {}", err);
                         }
-                    },
+                    }
+                    None
                 }
-            });
-            handle.join().unwrap();
-        }
-    });
+            }
+        });
+        handles.push(handle);
+    }
 
     let mut results: Vec<TLS> = Vec::with_capacity(hosts_len);
 
-    for tls_result in receiver {
-        results.push(tls_result);
+    for handle in handles {
+        match handle.join() {
+            Ok(Some(tls_result)) => results.push(tls_result),
+            Ok(None) => {} // Error already logged inside the thread
+            Err(panic_err) => {
+                error!("A worker thread panicked unexpectedly: {:?}", panic_err);
+            }
+        }
     }
 
     let expired_certs = &results

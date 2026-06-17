@@ -314,7 +314,7 @@ pub fn analyze_certificate_chain(cert: &X509, chain: &[X509]) -> Vec<SecurityWar
                 .subject_name()
                 .entries_by_nid(Nid::COMMONNAME)
                 .next()
-                .and_then(|e| e.data().as_utf8().ok().map(|s| s.to_string()))
+                .and_then(|e| e.data().to_string().ok())
                 .unwrap_or_else(|| "Unknown".to_string());
             warnings.push(SecurityWarning::WeakSignatureAlgorithm(format!(
                 "Chain certificate '{}' uses weak signature algorithm: {}",
@@ -364,7 +364,7 @@ pub fn analyze_certificate_chain(cert: &X509, chain: &[X509]) -> Vec<SecurityWar
             .subject_name()
             .entries_by_nid(Nid::COMMONNAME)
             .next()
-            .and_then(|e| e.data().as_utf8().ok().map(|s| s.to_string()))
+            .and_then(|e| e.data().to_string().ok())
             .unwrap_or_else(|| "Unknown".to_string());
 
         if has_expired(chain_cert.not_after()) {
@@ -1191,9 +1191,8 @@ fn from_entries(mut entries: X509NameEntries) -> String {
         None => "None".to_string(),
         Some(x509_name_ref) => x509_name_ref
             .data()
-            .as_utf8()
-            .expect("Failed to convert data to UTF-8")
-            .to_string(),
+            .to_string()
+            .expect("Failed to convert data to UTF-8"),
     }
 }
 
