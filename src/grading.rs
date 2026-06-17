@@ -176,6 +176,20 @@ fn score_to_letter(score: u8) -> String {
     }
 }
 
+/// Ceiling applied when the *negotiated* protocol is TLS 1.0 or SSLv3.
+///
+/// Set to the top of the D band in [`score_to_letter`] so the cap means
+/// "D at best" — keep this in lockstep with that band if it ever changes.
+const CAP_NEGOTIATED_OBSOLETE_PROTOCOL: u8 = 54; // D max
+
+/// Ceiling applied for trust problems (self-signed, hostname mismatch) and for
+/// scan-/negotiation-discovered weaknesses (obsolete protocol support, weak
+/// cipher).
+///
+/// Set to the top of the C band in [`score_to_letter`] so the cap means
+/// "C at best" — keep this in lockstep with that band if it ever changes.
+const CAP_TRUST_OR_WEAKNESS: u8 = 69; // C max
+
 /// Calculate the composite TLS configuration grade.
 ///
 /// Uses a weighted average of five category scores with hard caps
@@ -185,11 +199,11 @@ fn score_to_letter(score: u8) -> String {
 ///
 /// **Hard caps:**
 /// - Expired or Revoked cert: score forced to 0 (F)
-/// - SSLv3 or TLS 1.0: score capped at 35 (D max)
-/// - Self-signed cert: score capped at 50 (C max)
-/// - Hostname mismatch: score capped at 50 (C max)
-/// - Supports obsolete protocol (SSLv3/TLS 1.0) or accepts a weak cipher
-///   (from `--scan`): score capped at 50 (C max)
+/// - SSLv3 or TLS 1.0 negotiated: score capped at 54 (D max)
+/// - Self-signed cert: score capped at 69 (C max)
+/// - Hostname mismatch: score capped at 69 (C max)
+/// - Accepts a weak cipher (negotiated, or discovered via `--scan`) or supports
+///   an obsolete protocol (SSLv3/TLS 1.0, via `--scan`): score capped at 69 (C max)
 pub fn calculate_grade(input: &GradingInput) -> TLSGrade {
     let (protocol_score, protocol_reason) = score_protocol(&input.protocol_version);
     let (cipher_score, cipher_reason) = score_cipher_bits(input.cipher_bits);
@@ -238,16 +252,16 @@ pub fn calculate_grade(input: &GradingInput) -> TLSGrade {
         composite = 0;
     }
     if protocol_score <= 20 {
-        composite = composite.min(35);
+        composite = composite.min(CAP_NEGOTIATED_OBSOLETE_PROTOCOL);
     }
     if input.is_self_signed {
-        composite = composite.min(50);
+        composite = composite.min(CAP_TRUST_OR_WEAKNESS);
     }
     if input.has_hostname_mismatch {
-        composite = composite.min(50);
+        composite = composite.min(CAP_TRUST_OR_WEAKNESS);
     }
     if input.supports_obsolete_protocol || input.accepts_weak_cipher {
-        composite = composite.min(50);
+        composite = composite.min(CAP_TRUST_OR_WEAKNESS);
     }
 
     let grade = score_to_letter(composite);
@@ -325,7 +339,7 @@ mod tests {
     fn test_self_signed_capped_at_c() {
         let input = make_input(|i| i.is_self_signed = true);
         let grade = calculate_grade(&input);
-        assert!(grade.score <= 50);
+        assert!(grade.score <= 69);
         assert!(
             ["C", "D", "F"].contains(&grade.grade.as_str()),
             "Expected C, D, or F for self-signed, got {}",
@@ -341,8 +355,8 @@ mod tests {
         });
         let grade = calculate_grade(&input);
         assert!(
-            grade.score <= 50,
-            "Expected score <= 50 for hostname mismatch, got {}",
+            grade.score <= 69,
+            "Expected score <= 69 for hostname mismatch, got {}",
             grade.score
         );
         assert!(
@@ -405,8 +419,8 @@ mod tests {
         });
         let grade = calculate_grade(&input);
         assert!(
-            grade.score <= 35,
-            "Expected score <= 35 for TLS 1.0, got {}",
+            grade.score <= 54,
+            "Expected score <= 54 (D max) for TLS 1.0, got {}",
             grade.score
         );
         assert!(
@@ -646,7 +660,7 @@ mod tests {
             i.is_self_signed = true;
         });
         let grade = calculate_grade(&input);
-        assert!(grade.score <= 50);
+        assert!(grade.score <= 69);
         assert!(
             ["C", "D", "F"].contains(&grade.grade.as_str()),
             "Expected C or worse for self-signed, got {}",
@@ -676,8 +690,54 @@ mod tests {
         });
         let grade = calculate_grade(&input);
         assert!(
-            grade.score <= 35,
-            "SSLv3 should be capped at D, got score {}",
+            grade.score <= 54,
+            "SSLv3 should be capped at D (<= 54), got score {}",
+            grade.score
+        );
+    }
+
+    #[test]
+    fn test_self_signed_ceiling_is_exactly_c() {
+        // Otherwise-perfect config + self-signed should land at the top of the
+        // C band (the documented "C max" ceiling), not D or below.
+        let input = make_input(|i| {
+            i.cert_key_bits = 4096;
+            i.is_self_signed = true;
+        });
+        let grade = calculate_grade(&input);
+        assert_eq!(grade.grade, "C", "self-signed ceiling should be C");
+        assert_eq!(grade.score, 69);
+    }
+
+    #[test]
+    fn test_tls10_ceiling_is_exactly_d() {
+        // Otherwise-strong config negotiating TLS 1.0 should land at the top of
+        // the D band (the documented "D max" ceiling).
+        let input = make_input(|i| {
+            i.cert_key_bits = 4096;
+            i.protocol_version = "TLSv1".into();
+            i.cipher_name = "ECDHE-RSA-AES256-SHA".into();
+            i.cipher_bits = 256;
+        });
+        let grade = calculate_grade(&input);
+        assert_eq!(grade.grade, "D", "TLS 1.0 ceiling should be D");
+        assert_eq!(grade.score, 54);
+    }
+
+    #[test]
+    fn test_negotiated_weak_cipher_caps_without_scan() {
+        // A weak negotiated cipher (no --scan) must trip the weak-cipher cap via
+        // GradingInput.accepts_weak_cipher, capping the composite at C.
+        let input = make_input(|i| {
+            i.protocol_version = "TLSv1.2".into();
+            i.cipher_name = "RC4-SHA".into();
+            i.cipher_bits = 128;
+            i.accepts_weak_cipher = true; // mirrors build_grading_input's name check
+        });
+        let grade = calculate_grade(&input);
+        assert!(
+            grade.score <= 69,
+            "negotiated weak cipher should cap at C (69), got {}",
             grade.score
         );
     }
