@@ -647,7 +647,12 @@ fn build_grading_input(
         has_weak_signature: has(|w| matches!(w, SecurityWarning::WeakSignatureAlgorithm(_))),
         has_hostname_mismatch: has(|w| matches!(w, SecurityWarning::HostnameMismatch(_))),
         supports_obsolete_protocol: scan.map(scan_supports_obsolete_protocol).unwrap_or(false),
-        accepts_weak_cipher: scan.map(scan_accepts_weak_cipher).unwrap_or(false),
+        // Penalise a weak cipher even without `--scan`: the negotiated cipher
+        // name alone (e.g. RC4/3DES/NULL) is enough to cap the grade. The scan,
+        // when present, additionally surfaces weak ciphers the server merely
+        // *accepts* beyond the one negotiated here.
+        accepts_weak_cipher: is_weak_cipher(&cipher.name)
+            || scan.map(scan_accepts_weak_cipher).unwrap_or(false),
         is_revoked: matches!(certificate.revocation_status, RevocationStatus::Revoked(_)),
     }
 }
@@ -2632,7 +2637,7 @@ mod tests {
 
         let scan = crate::probe::TlsScan {
             protocols: vec![
-                proto(ProtoVersion::Ssl3, true, &[]), // obsolete -> cap at 50
+                proto(ProtoVersion::Ssl3, true, &[]), // obsolete -> cap at C (69)
                 proto(ProtoVersion::Tls1_2, true, &["ECDHE-RSA-AES256-GCM-SHA384"]),
             ],
         };
@@ -2647,8 +2652,8 @@ mod tests {
             "expected a WeakProtocol warning after apply_scan"
         );
         assert!(
-            tls.grade.as_ref().unwrap().score <= 50,
-            "expected grade capped at 50, got {}",
+            tls.grade.as_ref().unwrap().score <= 69,
+            "expected grade capped at C (69), got {}",
             tls.grade.as_ref().unwrap().score
         );
     }
@@ -2665,8 +2670,8 @@ mod tests {
         };
         tls.apply_scan(scan);
         assert!(
-            tls.grade.as_ref().unwrap().score <= 50,
-            "weak cipher should cap grade at 50, got {}",
+            tls.grade.as_ref().unwrap().score <= 69,
+            "weak cipher should cap grade at C (69), got {}",
             tls.grade.as_ref().unwrap().score
         );
         assert!(tls
@@ -2674,6 +2679,34 @@ mod tests {
             .security_warnings
             .iter()
             .any(|w| matches!(w, SecurityWarning::WeakCipher(_))));
+    }
+
+    #[test]
+    fn test_build_grading_input_flags_negotiated_weak_cipher_without_scan() {
+        // Finding 2: the negotiated cipher name alone must set accepts_weak_cipher
+        // (no scan), so a server negotiating RC4 can't slip through with a high
+        // grade when `--scan` is not used.
+        let mut tls = make_test_tls();
+        tls.cipher.name = "RC4-SHA".to_string();
+        tls.cipher.version = "TLSv1.2".to_string();
+        tls.cipher.bits = 128;
+
+        let input = crate::build_grading_input(&tls.cipher, &tls.certificate, None);
+        assert!(
+            input.accepts_weak_cipher,
+            "negotiated RC4 should flag accepts_weak_cipher even without a scan"
+        );
+
+        let grade = grading::calculate_grade(&input);
+        assert!(
+            grade.score <= 69,
+            "negotiated weak cipher should cap the grade at C (69), got {}",
+            grade.score
+        );
+
+        // A strong negotiated cipher must NOT trip the flag.
+        let strong = crate::build_grading_input(&make_test_tls().cipher, &tls.certificate, None);
+        assert!(!strong.accepts_weak_cipher);
     }
 
     #[test]
