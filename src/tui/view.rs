@@ -11,7 +11,7 @@ use ratatui::Frame;
 
 use tlschecker::TLS;
 
-use super::state::{verdict, App, Verdict};
+use super::state::{verdict, App, Screen, Verdict};
 use crate::{warning_label, HostOutcome};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
@@ -34,6 +34,14 @@ fn verdict_symbol(verdict: Verdict) -> &'static str {
 
 /// Renders the whole dashboard.
 pub fn draw(frame: &mut Frame, app: &App) {
+    match app.screen {
+        Screen::Fleet => draw_fleet(frame, app),
+        Screen::Detail => draw_explorer(frame, app),
+    }
+}
+
+/// Fleet overview: host list + compact detail pane.
+fn draw_fleet(frame: &mut Frame, app: &App) {
     let [header, main, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(5),
@@ -49,7 +57,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_detail(frame, app, right);
 
     frame.render_widget(
-        Line::from(" j/k move · g/G first/last · q quit").style(DIM),
+        Line::from(" j/k move · ⏎ explore · g/G first/last · q quit").style(DIM),
         footer,
     );
 }
@@ -308,6 +316,233 @@ fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
     }
 }
 
+/// Section heading for the explorer.
+fn section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("── {} ", title),
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// Key/value line for the explorer ("None" values are dimmed).
+fn kv(key: &str, value: impl Into<String>) -> Line<'static> {
+    let value = value.into();
+    let value_style = if value == "None" || value.is_empty() {
+        DIM
+    } else {
+        Style::new()
+    };
+    Line::from(vec![
+        Span::styled(format!("  {:<22}", key), DIM),
+        Span::styled(value, value_style),
+    ])
+}
+
+/// Builds the full certificate report shown by the explorer.
+///
+/// Pure content: rendering applies the scroll offset, so this is also the
+/// source of truth for the maximum scroll position (`detail_line_count`).
+fn detail_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match app.slots.get(app.selected).and_then(|s| s.as_ref()) {
+        None => lines.push(Line::from(Span::styled("⋯ checking…", DIM))),
+        Some(HostOutcome::Failed { kind, detail }) => {
+            lines.push(Line::from(Span::styled(
+                format!("✗ Could not check ({})", kind),
+                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::default());
+            lines.push(Line::from(detail.clone()));
+        }
+        Some(HostOutcome::Checked(tls)) => {
+            let cert = &tls.certificate;
+            let v = verdict(tls);
+            let color = verdict_color(v);
+
+            let mut headline = vec![Span::styled(
+                format!("{} {:?}", verdict_symbol(v), v),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            )];
+            if let Some(grade) = &tls.grade {
+                headline.push(Span::styled(
+                    format!("  ·  Grade {} ({}/100)", grade.grade, grade.score),
+                    Style::new().fg(color).add_modifier(Modifier::BOLD),
+                ));
+            }
+            lines.push(Line::from(headline));
+
+            lines.push(section("Subject"));
+            lines.push(kv("Common Name", cert.subject.common_name.clone()));
+            lines.push(kv("Organization", cert.subject.organization.clone()));
+            lines.push(kv("Org. Unit", cert.subject.organization_unit.clone()));
+            lines.push(kv("Locality", cert.subject.locality.clone()));
+            lines.push(kv("State/Province", cert.subject.state_or_province.clone()));
+            lines.push(kv("Country", cert.subject.country_or_region.clone()));
+
+            lines.push(section("Issuer"));
+            lines.push(kv("Common Name", cert.issued.common_name.clone()));
+            lines.push(kv("Organization", cert.issued.organization.clone()));
+            lines.push(kv("Country", cert.issued.country_or_region.clone()));
+
+            lines.push(section("Validity"));
+            lines.push(kv("Not Before", cert.valid_from.clone()));
+            lines.push(kv("Not After", cert.valid_to.clone()));
+            lines.push(kv(
+                "Remaining",
+                if cert.is_expired {
+                    format!("expired {}d ago", -cert.validity_days)
+                } else {
+                    format!("{}d ({}h)", cert.validity_days, cert.validity_hours)
+                },
+            ));
+            lines.push(kv("Self-signed", if cert.is_self_signed { "yes" } else { "no" }));
+            lines.push(kv("Revocation", format!("{:?}", cert.revocation_status)));
+            if let Some(ct) = &tls.ct {
+                lines.push(kv(
+                    "CT (crt.sh)",
+                    match ct {
+                        tlschecker::ct::CtStatus::Logged { crtsh_url, .. } => {
+                            format!("logged · {}", crtsh_url)
+                        }
+                        tlschecker::ct::CtStatus::NotLogged => "not logged".to_string(),
+                        tlschecker::ct::CtStatus::Unknown => "unknown".to_string(),
+                    },
+                ));
+            }
+
+            lines.push(section("Certificate"));
+            lines.push(kv("Serial Number", cert.cert_sn.clone()));
+            lines.push(kv("Version", cert.cert_ver.clone()));
+            lines.push(kv("Signature Alg.", cert.cert_alg.clone()));
+            lines.push(kv(
+                "Public Key",
+                format!("{} {}-bit", cert.cert_key_algorithm, cert.cert_key_bits),
+            ));
+            lines.push(kv("SHA-256", cert.cert_sha256.clone()));
+            lines.push(kv("SHA-1", cert.cert_sha1.clone()));
+
+            lines.push(section("Connection"));
+            lines.push(kv("Protocol", tls.cipher.version.clone()));
+            lines.push(kv(
+                "Cipher Suite",
+                format!("{} ({}-bit)", tls.cipher.name, tls.cipher.bits),
+            ));
+
+            lines.push(section(&format!(
+                "Subject Alternative Names ({})",
+                cert.sans.len()
+            )));
+            for san in &cert.sans {
+                lines.push(kv("DNS", san.clone()));
+            }
+
+            if !cert.scts.is_empty() {
+                lines.push(section(&format!("Embedded SCTs ({})", cert.scts.len())));
+                for sct in &cert.scts {
+                    lines.push(kv("Log", format!("{} at {}", sct.log_id, sct.timestamp)));
+                }
+            }
+
+            if let Some(chain) = &cert.chain {
+                lines.push(section(&format!("Certificate Chain ({})", chain.len())));
+                for (i, link) in chain.iter().enumerate() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  #{} {}", i + 1, link.subject),
+                        Style::new().add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(kv("  Issuer", link.issuer.clone()));
+                    lines.push(kv("  Valid", format!("{} → {}", link.valid_from, link.valid_to)));
+                    lines.push(kv("  Signature", link.signature_algorithm.clone()));
+                }
+            }
+
+            if let Some(grade) = &tls.grade {
+                lines.push(section("Grade Breakdown"));
+                for cat in &grade.categories {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {:<22}", cat.category), DIM),
+                        Span::styled(
+                            format!("{:>3}  ", cat.score),
+                            Style::new().fg(score_color(cat.score)),
+                        ),
+                        Span::raw(cat.reason.clone()),
+                    ]));
+                }
+            }
+
+            if let Some(scan) = &tls.scan {
+                lines.push(section("Protocol & Cipher Scan"));
+                for proto in &scan.protocols {
+                    if proto.supported {
+                        lines.push(kv(proto.version.label(), "supported"));
+                        for cipher in &proto.ciphers {
+                            lines.push(Line::from(Span::raw(format!("      · {}", cipher))));
+                        }
+                    } else {
+                        lines.push(kv(proto.version.label(), "not supported".to_string()));
+                    }
+                }
+            }
+
+            if !cert.security_warnings.is_empty() {
+                lines.push(section(&format!(
+                    "Warnings ({})",
+                    cert.security_warnings.len()
+                )));
+                for warning in &cert.security_warnings {
+                    let (kind, msg) = warning_label(warning);
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  ⚠ {}: ", kind), Style::new().fg(Color::Yellow)),
+                        Span::raw(msg.to_string()),
+                    ]));
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// Number of lines in the explorer's content — the scroll clamp bound.
+pub fn detail_line_count(app: &App) -> usize {
+    detail_lines(app).len()
+}
+
+/// Full-screen certificate explorer for the selected host.
+fn draw_explorer(frame: &mut Frame, app: &App) {
+    let [main, footer] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+
+    let label = app.labels.get(app.selected).cloned().unwrap_or_default();
+    let lines = detail_lines(app);
+    let total = lines.len();
+    let visible = main.height.saturating_sub(2) as usize; // minus borders
+    let position = if total > visible {
+        format!(
+            " {}–{}/{} ",
+            app.detail_scroll + 1,
+            (app.detail_scroll + visible).min(total),
+            total
+        )
+    } else {
+        String::new()
+    };
+
+    let block = Block::bordered()
+        .title(format!(" {} — certificate ", label))
+        .title(Line::from(position).style(DIM).right_aligned());
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((app.detail_scroll as u16, 0))
+            .block(block),
+        main,
+    );
+
+    frame.render_widget(
+        Line::from(" j/k scroll · g/G top/bottom · esc back · q quit").style(DIM),
+        footer,
+    );
+}
+
 fn score_color(score: u8) -> Color {
     match score {
         80..=100 => Color::Green,
@@ -323,13 +558,19 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    /// Renders the app into a test buffer and returns its text content.
-    fn render(app: &App) -> String {
-        let backend = TestBackend::new(110, 32);
+    /// Renders the app into a test buffer of the given size and returns its
+    /// text content.
+    fn render_sized(app: &App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    /// Renders the app at the default test size.
+    fn render(app: &App) -> String {
+        render_sized(app, 110, 32)
     }
 
     fn app_with(outcomes: Vec<(usize, HostOutcome)>, labels: &[&str]) -> App {
@@ -395,6 +636,79 @@ mod tests {
         assert!(content.contains("Could not check (DNS)"));
         assert!(content.contains("no such host"));
         assert!(content.contains("1 failed"));
+    }
+
+    #[test]
+    fn test_explorer_shows_full_certificate_report() {
+        let mut tls = make_test_tls();
+        tls.scan = Some(tlschecker::probe::TlsScan {
+            protocols: vec![tlschecker::probe::ProtocolSupport {
+                version: tlschecker::probe::ProtoVersion::Tls1_3,
+                supported: true,
+                ciphers: vec!["TLS_AES_256_GCM_SHA384".to_string()],
+            }],
+        });
+        let mut app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(tls)))],
+            &["test.example.com"],
+        );
+        app.open_detail();
+
+        // Tall enough to show the whole report without scrolling.
+        let content = render_sized(&app, 110, 70);
+        // Sections
+        for heading in [
+            "Subject",
+            "Issuer",
+            "Validity",
+            "Certificate",
+            "Connection",
+            "Subject Alternative Names (2)",
+            "Certificate Chain (1)",
+            "Protocol & Cipher Scan",
+        ] {
+            assert!(content.contains(heading), "missing section {heading:?}");
+        }
+        // Facts from make_test_tls
+        assert!(content.contains("San Francisco")); // subject locality
+        assert!(content.contains("1234567890")); // serial number
+        assert!(content.contains("www.example.com")); // SAN entry
+        assert!(content.contains("Test CA Root")); // chain issuer
+        assert!(content.contains("esc back")); // explorer footer
+    }
+
+    #[test]
+    fn test_explorer_scroll_moves_content() {
+        let mut app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(make_test_tls())))],
+            &["test.example.com"],
+        );
+        app.open_detail();
+        let top = render(&app);
+        assert!(top.contains("Common Name"));
+
+        let max = detail_line_count(&app).saturating_sub(1);
+        app.scroll_down(1000, max); // clamped to the last line
+        let bottom = render(&app);
+        assert!(!bottom.contains("Common Name"), "top content still visible");
+    }
+
+    #[test]
+    fn test_explorer_failed_host() {
+        let mut app = app_with(
+            vec![(
+                0,
+                HostOutcome::Failed {
+                    kind: "DNS",
+                    detail: "no such host".to_string(),
+                },
+            )],
+            &["nope.invalid"],
+        );
+        app.open_detail();
+        let content = render(&app);
+        assert!(content.contains("Could not check (DNS)"));
+        assert!(content.contains("no such host"));
     }
 
     #[test]

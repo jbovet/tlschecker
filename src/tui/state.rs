@@ -40,6 +40,15 @@ pub fn verdict(tls: &TLS) -> Verdict {
     }
 }
 
+/// Which screen the dashboard is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    /// The fleet overview: host list + compact detail pane.
+    Fleet,
+    /// Full-screen certificate explorer for the selected host.
+    Detail,
+}
+
 /// Live dashboard state: one slot per host (input order), plus the selection.
 pub struct App {
     /// Host labels exactly as the user supplied them.
@@ -48,6 +57,10 @@ pub struct App {
     pub slots: Vec<Option<HostOutcome>>,
     /// Index of the currently selected host row.
     pub selected: usize,
+    /// Current screen.
+    pub screen: Screen,
+    /// Scroll offset (in lines) of the full-screen detail explorer.
+    pub detail_scroll: usize,
 }
 
 /// Tally of hosts per state, shown under the host list.
@@ -66,7 +79,31 @@ impl App {
             labels: labels.to_vec(),
             slots: labels.iter().map(|_| None).collect(),
             selected: 0,
+            screen: Screen::Fleet,
+            detail_scroll: 0,
         }
+    }
+
+    /// Opens the full-screen certificate explorer for the selected host.
+    pub fn open_detail(&mut self) {
+        self.screen = Screen::Detail;
+        self.detail_scroll = 0;
+    }
+
+    /// Returns from the explorer to the fleet view.
+    pub fn close_detail(&mut self) {
+        self.screen = Screen::Fleet;
+        self.detail_scroll = 0;
+    }
+
+    /// Scrolls the explorer down, clamped to `max` (the last valid offset).
+    pub fn scroll_down(&mut self, lines: usize, max: usize) {
+        self.detail_scroll = (self.detail_scroll + lines).min(max);
+    }
+
+    /// Scrolls the explorer up.
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.detail_scroll = self.detail_scroll.saturating_sub(lines);
     }
 
     /// Records a completed check for the host at `index`.

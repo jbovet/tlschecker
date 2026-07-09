@@ -52,6 +52,12 @@ tally on the left and a detail pane (expiry lifetime gauge, TLS grade
 breakdown, security warnings) for the selected host on the right. Navigate
 with `j`/`k` (or arrow keys), jump with `g`/`G`, quit with `q`.
 
+Press `Enter` on a host to open the full certificate explorer: subject and
+issuer details, validity dates, serial number and fingerprints, SANs, the
+presented chain, embedded SCTs, the grade breakdown with reasons, and scan
+results when `--scan` was used. Scroll with `j`/`k` or `PgUp`/`PgDn`, and
+return with `Esc`.
+
 The classic text outputs are used automatically whenever stdout is piped or
 redirected, and can always be forced with `-o summary|json|text` — so
 scripts, CI pipelines, and `tlschecker -o json | jq` behave exactly as

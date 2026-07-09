@@ -20,7 +20,7 @@ use std::time::Duration;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::HostOutcome;
-use state::App;
+use state::{App, Screen};
 
 /// How long to wait for input before checking the result channel again.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -62,27 +62,51 @@ pub fn run(
             continue;
         }
         match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Char('j') | KeyCode::Down => {
-                    app.select_next();
-                    dirty = true;
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // The last scroll offset that still shows a full page (loose
+                // clamp: at least one line remains visible).
+                let scroll_max = {
+                    let page = terminal.size().map(|s| s.height as usize).unwrap_or(24);
+                    view::detail_line_count(&app).saturating_sub(page.saturating_sub(3))
+                };
+                dirty = true;
+                match (app.screen, key.code) {
+                    // Quit from anywhere; Esc only quits from the fleet view.
+                    (_, KeyCode::Char('c'))
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        break
+                    }
+                    (_, KeyCode::Char('q')) | (Screen::Fleet, KeyCode::Esc) => break,
+
+                    // Fleet: move selection, open the explorer.
+                    (Screen::Fleet, KeyCode::Char('j') | KeyCode::Down) => app.select_next(),
+                    (Screen::Fleet, KeyCode::Char('k') | KeyCode::Up) => app.select_prev(),
+                    (Screen::Fleet, KeyCode::Char('g') | KeyCode::Home) => app.select_first(),
+                    (Screen::Fleet, KeyCode::Char('G') | KeyCode::End) => app.select_last(),
+                    (Screen::Fleet, KeyCode::Enter) => app.open_detail(),
+
+                    // Explorer: scroll, page, and go back.
+                    (Screen::Detail, KeyCode::Char('j') | KeyCode::Down) => {
+                        app.scroll_down(1, scroll_max)
+                    }
+                    (Screen::Detail, KeyCode::Char('k') | KeyCode::Up) => app.scroll_up(1),
+                    (Screen::Detail, KeyCode::PageDown | KeyCode::Char(' ')) => {
+                        app.scroll_down(10, scroll_max)
+                    }
+                    (Screen::Detail, KeyCode::PageUp) => app.scroll_up(10),
+                    (Screen::Detail, KeyCode::Char('g') | KeyCode::Home) => {
+                        app.detail_scroll = 0
+                    }
+                    (Screen::Detail, KeyCode::Char('G') | KeyCode::End) => {
+                        app.detail_scroll = scroll_max
+                    }
+                    (Screen::Detail, KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace) => {
+                        app.close_detail()
+                    }
+                    _ => dirty = false,
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    app.select_prev();
-                    dirty = true;
-                }
-                KeyCode::Char('g') | KeyCode::Home => {
-                    app.select_first();
-                    dirty = true;
-                }
-                KeyCode::Char('G') | KeyCode::End => {
-                    app.select_last();
-                    dirty = true;
-                }
-                _ => {}
-            },
+            }
             Event::Resize(_, _) => dirty = true,
             _ => {}
         }
