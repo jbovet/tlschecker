@@ -432,7 +432,9 @@ fn is_chain_well_ordered(chain: &[X509]) -> bool {
 ///
 /// `true` if the certificate is valid for the hostname, `false` otherwise.
 pub fn cert_matches_hostname(hostname: &str, cert: &X509) -> bool {
-    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+    // Certificates carry DNS names in ASCII A-label form; convert an IDN
+    // input (e.g. "bücher.example") before comparing.
+    let hostname = to_ascii_hostname(hostname.trim_end_matches('.')).to_ascii_lowercase();
     if hostname.is_empty() {
         return false;
     }
@@ -500,6 +502,21 @@ pub(crate) fn unbracket_host(host: &str) -> &str {
     host.strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host)
+}
+
+/// Converts an internationalized (IDN) hostname to its ASCII A-label
+/// (punycode) form, e.g. `bücher.example` -> `xn--bcher-kva.example`.
+///
+/// Certificates carry SAN entries in A-label form, and DNS resolution likewise
+/// expects ASCII, so user-supplied unicode hostnames are converted before
+/// matching or resolving. Already-ASCII input is returned unchanged, and a
+/// failed conversion falls back to the original string (which will then fail
+/// resolution/matching with the user's own spelling in the message).
+pub(crate) fn to_ascii_hostname(host: &str) -> String {
+    if host.is_ascii() {
+        return host.to_string();
+    }
+    idna::domain_to_ascii(host).unwrap_or_else(|_| host.to_string())
 }
 
 /// Matches a single certificate DNS name (which may be a wildcard) against a
@@ -929,9 +946,24 @@ pub fn check_crl_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus,
             }
         };
 
-        // Verify the CRL signature
-        if crl.verify(&issuer.public_key().unwrap()).is_err() {
+        // Verify the CRL signature. An issuer whose public key cannot be
+        // extracted is treated like a failed verification: skip this CRL
+        // (degrading to `Unknown`) rather than panicking.
+        let issuer_key = match issuer.public_key() {
+            Ok(key) => key,
+            Err(_) => continue,
+        };
+        if crl.verify(&issuer_key).is_err() {
             continue; // CRL signature verification failed
+        }
+
+        // Reject stale CRLs: a correctly-signed but expired CRL (nextUpdate in
+        // the past) may predate a revocation, so trusting it could mask a
+        // revoked certificate — e.g. an on-path attacker replaying an old CRL.
+        // Skipping degrades to `Unknown`, mirroring the OCSP
+        // verification-failure handling.
+        if !is_crl_fresh(&crl, crl_url) {
+            continue;
         }
 
         // Check if the certificate is in the CRL
@@ -962,6 +994,36 @@ pub fn check_crl_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus,
     Ok(RevocationStatus::Unknown)
 }
 
+/// Checks whether a CRL is still fresh enough to be trusted.
+///
+/// Returns `false` when `nextUpdate` lies in the past — a correctly-signed but
+/// stale CRL may predate a revocation and must not be relied upon. `nextUpdate`
+/// is optional per RFC 5280; when absent the CRL is accepted (returns `true`)
+/// but a warning is logged, since freshness cannot be established. `source` is
+/// only used to make the log messages actionable.
+fn is_crl_fresh(crl: &X509Crl, source: &str) -> bool {
+    match crl.next_update() {
+        Some(next_update) => {
+            if has_expired(next_update) {
+                warn!(
+                    "CRL from {} is stale (nextUpdate {} is in the past); ignoring it",
+                    source, next_update
+                );
+                false
+            } else {
+                true
+            }
+        }
+        None => {
+            warn!(
+                "CRL from {} carries no nextUpdate; accepting it but freshness cannot be verified",
+                source
+            );
+            true
+        }
+    }
+}
+
 impl TLS {
     #[instrument]
     pub fn from(
@@ -976,8 +1038,11 @@ impl TLS {
 
         // Trim any whitespace, and strip brackets that wrap IPv6 literals
         // (e.g. "[::1]" -> "::1") so address resolution and hostname matching
-        // both operate on a bare address.
-        let host = unbracket_host(host.trim());
+        // both operate on a bare address. Internationalized hostnames are
+        // converted to their ASCII A-label (punycode) form, which is what both
+        // DNS and certificate SAN entries use.
+        let host = to_ascii_hostname(unbracket_host(host.trim()));
+        let host = host.as_str();
 
         // Validate hostname is not empty
         if host.is_empty() {
@@ -1194,10 +1259,12 @@ impl TLS {
 fn from_entries(mut entries: X509NameEntries) -> String {
     match entries.next() {
         None => "None".to_string(),
-        Some(x509_name_ref) => x509_name_ref
-            .data()
-            .to_string()
-            .expect("Failed to convert data to UTF-8"),
+        // A certificate under inspection may carry non-UTF-8 name entries;
+        // degrade to a lossy conversion instead of panicking on it.
+        Some(x509_name_ref) => match x509_name_ref.data().to_string() {
+            Ok(s) => s,
+            Err(_) => String::from_utf8_lossy(x509_name_ref.data().as_slice()).into_owned(),
+        },
     }
 }
 
@@ -1293,7 +1360,11 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         validity_days: get_validity_days(cert_ref.not_after()),
         validity_hours: get_validity_in_hours(cert_ref.not_after()),
         is_expired: has_expired(cert_ref.not_after()),
-        cert_sn: cert_ref.serial_number().to_bn().unwrap().to_string(),
+        cert_sn: cert_ref
+            .serial_number()
+            .to_bn()
+            .map(|bn| bn.to_string())
+            .unwrap_or_else(|_| "Unknown".to_string()),
         cert_ver: cert_ref.version().to_string(),
         cert_alg: cert_ref.signature_algorithm().object().to_string(),
         sans,
@@ -1326,7 +1397,26 @@ fn fingerprint(cert_ref: &X509, digest: openssl::hash::MessageDigest) -> String 
     }
 }
 
+/// Computes the time remaining until certificate expiration.
+///
+/// Returns the openssl `TimeDiff` (days + leftover seconds, both negative when
+/// already expired), or `None` if the current time or the diff cannot be
+/// computed — callers degrade to zero rather than panicking.
+fn validity_diff(not_after: &Asn1TimeRef) -> Option<openssl::asn1::TimeDiff> {
+    let now = Asn1Time::days_from_now(0).ok()?;
+    match now.deref().diff(not_after) {
+        Ok(diff) => Some(diff),
+        Err(_) => {
+            warn!("Failed to compute certificate validity period");
+            None
+        }
+    }
+}
+
 /// Calculates the number of hours until certificate expiration.
+///
+/// Unlike `days * 24`, this includes the sub-day remainder, so a certificate
+/// expiring in 10 hours reports 10 rather than 0.
 ///
 /// # Arguments
 ///
@@ -1336,7 +1426,9 @@ fn fingerprint(cert_ref: &X509, digest: openssl::hash::MessageDigest) -> String 
 ///
 /// Number of hours until expiration (negative if already expired).
 fn get_validity_in_hours(not_after: &Asn1TimeRef) -> i32 {
-    get_validity_days(not_after) * 24
+    validity_diff(not_after)
+        .map(|diff| diff.days * 24 + diff.secs / 3600)
+        .unwrap_or(0)
 }
 
 /// Calculates the number of days until certificate expiration.
@@ -1349,12 +1441,7 @@ fn get_validity_in_hours(not_after: &Asn1TimeRef) -> i32 {
 ///
 /// Number of days until expiration (negative if already expired).
 fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
-    Asn1Time::days_from_now(0)
-        .unwrap()
-        .deref()
-        .diff(not_after)
-        .unwrap()
-        .days
+    validity_diff(not_after).map(|diff| diff.days).unwrap_or(0)
 }
 
 /// Checks whether a certificate has expired.
@@ -1973,10 +2060,11 @@ mod tests {
         assert!(!tls_result.certificate.is_expired);
         assert!(tls_result.certificate.validity_days > 0);
         assert!(tls_result.certificate.validity_hours > 0);
-        assert_eq!(
-            tls_result.certificate.validity_hours,
-            tls_result.certificate.validity_days * 24
-        );
+        // Hours include the sub-day remainder, so they fall between the whole
+        // days and the next full day.
+        let days = tls_result.certificate.validity_days;
+        let hours = tls_result.certificate.validity_hours;
+        assert!(hours >= days * 24 && hours < (days + 1) * 24);
     }
 
     #[test]
@@ -2028,6 +2116,86 @@ mod tests {
         builder.sign(&pkey, MessageDigest::sha256()).unwrap();
 
         (builder.build(), pkey)
+    }
+
+    /// Builds a signed CRL whose `nextUpdate` is `next_update_offset_secs`
+    /// from now (negative = already stale). The builder requires an AKID,
+    /// a CRL number, and at least one revoked entry, so those are included.
+    fn make_test_crl(next_update_offset_secs: i64) -> openssl::x509::X509Crl {
+        use openssl::x509::extension::AuthorityKeyIdentifier;
+        use openssl::x509::{CrlNumber, X509CrlBuilder, X509RevokedBuilder};
+
+        let (issuer_cert, issuer_key) = make_test_x509("Test CA");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let mut revoked = X509RevokedBuilder::new().unwrap();
+        revoked
+            .set_serial_number(&BigNum::from_u32(1024).unwrap().to_asn1_integer().unwrap())
+            .unwrap();
+        revoked
+            .set_revocation_date(&Asn1Time::from_unix(now - 86_400).unwrap())
+            .unwrap();
+
+        let dummy = X509Builder::new().unwrap();
+        let ctx = dummy.x509v3_context(Some(issuer_cert.as_ref()), None);
+        let aki = AuthorityKeyIdentifier::new()
+            .issuer(true)
+            .build(&ctx)
+            .unwrap();
+        let crl_number = CrlNumber::new(BigNum::from_u32(1).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut builder = X509CrlBuilder::new().unwrap();
+        builder.set_issuer_name(issuer_cert.subject_name()).unwrap();
+        builder
+            .set_last_update(&Asn1Time::from_unix(now - 7 * 86_400).unwrap())
+            .unwrap();
+        builder
+            .set_next_update(&Asn1Time::from_unix(now + next_update_offset_secs).unwrap())
+            .unwrap();
+        builder.append_extension(aki).unwrap();
+        builder.append_extension(crl_number).unwrap();
+        builder.add_revoked(revoked.build()).unwrap();
+        builder.sign(&issuer_key, MessageDigest::sha256()).unwrap();
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn test_stale_crl_is_rejected() {
+        // nextUpdate a day in the past -> stale, must not be trusted.
+        let crl = make_test_crl(-86_400);
+        assert!(!crate::is_crl_fresh(&crl, "test"));
+    }
+
+    #[test]
+    fn test_fresh_crl_is_accepted() {
+        // nextUpdate a week in the future -> fresh.
+        let crl = make_test_crl(7 * 86_400);
+        assert!(crate::is_crl_fresh(&crl, "test"));
+    }
+
+    #[test]
+    fn test_validity_hours_includes_subday_remainder() {
+        // A certificate expiring in ~10 hours must report 0 days but ~10
+        // hours (regression: hours used to be computed as days * 24).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let not_after = Asn1Time::from_unix(now + 10 * 3600).unwrap();
+
+        assert_eq!(crate::get_validity_days(&not_after), 0);
+        let hours = crate::get_validity_in_hours(&not_after);
+        assert!(
+            (9..=10).contains(&hours),
+            "expected ~10 hours remaining, got {}",
+            hours
+        );
     }
 
     /// Creates a certificate signed by an issuer (not self-signed).
@@ -2318,6 +2486,31 @@ mod tests {
         let cert = make_test_x509_with_sans("cn.example.com", &["san.example.com"]);
         assert!(super::cert_matches_hostname("san.example.com", &cert));
         assert!(!super::cert_matches_hostname("cn.example.com", &cert));
+    }
+
+    #[test]
+    fn test_cert_matches_hostname_idn() {
+        // Certificates carry SANs in A-label (punycode) form; a unicode input
+        // hostname must be converted before matching.
+        let cert = make_test_x509_with_sans(
+            "xn--bcher-kva.example",
+            &["xn--bcher-kva.example", "*.xn--bcher-kva.example"],
+        );
+        assert!(super::cert_matches_hostname("bücher.example", &cert));
+        assert!(super::cert_matches_hostname("www.bücher.example", &cert));
+        assert!(!super::cert_matches_hostname("bücherei.example", &cert));
+        // The A-label form itself still matches, of course.
+        assert!(super::cert_matches_hostname("xn--bcher-kva.example", &cert));
+    }
+
+    #[test]
+    fn test_to_ascii_hostname() {
+        assert_eq!(
+            super::to_ascii_hostname("bücher.example"),
+            "xn--bcher-kva.example"
+        );
+        // ASCII input passes through unchanged.
+        assert_eq!(super::to_ascii_hostname("example.com"), "example.com");
     }
 
     /// Creates a self-signed cert with the given iPAddress SANs (plus optional

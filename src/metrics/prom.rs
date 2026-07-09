@@ -8,6 +8,7 @@
 //! - `tlschecker_days_before_expired` - Days until certificate expiration (gauge)
 //! - `tlschecker_hours_before_expired` - Hours until certificate expiration (gauge)
 //! - `tlschecker_revocation_status` - Certificate revocation status (gauge)
+//! - `tlschecker_grade_score` - TLS configuration grade score, only when grading ran (gauge)
 //! - `tlschecker_below_min_validity` - Whether certificate is below minimum validity threshold (gauge)
 //!
 //! # Metric Labels
@@ -29,43 +30,76 @@
 //! - `2.0` - Unknown (couldn't determine)
 //! - `3.0` - Revoked
 
-use lazy_static::lazy_static;
-use prometheus::{labels, register_gauge, Gauge};
+use prometheus::proto::MetricFamily;
+use prometheus::{labels, Gauge, Registry};
 
 use tlschecker::RevocationStatus;
 use tlschecker::TLS;
 
-lazy_static! {
-    /// Gauge metric tracking days until certificate expiration.
-    static ref TLSCHECKER_DAYS_BEFORE_EXPIRED: Gauge =
-        register_gauge!("tlschecker_days_before_expired", "days before expiration").unwrap();
+/// Builds the metric families for a single host's check result.
+///
+/// Each host gets a **fresh registry** so values never leak between hosts:
+/// with shared global gauges, a host without a grade would push the previous
+/// host's `tlschecker_grade_score` under its own labels. The grade gauge is
+/// only registered when grading was actually performed for this host.
+fn host_metric_families(tls: &TLS, min_validity: i32) -> Vec<MetricFamily> {
+    let registry = Registry::new();
 
-    /// Gauge metric tracking hours until certificate expiration.
-    static ref TLSCHECKER_HOURS_BEFORE_EXPIRED: Gauge =
-        register_gauge!("tlschecker_hours_before_expired", "hours before expiration").unwrap();
+    let register_gauge = |name: &str, help: &str, value: f64| {
+        match Gauge::new(name, help) {
+            Ok(gauge) => {
+                gauge.set(value);
+                if let Err(e) = registry.register(Box::new(gauge)) {
+                    eprintln!("Failed to register metric {}: {}", name, e);
+                }
+            }
+            Err(e) => eprintln!("Failed to create metric {}: {}", name, e),
+        };
+    };
 
-    /// Gauge metric tracking certificate revocation status.
-    /// Values: 0=not checked, 1=good, 2=unknown, 3=revoked
-    static ref TLSCHECKER_REVOCATION_STATUS: Gauge = register_gauge!(
+    register_gauge(
+        "tlschecker_days_before_expired",
+        "days before expiration",
+        f64::from(tls.certificate.validity_days),
+    );
+    register_gauge(
+        "tlschecker_hours_before_expired",
+        "hours before expiration",
+        f64::from(tls.certificate.validity_hours),
+    );
+
+    // 0 = Not checked, 1 = Good, 2 = Unknown, 3 = Revoked
+    let revocation_value = match tls.certificate.revocation_status {
+        RevocationStatus::NotChecked => 0.0,
+        RevocationStatus::Good => 1.0,
+        RevocationStatus::Unknown => 2.0,
+        RevocationStatus::Revoked(_) => 3.0,
+    };
+    register_gauge(
         "tlschecker_revocation_status",
-        "certificate revocation status"
-    )
-    .unwrap();
+        "certificate revocation status",
+        revocation_value,
+    );
 
-    /// Gauge metric tracking TLS configuration grade score (0-100).
-    static ref TLSCHECKER_GRADE_SCORE: Gauge = register_gauge!(
-        "tlschecker_grade_score",
-        "TLS configuration grade score (0-100)"
-    )
-    .unwrap();
+    // Only exported when grading was performed for this host.
+    if let Some(ref grade) = tls.grade {
+        register_gauge(
+            "tlschecker_grade_score",
+            "TLS configuration grade score (0-100)",
+            f64::from(grade.score),
+        );
+    }
 
-    /// Gauge metric indicating if certificate validity is below the configured minimum threshold.
-    /// Values: 0=above threshold or not configured, 1=below threshold
-    static ref TLSCHECKER_BELOW_MIN_VALIDITY: Gauge = register_gauge!(
+    let below_min_validity = min_validity > 0
+        && !tls.certificate.is_expired
+        && tls.certificate.validity_days < min_validity;
+    register_gauge(
         "tlschecker_below_min_validity",
-        "1 if certificate validity is below the configured minimum threshold, 0 otherwise"
-    )
-    .unwrap();
+        "1 if certificate validity is below the configured minimum threshold, 0 otherwise",
+        if below_min_validity { 1.0 } else { 0.0 },
+    );
+
+    registry.gather()
 }
 
 /// Pushes TLS certificate metrics to a Prometheus Push Gateway.
@@ -84,6 +118,7 @@ lazy_static! {
 /// For each certificate:
 /// - Days and hours until expiration
 /// - Revocation status (0-3, see module documentation)
+/// - Grade score (only when grading was performed)
 /// - Associated labels (host, cipher, issuer, etc.)
 ///
 /// # Error Handling
@@ -102,35 +137,11 @@ lazy_static! {
 /// ```
 pub fn prometheus_metrics(results: Vec<TLS>, prometheus_address: String, min_validity: i32) {
     for tls in results.iter() {
-        TLSCHECKER_DAYS_BEFORE_EXPIRED.set(f64::from(tls.certificate.validity_days.to_owned()));
-        TLSCHECKER_HOURS_BEFORE_EXPIRED.set(f64::from(tls.certificate.validity_hours.to_owned()));
-
-        // Set revocation status metric
-        // 0 = Not checked, 1 = Good, 2 = Unknown, 3 = Revoked
-        let revocation_value = match tls.certificate.revocation_status {
-            RevocationStatus::NotChecked => 0.0,
-            RevocationStatus::Good => 1.0,
-            RevocationStatus::Unknown => 2.0,
-            RevocationStatus::Revoked(_) => 3.0,
-        };
-        TLSCHECKER_REVOCATION_STATUS.set(revocation_value);
-
-        // Set grade score metric if grading was performed
-        if let Some(ref grade) = tls.grade {
-            TLSCHECKER_GRADE_SCORE.set(f64::from(grade.score));
-        }
-
-        // Set below minimum validity threshold metric
-        if min_validity > 0
+        let metric_families = host_metric_families(tls, min_validity);
+        let below_min_validity = min_validity > 0
             && !tls.certificate.is_expired
-            && tls.certificate.validity_days < min_validity
-        {
-            TLSCHECKER_BELOW_MIN_VALIDITY.set(1.0);
-        } else {
-            TLSCHECKER_BELOW_MIN_VALIDITY.set(0.0);
-        }
+            && tls.certificate.validity_days < min_validity;
 
-        let metric_families = prometheus::gather();
         let prometheus_client = prometheus::push_metrics(
             "tlschecker",
             labels! {
@@ -143,16 +154,122 @@ pub fn prometheus_metrics(results: Vec<TLS>, prometheus_address: String, min_val
                 "expired".to_owned() => tls.certificate.is_expired.to_string(),
                 "revoked".to_owned() => (matches!(tls.certificate.revocation_status, RevocationStatus::Revoked(_))).to_string(),
                 "grade".to_owned() => tls.grade.as_ref().map_or("N/A".to_string(), |g| g.grade.clone()),
-                "below_min_validity".to_owned() => (min_validity > 0 && !tls.certificate.is_expired && tls.certificate.validity_days < min_validity).to_string(),
+                "below_min_validity".to_owned() => below_min_validity.to_string(),
             },
             &format!("{}/metrics/job", prometheus_address),
             metric_families,
             None,
         );
 
-        match prometheus_client {
-            Ok(_) => {} //TODO
-            Err(e) => println!("\nFailed to push metrics to prometheus: {}", e),
+        if let Err(e) = prometheus_client {
+            eprintln!("\nFailed to push metrics to prometheus: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tlschecker::{CertificateInfo, Cipher, Issuer, Subject};
+
+    fn make_test_tls() -> TLS {
+        TLS {
+            cipher: Cipher {
+                name: "TLS_AES_256_GCM_SHA384".to_string(),
+                version: "TLSv1.3".to_string(),
+                bits: 256,
+            },
+            certificate: CertificateInfo {
+                hostname: "test.example.com".to_string(),
+                subject: Subject {
+                    country_or_region: "US".to_string(),
+                    state_or_province: "None".to_string(),
+                    locality: "None".to_string(),
+                    organization_unit: "None".to_string(),
+                    organization: "Example Inc".to_string(),
+                    common_name: "test.example.com".to_string(),
+                },
+                issued: Issuer {
+                    country_or_region: "US".to_string(),
+                    organization: "Test CA".to_string(),
+                    common_name: "Test CA Root".to_string(),
+                },
+                valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
+                valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                validity_days: 100,
+                validity_hours: 2400,
+                is_expired: false,
+                cert_sn: "1".to_string(),
+                cert_ver: "2".to_string(),
+                cert_alg: "sha256WithRSAEncryption".to_string(),
+                sans: vec![],
+                chain: None,
+                revocation_status: RevocationStatus::NotChecked,
+                is_self_signed: false,
+                security_warnings: vec![],
+                cert_key_bits: 2048,
+                cert_key_algorithm: "RSA".to_string(),
+                cert_sha256: String::new(),
+                cert_sha1: String::new(),
+                scts: Vec::new(),
+                pem: String::new(),
+            },
+            grade: None,
+            scan: None,
+            ct: None,
+        }
+    }
+
+    fn family_names(families: &[MetricFamily]) -> Vec<&str> {
+        families.iter().map(|f| f.name()).collect()
+    }
+
+    #[test]
+    fn test_no_grade_gauge_without_grade() {
+        // Regression: with shared global gauges, a grade-less host pushed the
+        // previous host's grade score under its own labels.
+        let tls = make_test_tls();
+        let families = host_metric_families(&tls, 0);
+        let names = family_names(&families);
+        assert!(!names.contains(&"tlschecker_grade_score"));
+        assert!(names.contains(&"tlschecker_days_before_expired"));
+        assert!(names.contains(&"tlschecker_revocation_status"));
+    }
+
+    #[test]
+    fn test_grade_gauge_present_with_grade() {
+        let mut tls = make_test_tls();
+        tls.grade = Some(tlschecker::grading::TLSGrade {
+            grade: "A".to_string(),
+            score: 90,
+            categories: vec![],
+        });
+        let families = host_metric_families(&tls, 0);
+        let names = family_names(&families);
+        assert!(names.contains(&"tlschecker_grade_score"));
+
+        let grade_family = families
+            .iter()
+            .find(|f| f.name() == "tlschecker_grade_score")
+            .unwrap();
+        let value = grade_family.get_metric()[0].get_gauge().value();
+        assert_eq!(value, 90.0);
+    }
+
+    #[test]
+    fn test_below_min_validity_gauge() {
+        let tls = make_test_tls(); // 100 days left
+        let get_value = |min_validity: i32| {
+            host_metric_families(&tls, min_validity)
+                .iter()
+                .find(|f| f.name() == "tlschecker_below_min_validity")
+                .unwrap()
+                .get_metric()[0]
+                .get_gauge()
+                .value()
+        };
+        assert_eq!(get_value(0), 0.0); // disabled
+        assert_eq!(get_value(30), 0.0); // above threshold
+        assert_eq!(get_value(365), 1.0); // below threshold
     }
 }

@@ -1832,7 +1832,7 @@ dependencies = [
  "anyhow",
  "clap",
  "comfy-table",
- "lazy_static",
+ "idna",
  "openssl",
  "prometheus",
  "reqwest 0.13.4",

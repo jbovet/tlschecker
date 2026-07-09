@@ -220,15 +220,22 @@ You can use a TOML configuration file to check multiple hosts. Create a file lik
 hosts = [
     "example.com",
     "example.com:8443",
-    "secure-service.internal:9443"
+    "secure-service.internal:9443",
 ]
 
 # Optional settings
+output = "summary"
+exit_code = 1
 check_revocation = true
-output_format = "json"
-prometheus = false
-prometheus_address = "http://localhost:9091"
+grade = false
+min_validity = 30
+
+[prometheus]
+enabled = false
+address = "http://localhost:9091"
 ```
+
+You can also generate a commented example with `tlschecker --generate-config`.
 
 Then run TLSChecker with the config file:
 

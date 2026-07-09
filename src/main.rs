@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::thread;
 mod config;
 mod metrics;
@@ -58,16 +60,16 @@ struct Args {
     ///
     /// Queries OCSP responders first, then falls back to CRL
     /// distribution points. Adds latency due to network requests.
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    check_revocation: Option<bool>,
+    #[arg(long)]
+    check_revocation: bool,
 
     /// Enable TLS configuration grading (A+ to F).
     ///
     /// Evaluates protocol version, cipher strength, key exchange,
     /// certificate key size, and trust chain to produce a composite
     /// letter grade for each host.
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    grade: Option<bool>,
+    #[arg(long)]
+    grade: bool,
 
     /// Minimum number of days a certificate must remain valid.
     ///
@@ -92,6 +94,16 @@ struct Args {
     /// sent, instead of the normal formatted report.
     #[arg(long)]
     export_pem: bool,
+
+    /// Treat hosts that could not be checked at all as failures for
+    /// exit-code purposes.
+    ///
+    /// By default an unreachable host (DNS failure, refused connection,
+    /// handshake error, invalid address) is only logged and does not affect
+    /// the exit code. With this flag, any such error makes the run exit with
+    /// --exit-code, so CI pipelines can catch hosts that are down entirely.
+    #[arg(long)]
+    fail_on_error: bool,
 
     /// Look the presented leaf certificate up in public Certificate
     /// Transparency logs (via crt.sh).
@@ -379,20 +391,17 @@ impl Formatter for TextFormat {
                 writeln!(output, "\tDNS Name: {}", san).unwrap();
             }
 
-            match &cert.chain {
-                Some(chains) => {
-                    writeln!(output, "Additional Certificates (if supplied):").unwrap();
-                    for (i, c) in chains.iter().enumerate() {
-                        writeln!(output, "Chain #{:?}", i + 1).unwrap();
-                        writeln!(output, "\tSubject: {:?}", c.subject).unwrap();
-                        writeln!(output, "\tValid from: {:?}", c.valid_from).unwrap();
-                        writeln!(output, "\tValid until: {:?}", c.valid_to).unwrap();
-                        writeln!(output, "\tIssuer: {:?}", c.issuer).unwrap();
-                        writeln!(output, "\tSignature algorithm: {:?}", c.signature_algorithm)
-                            .unwrap();
-                    }
+            if let Some(chains) = &cert.chain {
+                writeln!(output, "Additional Certificates (if supplied):").unwrap();
+                for (i, c) in chains.iter().enumerate() {
+                    writeln!(output, "Chain #{:?}", i + 1).unwrap();
+                    writeln!(output, "\tSubject: {:?}", c.subject).unwrap();
+                    writeln!(output, "\tValid from: {:?}", c.valid_from).unwrap();
+                    writeln!(output, "\tValid until: {:?}", c.valid_to).unwrap();
+                    writeln!(output, "\tIssuer: {:?}", c.issuer).unwrap();
+                    writeln!(output, "\tSignature algorithm: {:?}", c.signature_algorithm)
+                        .unwrap();
                 }
-                None => todo!(),
             }
         }
         output
@@ -646,6 +655,7 @@ impl FormatterFactory {
 ///
 /// Represents the result of parsing a host address specification,
 /// which may include a port number or use the default port 443.
+#[derive(Debug)]
 struct HostPort {
     /// Hostname or IP address (IPv6 brackets are removed)
     host: String,
@@ -709,6 +719,97 @@ impl FinalConfig {
     }
 }
 
+/// Upper bound on concurrent host checks; the pool also never exceeds the
+/// machine's available parallelism or the number of hosts.
+const MAX_CONCURRENT_CHECKS: usize = 16;
+
+/// Checks a single host: TLS connection plus the optional scan and CT lookup.
+///
+/// Returns `None` when the host could not be checked at all; the reason is
+/// logged to stderr before returning.
+fn check_host(
+    host_port: &HostPort,
+    check_revocation: bool,
+    calculate_grade: bool,
+    do_scan: bool,
+    do_ct: bool,
+) -> Option<TLS> {
+    let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
+
+    match TLS::from(
+        &host_port.host,
+        host_port.port,
+        check_revocation,
+        calculate_grade,
+    ) {
+        Ok(mut cert) => {
+            if do_scan {
+                if let Ok(scan) = tlschecker::probe::scan_tls(&host_port.host, host_port.port) {
+                    // Fold scan-derived warnings into the result and
+                    // recompute the grade to reflect full posture.
+                    cert.apply_scan(scan);
+                }
+            }
+            if do_ct {
+                // Look the leaf up in public CT logs (crt.sh, by
+                // SHA-256 fingerprint). A failed/inconclusive lookup
+                // is non-fatal: the reason is logged to stderr and the
+                // result is recorded as `Unknown` rather than dropped,
+                // so "could not check" is never mistaken for "absent".
+                let ct = match tlschecker::ct::check_ct_status(&cert.certificate.cert_sha256) {
+                    Ok(ct) => ct,
+                    Err(e) => {
+                        warn!(
+                            "CT lookup could not be completed for {}{}: {}",
+                            host_port.host, port_display, e
+                        );
+                        tlschecker::ct::CtStatus::Unknown
+                    }
+                };
+                cert.apply_ct(ct);
+            }
+            Some(cert)
+        }
+        Err(err) => {
+            match err {
+                TLSError::DNS(msg) => {
+                    error!(
+                        "Cannot resolve hostname: {}{}",
+                        host_port.host, port_display
+                    );
+                    error!("  - {}", msg);
+                }
+                TLSError::Connection(e) => {
+                    error!(
+                        "Connection refused for host: {}{}",
+                        host_port.host, port_display
+                    );
+                    error!("  - {}", e);
+                }
+                TLSError::Certificate(msg) => {
+                    error!(
+                        "Certificate issue with host: {}{}",
+                        host_port.host, port_display
+                    );
+                    error!("  - {}", msg);
+                }
+                TLSError::Validation(msg) => {
+                    error!(
+                        "Validation error for host: {}{}",
+                        host_port.host, port_display
+                    );
+                    error!("  - {}", msg);
+                }
+                _ => {
+                    error!("Failed to check host: {}{}", host_port.host, port_display);
+                    error!("  - {}", err);
+                }
+            }
+            None
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // Initialize tracing. Diagnostics (errors, warnings) go to stderr so stdout
     // stays a clean machine-readable stream — e.g. `-o json ... | jq` is not
@@ -743,12 +844,19 @@ fn main() -> Result<()> {
     let exit_code = final_config.exit_code;
     let mut failed_result = false;
 
-    // Parse hosts and ports
-    let hosts_and_ports: Vec<HostPort> = final_config
-        .addresses
-        .iter()
-        .map(|address| parse_host_port(address))
-        .collect();
+    // Parse hosts and ports; invalid addresses are reported and counted as
+    // errored hosts rather than silently checked as bogus hostnames.
+    let mut error_count: usize = 0;
+    let mut hosts_and_ports: Vec<HostPort> = Vec::with_capacity(final_config.addresses.len());
+    for address in &final_config.addresses {
+        match parse_host_port(address) {
+            Ok(host_port) => hosts_and_ports.push(host_port),
+            Err(msg) => {
+                error!("Skipping '{}': {}", address, msg);
+                error_count += 1;
+            }
+        }
+    }
 
     let hosts_len = hosts_and_ports.len();
     let check_revocation = final_config.check_revocation;
@@ -759,121 +867,77 @@ fn main() -> Result<()> {
     // scanned posture, so enable grading whenever scanning.
     let calculate_grade = should_grade(final_config.grade, do_scan);
 
-    let mut handles = Vec::new();
+    // Check hosts through a bounded worker pool rather than one thread per
+    // host: a large host list would otherwise spawn an unbounded number of
+    // threads, each potentially holding a 30s connection timeout.
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(MAX_CONCURRENT_CHECKS)
+        .min(hosts_len.max(1));
 
-    for host_port in hosts_and_ports {
-        let handle = thread::spawn(move || {
-            let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
+    let queue: Arc<Mutex<VecDeque<(usize, HostPort)>>> =
+        Arc::new(Mutex::new(hosts_and_ports.into_iter().enumerate().collect()));
 
-            match TLS::from(
-                &host_port.host,
-                host_port.port,
-                check_revocation,
-                calculate_grade,
-            ) {
-                Ok(mut cert) => {
-                    if do_scan {
-                        if let Ok(scan) =
-                            tlschecker::probe::scan_tls(&host_port.host, host_port.port)
-                        {
-                            // Fold scan-derived warnings into the result and
-                            // recompute the grade to reflect full posture.
-                            cert.apply_scan(scan);
-                        }
-                    }
-                    if do_ct {
-                        // Look the leaf up in public CT logs (crt.sh, by
-                        // SHA-256 fingerprint). A failed/inconclusive lookup
-                        // is non-fatal: the reason is logged to stderr and the
-                        // result is recorded as `Unknown` rather than dropped,
-                        // so "could not check" is never mistaken for "absent".
-                        let ct =
-                            match tlschecker::ct::check_ct_status(&cert.certificate.cert_sha256) {
-                                Ok(ct) => ct,
-                                Err(e) => {
-                                    warn!(
-                                        "CT lookup could not be completed for {}{}: {}",
-                                        host_port.host, port_display, e
-                                    );
-                                    tlschecker::ct::CtStatus::Unknown
-                                }
-                            };
-                        cert.apply_ct(ct);
-                    }
-                    Some(cert)
-                }
-                Err(err) => {
-                    match err {
-                        TLSError::DNS(msg) => {
-                            error!(
-                                "Cannot resolve hostname: {}{}",
-                                host_port.host, port_display
-                            );
-                            error!("  - {}", msg);
-                        }
-                        TLSError::Connection(e) => {
-                            error!(
-                                "Connection refused for host: {}{}",
-                                host_port.host, port_display
-                            );
-                            error!("  - {}", e);
-                        }
-                        TLSError::Certificate(msg) => {
-                            error!(
-                                "Certificate issue with host: {}{}",
-                                host_port.host, port_display
-                            );
-                            error!("  - {}", msg);
-                        }
-                        TLSError::Validation(msg) => {
-                            error!(
-                                "Validation error for host: {}{}",
-                                host_port.host, port_display
-                            );
-                            error!("  - {}", msg);
-                        }
-                        _ => {
-                            error!("Failed to check host: {}{}", host_port.host, port_display);
-                            error!("  - {}", err);
-                        }
-                    }
-                    None
-                }
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        handles.push(thread::spawn(move || {
+            let mut outcomes = Vec::new();
+            loop {
+                let job = queue.lock().unwrap().pop_front();
+                let Some((index, host_port)) = job else { break };
+                outcomes.push((
+                    index,
+                    check_host(&host_port, check_revocation, calculate_grade, do_scan, do_ct),
+                ));
             }
-        });
-        handles.push(handle);
+            outcomes
+        }));
     }
 
-    let mut results: Vec<TLS> = Vec::with_capacity(hosts_len);
-
+    // Collect into index-order slots so the output order matches the input
+    // order regardless of which worker handled which host.
+    let mut slots: Vec<Option<Option<TLS>>> = std::iter::repeat_with(|| None)
+        .take(hosts_len)
+        .collect();
     for handle in handles {
         match handle.join() {
-            Ok(Some(tls_result)) => results.push(tls_result),
-            Ok(None) => {} // Error already logged inside the thread
+            Ok(outcomes) => {
+                for (index, outcome) in outcomes {
+                    slots[index] = Some(outcome);
+                }
+            }
             Err(panic_err) => {
                 error!("A worker thread panicked unexpectedly: {:?}", panic_err);
             }
         }
     }
 
-    let expired_certs = &results
-        .clone()
-        .into_iter()
-        .filter(|c| c.certificate.is_expired)
-        .collect::<Vec<_>>();
+    let mut results: Vec<TLS> = Vec::with_capacity(hosts_len);
+    for slot in slots {
+        match slot {
+            Some(Some(tls_result)) => results.push(tls_result),
+            // Error already logged inside the worker, or the host was lost to
+            // a worker panic.
+            Some(None) | None => error_count += 1,
+        }
+    }
 
-    let revoked_certs = &results
-        .clone()
-        .into_iter()
-        .filter(|c| {
-            matches!(
-                c.certificate.revocation_status,
-                RevocationStatus::Revoked(_)
-            )
-        })
-        .collect::<Vec<_>>();
+    let any_expired = results.iter().any(|c| c.certificate.is_expired);
+    let any_revoked = results.iter().any(|c| {
+        matches!(
+            c.certificate.revocation_status,
+            RevocationStatus::Revoked(_)
+        )
+    });
+    if any_expired || any_revoked {
+        failed_result = true;
+    }
 
-    if !expired_certs.is_empty() || !revoked_certs.is_empty() {
+    // With --fail-on-error, hosts that could not be checked at all (invalid
+    // address, DNS failure, connection/handshake error) count as failures.
+    if cli.fail_on_error && error_count > 0 {
         failed_result = true;
     }
 
@@ -893,11 +957,7 @@ fn main() -> Result<()> {
             print!("{}", r.certificate.pem);
         }
     } else {
-        let formatter = match final_config.output {
-            OutFormat::Json => FormatterFactory::new_formatter(&OutFormat::Json),
-            OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
-            OutFormat::Summary => FormatterFactory::new_formatter(&OutFormat::Summary),
-        };
+        let formatter = FormatterFactory::new_formatter(&final_config.output);
         print!("{}", formatter.format(&results));
     }
 
@@ -956,14 +1016,17 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
         None
     };
 
+    // Boolean flags are only forwarded when actually passed on the command
+    // line: an absent flag must stay `None` so it does not override a value
+    // set in the config file during the "last `Some` wins" merge.
     let cli_config = Config::from_cli_args(
         cli_addresses,
         cli.output.as_ref().map(|o| o.to_string()),
         cli.exit_code,
         cli.prometheus,
         cli.prometheus_address.clone(),
-        cli.check_revocation,
-        cli.grade,
+        cli.check_revocation.then_some(true),
+        cli.grade.then_some(true),
         cli.min_validity,
     );
 
@@ -1018,14 +1081,16 @@ fn should_grade(config_grade: bool, scan: bool) -> bool {
 ///
 /// # Returns
 ///
-/// A `HostPort` struct containing the extracted hostname and optional port.
+/// `Ok(HostPort)` with the extracted hostname and optional port, or an error
+/// message when the address carries a port specification that is not a valid
+/// port number (e.g. `example.com:99999`).
 ///
 /// # Note
 ///
 /// - IPv6 brackets are automatically removed from the hostname
 /// - If no port is specified, returns `None` for the port (defaults to 443)
 /// - URL schemes (http://, https://) are stripped and ignored
-fn parse_host_port(address: &str) -> HostPort {
+fn parse_host_port(address: &str) -> Result<HostPort, String> {
     // Try to fix common user mistakes by adding https:// if missing a scheme
     let address_with_scheme = if !address.contains("://") {
         format!("https://{}", address)
@@ -1037,10 +1102,10 @@ fn parse_host_port(address: &str) -> HostPort {
     if let Ok(url) = Url::parse(&address_with_scheme) {
         // If it's a valid URL, extract host and port
         if let Some(host_str) = url.host_str() {
-            return HostPort {
+            return Ok(HostPort {
                 host: host_str.to_string(),
                 port: url.port(),
-            };
+            });
         }
     }
 
@@ -1050,20 +1115,29 @@ fn parse_host_port(address: &str) -> HostPort {
         if let Ok(port) = port_str.parse::<u16>() {
             // Make sure we don't include IPv6 brackets in the hostname
             let clean_host = host.trim_start_matches('[').trim_end_matches(']');
-            return HostPort {
+            return Ok(HostPort {
                 host: clean_host.to_string(),
                 port: Some(port),
-            };
+            });
+        }
+        // The segment after the colon was clearly meant as a port but is not a
+        // valid one; report it instead of silently treating "host:99999" as a
+        // hostname (which would only surface later as a confusing DNS error).
+        if !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "Invalid port '{}' in address '{}' (ports must be 1-65535)",
+                port_str, address
+            ));
         }
     }
 
     // No port specified, just a hostname
     // For IPv6 addresses, clean up any brackets
     let clean_address = address.trim_start_matches('[').trim_end_matches(']');
-    HostPort {
+    Ok(HostPort {
         host: clean_address.to_string(),
         port: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1074,56 +1148,56 @@ mod tests {
 
     #[test]
     fn test_parse_host_port_hostname_only() {
-        let hp = parse_host_port("example.com");
+        let hp = parse_host_port("example.com").unwrap();
         assert_eq!(hp.host, "example.com");
         assert_eq!(hp.port, None);
     }
 
     #[test]
     fn test_parse_host_port_with_port() {
-        let hp = parse_host_port("example.com:8443");
+        let hp = parse_host_port("example.com:8443").unwrap();
         assert_eq!(hp.host, "example.com");
         assert_eq!(hp.port, Some(8443));
     }
 
     #[test]
     fn test_parse_host_port_https_url() {
-        let hp = parse_host_port("https://example.com:9443");
+        let hp = parse_host_port("https://example.com:9443").unwrap();
         assert_eq!(hp.host, "example.com");
         assert_eq!(hp.port, Some(9443));
     }
 
     #[test]
     fn test_parse_host_port_https_url_no_port() {
-        let hp = parse_host_port("https://example.com");
+        let hp = parse_host_port("https://example.com").unwrap();
         assert_eq!(hp.host, "example.com");
         assert_eq!(hp.port, None);
     }
 
     #[test]
     fn test_parse_host_port_http_url() {
-        let hp = parse_host_port("http://example.com:8080");
+        let hp = parse_host_port("http://example.com:8080").unwrap();
         assert_eq!(hp.host, "example.com");
         assert_eq!(hp.port, Some(8080));
     }
 
     #[test]
     fn test_parse_host_port_ipv4_with_port() {
-        let hp = parse_host_port("192.168.1.1:8443");
+        let hp = parse_host_port("192.168.1.1:8443").unwrap();
         assert_eq!(hp.host, "192.168.1.1");
         assert_eq!(hp.port, Some(8443));
     }
 
     #[test]
     fn test_parse_host_port_ipv4_no_port() {
-        let hp = parse_host_port("10.0.0.1");
+        let hp = parse_host_port("10.0.0.1").unwrap();
         assert_eq!(hp.host, "10.0.0.1");
         assert_eq!(hp.port, None);
     }
 
     #[test]
     fn test_parse_host_port_ipv6_with_port() {
-        let hp = parse_host_port("[::1]:443");
+        let hp = parse_host_port("[::1]:443").unwrap();
         // URL parser keeps brackets for IPv6 addresses
         assert_eq!(hp.host, "[::1]");
         // url.port() returns None for scheme-default ports (443 for HTTPS),
@@ -1133,29 +1207,94 @@ mod tests {
 
     #[test]
     fn test_parse_host_port_ipv6_with_non_default_port() {
-        let hp = parse_host_port("[::1]:8443");
+        let hp = parse_host_port("[::1]:8443").unwrap();
         assert_eq!(hp.host, "[::1]");
         assert_eq!(hp.port, Some(8443));
     }
 
     #[test]
     fn test_parse_host_port_ipv6_no_port() {
-        let hp = parse_host_port("[::1]");
+        let hp = parse_host_port("[::1]").unwrap();
         assert_eq!(hp.host, "[::1]");
         assert_eq!(hp.port, None);
     }
 
     #[test]
     fn test_parse_host_port_default_port_443() {
-        let hp = parse_host_port("example.com");
+        let hp = parse_host_port("example.com").unwrap();
         assert_eq!(hp.port, None); // None means default 443
     }
 
     #[test]
     fn test_parse_host_port_subdomain() {
-        let hp = parse_host_port("sub.domain.example.com:8443");
+        let hp = parse_host_port("sub.domain.example.com:8443").unwrap();
         assert_eq!(hp.host, "sub.domain.example.com");
         assert_eq!(hp.port, Some(8443));
+    }
+
+    // ── CLI flag / config precedence tests ───────────────────────────
+
+    #[test]
+    fn test_absent_bool_flags_do_not_override_config() {
+        use clap::Parser;
+        // Absent flags parse as plain `false`...
+        let cli = Args::try_parse_from(["tlschecker", "example.com"]).unwrap();
+        assert!(!cli.check_revocation);
+        assert!(!cli.grade);
+
+        // ...and a config file enabling them must survive a CLI run where the
+        // flags are absent (regression: Option<bool> + SetTrue used to yield
+        // Some(false), silently overriding the config file).
+        let mut config_file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut config_file,
+            b"hosts = [\"example.com\"]\ncheck_revocation = true\ngrade = true\n",
+        )
+        .unwrap();
+        let cli = Args::try_parse_from([
+            "tlschecker",
+            "--config",
+            config_file.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let final_config = load_config(&cli).unwrap();
+        assert!(final_config.check_revocation);
+        assert!(final_config.grade);
+    }
+
+    #[test]
+    fn test_present_bool_flags_override_config() {
+        use clap::Parser;
+        let mut config_file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut config_file, b"hosts = [\"example.com\"]\n").unwrap();
+        let cli = Args::try_parse_from([
+            "tlschecker",
+            "--config",
+            config_file.path().to_str().unwrap(),
+            "--check-revocation",
+            "--grade",
+        ])
+        .unwrap();
+        let final_config = load_config(&cli).unwrap();
+        assert!(final_config.check_revocation);
+        assert!(final_config.grade);
+    }
+
+    #[test]
+    fn test_parse_host_port_invalid_port_is_error() {
+        let result = parse_host_port("example.com:99999");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid port '99999'"));
+    }
+
+    #[test]
+    fn test_parse_host_port_non_numeric_suffix_is_hostname() {
+        // A colon followed by non-digits is not a port specification; the
+        // address is treated as an (almost certainly unresolvable) hostname
+        // rather than rejected here.
+        let hp = parse_host_port("example.com:abc").unwrap();
+        assert_eq!(hp.host, "example.com:abc");
+        assert_eq!(hp.port, None);
     }
 
     // ── OutFormat Display tests ──────────────────────────────────────
@@ -1397,6 +1536,16 @@ mod tests {
             scan: None,
             ct: None,
         }
+    }
+
+    #[test]
+    fn test_text_format_without_chain_does_not_panic() {
+        // Regression: the `chain: None` arm used to be `todo!()`.
+        let mut tls = make_test_tls();
+        tls.certificate.chain = None;
+        let output = TextFormat.format(&[tls]);
+        assert!(output.contains("Hostname: test.example.com"));
+        assert!(!output.contains("Additional Certificates"));
     }
 
     #[test]
