@@ -58,16 +58,16 @@ struct Args {
     ///
     /// Queries OCSP responders first, then falls back to CRL
     /// distribution points. Adds latency due to network requests.
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    check_revocation: Option<bool>,
+    #[arg(long)]
+    check_revocation: bool,
 
     /// Enable TLS configuration grading (A+ to F).
     ///
     /// Evaluates protocol version, cipher strength, key exchange,
     /// certificate key size, and trust chain to produce a composite
     /// letter grade for each host.
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    grade: Option<bool>,
+    #[arg(long)]
+    grade: bool,
 
     /// Minimum number of days a certificate must remain valid.
     ///
@@ -956,14 +956,17 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
         None
     };
 
+    // Boolean flags are only forwarded when actually passed on the command
+    // line: an absent flag must stay `None` so it does not override a value
+    // set in the config file during the "last `Some` wins" merge.
     let cli_config = Config::from_cli_args(
         cli_addresses,
         cli.output.as_ref().map(|o| o.to_string()),
         cli.exit_code,
         cli.prometheus,
         cli.prometheus_address.clone(),
-        cli.check_revocation,
-        cli.grade,
+        cli.check_revocation.then_some(true),
+        cli.grade.then_some(true),
         cli.min_validity,
     );
 
@@ -1156,6 +1159,54 @@ mod tests {
         let hp = parse_host_port("sub.domain.example.com:8443");
         assert_eq!(hp.host, "sub.domain.example.com");
         assert_eq!(hp.port, Some(8443));
+    }
+
+    // ── CLI flag / config precedence tests ───────────────────────────
+
+    #[test]
+    fn test_absent_bool_flags_do_not_override_config() {
+        use clap::Parser;
+        // Absent flags parse as plain `false`...
+        let cli = Args::try_parse_from(["tlschecker", "example.com"]).unwrap();
+        assert!(!cli.check_revocation);
+        assert!(!cli.grade);
+
+        // ...and a config file enabling them must survive a CLI run where the
+        // flags are absent (regression: Option<bool> + SetTrue used to yield
+        // Some(false), silently overriding the config file).
+        let mut config_file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut config_file,
+            b"hosts = [\"example.com\"]\ncheck_revocation = true\ngrade = true\n",
+        )
+        .unwrap();
+        let cli = Args::try_parse_from([
+            "tlschecker",
+            "--config",
+            config_file.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let final_config = load_config(&cli).unwrap();
+        assert!(final_config.check_revocation);
+        assert!(final_config.grade);
+    }
+
+    #[test]
+    fn test_present_bool_flags_override_config() {
+        use clap::Parser;
+        let mut config_file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut config_file, b"hosts = [\"example.com\"]\n").unwrap();
+        let cli = Args::try_parse_from([
+            "tlschecker",
+            "--config",
+            config_file.path().to_str().unwrap(),
+            "--check-revocation",
+            "--grade",
+        ])
+        .unwrap();
+        let final_config = load_config(&cli).unwrap();
+        assert!(final_config.check_revocation);
+        assert!(final_config.grade);
     }
 
     // ── OutFormat Display tests ──────────────────────────────────────
