@@ -157,7 +157,7 @@ pub struct ProtocolSupport {
 /// cipher could not be set or the handshake failed for any reason.
 fn try_handshake(
     host: &str,
-    port: u16,
+    addr: std::net::SocketAddr,
     version: SslVersion,
     cipher_list: Option<&str>,
     ciphersuites: Option<&str>,
@@ -180,9 +180,6 @@ fn try_handshake(
     let mut ssl = Ssl::new(&ctx).ok()?;
     ssl.set_hostname(host).ok()?;
 
-    // Use the (host, port) tuple rather than "{host}:{port}" so IPv6 literals
-    // (e.g. "::1") resolve correctly without needing bracket syntax.
-    let addr = (host, port).to_socket_addrs().ok()?.next()?;
     let tcp = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
     tcp.set_read_timeout(Some(PROBE_TIMEOUT)).ok()?;
     tcp.set_write_timeout(Some(PROBE_TIMEOUT)).ok()?;
@@ -204,8 +201,9 @@ fn try_handshake(
 ///
 /// # Returns
 ///
-/// A [`TlsScan`] describing per-version support, or [`TLSError::Validation`]
-/// if the hostname is empty.
+/// A [`TlsScan`] describing per-version support, [`TLSError::Validation`] if
+/// the hostname is empty, or a connection/DNS error when the host does not
+/// resolve.
 #[instrument]
 pub fn scan_tls(host: &str, port: Option<u16>) -> Result<TlsScan, TLSError> {
     // Strip IPv6 brackets so "[::1]" resolves like the bare "::1".
@@ -215,16 +213,26 @@ pub fn scan_tls(host: &str, port: Option<u16>) -> Result<TlsScan, TLSError> {
     }
     let port = port.unwrap_or(443);
 
+    // Resolve once up front: a scan performs on the order of a hundred
+    // handshake attempts, and per-attempt resolution would both hammer the
+    // resolver and risk probing different IPs of a multi-address host,
+    // making per-version results incoherent.
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(TLSError::Connection)?
+        .next()
+        .ok_or_else(|| TLSError::DNS("Failed parse remote hostname".to_string()))?;
+
     let mut protocols = Vec::with_capacity(VERSIONS.len());
     for &(ssl_version, version) in VERSIONS {
         // Is this version accepted at all (with a default cipher selection)?
-        let supported = try_handshake(host, port, ssl_version, None, None).is_some();
+        let supported = try_handshake(host, addr, ssl_version, None, None).is_some();
 
         let mut ciphers = Vec::new();
         if supported {
             if ssl_version == SslVersion::TLS1_3 {
                 for suite in TLS13_CIPHERS {
-                    if let Some(name) = try_handshake(host, port, ssl_version, None, Some(suite)) {
+                    if let Some(name) = try_handshake(host, addr, ssl_version, None, Some(suite)) {
                         if !ciphers.contains(&name) {
                             ciphers.push(name);
                         }
@@ -232,7 +240,7 @@ pub fn scan_tls(host: &str, port: Option<u16>) -> Result<TlsScan, TLSError> {
                 }
             } else {
                 for cipher in LEGACY_CIPHERS {
-                    if let Some(name) = try_handshake(host, port, ssl_version, Some(cipher), None) {
+                    if let Some(name) = try_handshake(host, addr, ssl_version, Some(cipher), None) {
                         if !ciphers.contains(&name) {
                             ciphers.push(name);
                         }

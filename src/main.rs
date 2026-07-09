@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::thread;
 mod config;
 mod metrics;
@@ -717,6 +719,97 @@ impl FinalConfig {
     }
 }
 
+/// Upper bound on concurrent host checks; the pool also never exceeds the
+/// machine's available parallelism or the number of hosts.
+const MAX_CONCURRENT_CHECKS: usize = 16;
+
+/// Checks a single host: TLS connection plus the optional scan and CT lookup.
+///
+/// Returns `None` when the host could not be checked at all; the reason is
+/// logged to stderr before returning.
+fn check_host(
+    host_port: &HostPort,
+    check_revocation: bool,
+    calculate_grade: bool,
+    do_scan: bool,
+    do_ct: bool,
+) -> Option<TLS> {
+    let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
+
+    match TLS::from(
+        &host_port.host,
+        host_port.port,
+        check_revocation,
+        calculate_grade,
+    ) {
+        Ok(mut cert) => {
+            if do_scan {
+                if let Ok(scan) = tlschecker::probe::scan_tls(&host_port.host, host_port.port) {
+                    // Fold scan-derived warnings into the result and
+                    // recompute the grade to reflect full posture.
+                    cert.apply_scan(scan);
+                }
+            }
+            if do_ct {
+                // Look the leaf up in public CT logs (crt.sh, by
+                // SHA-256 fingerprint). A failed/inconclusive lookup
+                // is non-fatal: the reason is logged to stderr and the
+                // result is recorded as `Unknown` rather than dropped,
+                // so "could not check" is never mistaken for "absent".
+                let ct = match tlschecker::ct::check_ct_status(&cert.certificate.cert_sha256) {
+                    Ok(ct) => ct,
+                    Err(e) => {
+                        warn!(
+                            "CT lookup could not be completed for {}{}: {}",
+                            host_port.host, port_display, e
+                        );
+                        tlschecker::ct::CtStatus::Unknown
+                    }
+                };
+                cert.apply_ct(ct);
+            }
+            Some(cert)
+        }
+        Err(err) => {
+            match err {
+                TLSError::DNS(msg) => {
+                    error!(
+                        "Cannot resolve hostname: {}{}",
+                        host_port.host, port_display
+                    );
+                    error!("  - {}", msg);
+                }
+                TLSError::Connection(e) => {
+                    error!(
+                        "Connection refused for host: {}{}",
+                        host_port.host, port_display
+                    );
+                    error!("  - {}", e);
+                }
+                TLSError::Certificate(msg) => {
+                    error!(
+                        "Certificate issue with host: {}{}",
+                        host_port.host, port_display
+                    );
+                    error!("  - {}", msg);
+                }
+                TLSError::Validation(msg) => {
+                    error!(
+                        "Validation error for host: {}{}",
+                        host_port.host, port_display
+                    );
+                    error!("  - {}", msg);
+                }
+                _ => {
+                    error!("Failed to check host: {}{}", host_port.host, port_display);
+                    error!("  - {}", err);
+                }
+            }
+            None
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // Initialize tracing. Diagnostics (errors, warnings) go to stderr so stdout
     // stays a clean machine-readable stream — e.g. `-o json ... | jq` is not
@@ -774,122 +867,71 @@ fn main() -> Result<()> {
     // scanned posture, so enable grading whenever scanning.
     let calculate_grade = should_grade(final_config.grade, do_scan);
 
-    let mut handles = Vec::new();
+    // Check hosts through a bounded worker pool rather than one thread per
+    // host: a large host list would otherwise spawn an unbounded number of
+    // threads, each potentially holding a 30s connection timeout.
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(MAX_CONCURRENT_CHECKS)
+        .min(hosts_len.max(1));
 
-    for host_port in hosts_and_ports {
-        let handle = thread::spawn(move || {
-            let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
+    let queue: Arc<Mutex<VecDeque<(usize, HostPort)>>> =
+        Arc::new(Mutex::new(hosts_and_ports.into_iter().enumerate().collect()));
 
-            match TLS::from(
-                &host_port.host,
-                host_port.port,
-                check_revocation,
-                calculate_grade,
-            ) {
-                Ok(mut cert) => {
-                    if do_scan {
-                        if let Ok(scan) =
-                            tlschecker::probe::scan_tls(&host_port.host, host_port.port)
-                        {
-                            // Fold scan-derived warnings into the result and
-                            // recompute the grade to reflect full posture.
-                            cert.apply_scan(scan);
-                        }
-                    }
-                    if do_ct {
-                        // Look the leaf up in public CT logs (crt.sh, by
-                        // SHA-256 fingerprint). A failed/inconclusive lookup
-                        // is non-fatal: the reason is logged to stderr and the
-                        // result is recorded as `Unknown` rather than dropped,
-                        // so "could not check" is never mistaken for "absent".
-                        let ct =
-                            match tlschecker::ct::check_ct_status(&cert.certificate.cert_sha256) {
-                                Ok(ct) => ct,
-                                Err(e) => {
-                                    warn!(
-                                        "CT lookup could not be completed for {}{}: {}",
-                                        host_port.host, port_display, e
-                                    );
-                                    tlschecker::ct::CtStatus::Unknown
-                                }
-                            };
-                        cert.apply_ct(ct);
-                    }
-                    Some(cert)
-                }
-                Err(err) => {
-                    match err {
-                        TLSError::DNS(msg) => {
-                            error!(
-                                "Cannot resolve hostname: {}{}",
-                                host_port.host, port_display
-                            );
-                            error!("  - {}", msg);
-                        }
-                        TLSError::Connection(e) => {
-                            error!(
-                                "Connection refused for host: {}{}",
-                                host_port.host, port_display
-                            );
-                            error!("  - {}", e);
-                        }
-                        TLSError::Certificate(msg) => {
-                            error!(
-                                "Certificate issue with host: {}{}",
-                                host_port.host, port_display
-                            );
-                            error!("  - {}", msg);
-                        }
-                        TLSError::Validation(msg) => {
-                            error!(
-                                "Validation error for host: {}{}",
-                                host_port.host, port_display
-                            );
-                            error!("  - {}", msg);
-                        }
-                        _ => {
-                            error!("Failed to check host: {}{}", host_port.host, port_display);
-                            error!("  - {}", err);
-                        }
-                    }
-                    None
-                }
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        handles.push(thread::spawn(move || {
+            let mut outcomes = Vec::new();
+            loop {
+                let job = queue.lock().unwrap().pop_front();
+                let Some((index, host_port)) = job else { break };
+                outcomes.push((
+                    index,
+                    check_host(&host_port, check_revocation, calculate_grade, do_scan, do_ct),
+                ));
             }
-        });
-        handles.push(handle);
+            outcomes
+        }));
     }
 
-    let mut results: Vec<TLS> = Vec::with_capacity(hosts_len);
-
+    // Collect into index-order slots so the output order matches the input
+    // order regardless of which worker handled which host.
+    let mut slots: Vec<Option<Option<TLS>>> = std::iter::repeat_with(|| None)
+        .take(hosts_len)
+        .collect();
     for handle in handles {
         match handle.join() {
-            Ok(Some(tls_result)) => results.push(tls_result),
-            Ok(None) => error_count += 1, // Error already logged inside the thread
+            Ok(outcomes) => {
+                for (index, outcome) in outcomes {
+                    slots[index] = Some(outcome);
+                }
+            }
             Err(panic_err) => {
                 error!("A worker thread panicked unexpectedly: {:?}", panic_err);
-                error_count += 1;
             }
         }
     }
 
-    let expired_certs = &results
-        .clone()
-        .into_iter()
-        .filter(|c| c.certificate.is_expired)
-        .collect::<Vec<_>>();
+    let mut results: Vec<TLS> = Vec::with_capacity(hosts_len);
+    for slot in slots {
+        match slot {
+            Some(Some(tls_result)) => results.push(tls_result),
+            // Error already logged inside the worker, or the host was lost to
+            // a worker panic.
+            Some(None) | None => error_count += 1,
+        }
+    }
 
-    let revoked_certs = &results
-        .clone()
-        .into_iter()
-        .filter(|c| {
-            matches!(
-                c.certificate.revocation_status,
-                RevocationStatus::Revoked(_)
-            )
-        })
-        .collect::<Vec<_>>();
-
-    if !expired_certs.is_empty() || !revoked_certs.is_empty() {
+    let any_expired = results.iter().any(|c| c.certificate.is_expired);
+    let any_revoked = results.iter().any(|c| {
+        matches!(
+            c.certificate.revocation_status,
+            RevocationStatus::Revoked(_)
+        )
+    });
+    if any_expired || any_revoked {
         failed_result = true;
     }
 
@@ -915,11 +957,7 @@ fn main() -> Result<()> {
             print!("{}", r.certificate.pem);
         }
     } else {
-        let formatter = match final_config.output {
-            OutFormat::Json => FormatterFactory::new_formatter(&OutFormat::Json),
-            OutFormat::Text => FormatterFactory::new_formatter(&OutFormat::Text),
-            OutFormat::Summary => FormatterFactory::new_formatter(&OutFormat::Summary),
-        };
+        let formatter = FormatterFactory::new_formatter(&final_config.output);
         print!("{}", formatter.format(&results));
     }
 
