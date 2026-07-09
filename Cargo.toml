@@ -21,6 +21,9 @@ comfy-table = "7.2.2"
 strum = "0.28.0"
 strum_macros = "0.28.0"
 url = "2.5.8"
+# Already in the dependency tree via `url`; used directly for IDN -> A-label
+# (punycode) hostname conversion.
+idna = "1.1.0"
 reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 toml = "1.1.2"
 tempfile = "3.27.0"

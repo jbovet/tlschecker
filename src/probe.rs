@@ -206,8 +206,10 @@ fn try_handshake(
 /// resolve.
 #[instrument]
 pub fn scan_tls(host: &str, port: Option<u16>) -> Result<TlsScan, TLSError> {
-    // Strip IPv6 brackets so "[::1]" resolves like the bare "::1".
-    let host = crate::unbracket_host(host.trim());
+    // Strip IPv6 brackets so "[::1]" resolves like the bare "::1", and
+    // convert IDN hostnames to their ASCII form for resolution.
+    let host = crate::to_ascii_hostname(crate::unbracket_host(host.trim()));
+    let host = host.as_str();
     if host.is_empty() {
         return Err(TLSError::Validation("Hostname cannot be empty".to_string()));
     }

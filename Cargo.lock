@@ -1832,6 +1832,7 @@ dependencies = [
  "anyhow",
  "clap",
  "comfy-table",
+ "idna",
  "openssl",
  "prometheus",
  "reqwest 0.13.4",

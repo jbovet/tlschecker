@@ -432,7 +432,9 @@ fn is_chain_well_ordered(chain: &[X509]) -> bool {
 ///
 /// `true` if the certificate is valid for the hostname, `false` otherwise.
 pub fn cert_matches_hostname(hostname: &str, cert: &X509) -> bool {
-    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+    // Certificates carry DNS names in ASCII A-label form; convert an IDN
+    // input (e.g. "bücher.example") before comparing.
+    let hostname = to_ascii_hostname(hostname.trim_end_matches('.')).to_ascii_lowercase();
     if hostname.is_empty() {
         return false;
     }
@@ -500,6 +502,21 @@ pub(crate) fn unbracket_host(host: &str) -> &str {
     host.strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host)
+}
+
+/// Converts an internationalized (IDN) hostname to its ASCII A-label
+/// (punycode) form, e.g. `bücher.example` -> `xn--bcher-kva.example`.
+///
+/// Certificates carry SAN entries in A-label form, and DNS resolution likewise
+/// expects ASCII, so user-supplied unicode hostnames are converted before
+/// matching or resolving. Already-ASCII input is returned unchanged, and a
+/// failed conversion falls back to the original string (which will then fail
+/// resolution/matching with the user's own spelling in the message).
+pub(crate) fn to_ascii_hostname(host: &str) -> String {
+    if host.is_ascii() {
+        return host.to_string();
+    }
+    idna::domain_to_ascii(host).unwrap_or_else(|_| host.to_string())
 }
 
 /// Matches a single certificate DNS name (which may be a wildcard) against a
@@ -1021,8 +1038,11 @@ impl TLS {
 
         // Trim any whitespace, and strip brackets that wrap IPv6 literals
         // (e.g. "[::1]" -> "::1") so address resolution and hostname matching
-        // both operate on a bare address.
-        let host = unbracket_host(host.trim());
+        // both operate on a bare address. Internationalized hostnames are
+        // converted to their ASCII A-label (punycode) form, which is what both
+        // DNS and certificate SAN entries use.
+        let host = to_ascii_hostname(unbracket_host(host.trim()));
+        let host = host.as_str();
 
         // Validate hostname is not empty
         if host.is_empty() {
@@ -2466,6 +2486,31 @@ mod tests {
         let cert = make_test_x509_with_sans("cn.example.com", &["san.example.com"]);
         assert!(super::cert_matches_hostname("san.example.com", &cert));
         assert!(!super::cert_matches_hostname("cn.example.com", &cert));
+    }
+
+    #[test]
+    fn test_cert_matches_hostname_idn() {
+        // Certificates carry SANs in A-label (punycode) form; a unicode input
+        // hostname must be converted before matching.
+        let cert = make_test_x509_with_sans(
+            "xn--bcher-kva.example",
+            &["xn--bcher-kva.example", "*.xn--bcher-kva.example"],
+        );
+        assert!(super::cert_matches_hostname("bücher.example", &cert));
+        assert!(super::cert_matches_hostname("www.bücher.example", &cert));
+        assert!(!super::cert_matches_hostname("bücherei.example", &cert));
+        // The A-label form itself still matches, of course.
+        assert!(super::cert_matches_hostname("xn--bcher-kva.example", &cert));
+    }
+
+    #[test]
+    fn test_to_ascii_hostname() {
+        assert_eq!(
+            super::to_ascii_hostname("bücher.example"),
+            "xn--bcher-kva.example"
+        );
+        // ASCII input passes through unchanged.
+        assert_eq!(super::to_ascii_hostname("example.com"), "example.com");
     }
 
     /// Creates a self-signed cert with the given iPAddress SANs (plus optional
