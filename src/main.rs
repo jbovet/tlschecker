@@ -379,20 +379,17 @@ impl Formatter for TextFormat {
                 writeln!(output, "\tDNS Name: {}", san).unwrap();
             }
 
-            match &cert.chain {
-                Some(chains) => {
-                    writeln!(output, "Additional Certificates (if supplied):").unwrap();
-                    for (i, c) in chains.iter().enumerate() {
-                        writeln!(output, "Chain #{:?}", i + 1).unwrap();
-                        writeln!(output, "\tSubject: {:?}", c.subject).unwrap();
-                        writeln!(output, "\tValid from: {:?}", c.valid_from).unwrap();
-                        writeln!(output, "\tValid until: {:?}", c.valid_to).unwrap();
-                        writeln!(output, "\tIssuer: {:?}", c.issuer).unwrap();
-                        writeln!(output, "\tSignature algorithm: {:?}", c.signature_algorithm)
-                            .unwrap();
-                    }
+            if let Some(chains) = &cert.chain {
+                writeln!(output, "Additional Certificates (if supplied):").unwrap();
+                for (i, c) in chains.iter().enumerate() {
+                    writeln!(output, "Chain #{:?}", i + 1).unwrap();
+                    writeln!(output, "\tSubject: {:?}", c.subject).unwrap();
+                    writeln!(output, "\tValid from: {:?}", c.valid_from).unwrap();
+                    writeln!(output, "\tValid until: {:?}", c.valid_to).unwrap();
+                    writeln!(output, "\tIssuer: {:?}", c.issuer).unwrap();
+                    writeln!(output, "\tSignature algorithm: {:?}", c.signature_algorithm)
+                        .unwrap();
                 }
-                None => todo!(),
             }
         }
         output
@@ -1448,6 +1445,16 @@ mod tests {
             scan: None,
             ct: None,
         }
+    }
+
+    #[test]
+    fn test_text_format_without_chain_does_not_panic() {
+        // Regression: the `chain: None` arm used to be `todo!()`.
+        let mut tls = make_test_tls();
+        tls.certificate.chain = None;
+        let output = TextFormat.format(&[tls]);
+        assert!(output.contains("Hostname: test.example.com"));
+        assert!(!output.contains("Additional Certificates"));
     }
 
     #[test]

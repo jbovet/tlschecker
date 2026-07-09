@@ -929,8 +929,14 @@ pub fn check_crl_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus,
             }
         };
 
-        // Verify the CRL signature
-        if crl.verify(&issuer.public_key().unwrap()).is_err() {
+        // Verify the CRL signature. An issuer whose public key cannot be
+        // extracted is treated like a failed verification: skip this CRL
+        // (degrading to `Unknown`) rather than panicking.
+        let issuer_key = match issuer.public_key() {
+            Ok(key) => key,
+            Err(_) => continue,
+        };
+        if crl.verify(&issuer_key).is_err() {
             continue; // CRL signature verification failed
         }
 
@@ -1194,10 +1200,12 @@ impl TLS {
 fn from_entries(mut entries: X509NameEntries) -> String {
     match entries.next() {
         None => "None".to_string(),
-        Some(x509_name_ref) => x509_name_ref
-            .data()
-            .to_string()
-            .expect("Failed to convert data to UTF-8"),
+        // A certificate under inspection may carry non-UTF-8 name entries;
+        // degrade to a lossy conversion instead of panicking on it.
+        Some(x509_name_ref) => match x509_name_ref.data().to_string() {
+            Ok(s) => s,
+            Err(_) => String::from_utf8_lossy(x509_name_ref.data().as_slice()).into_owned(),
+        },
     }
 }
 
@@ -1293,7 +1301,11 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         validity_days: get_validity_days(cert_ref.not_after()),
         validity_hours: get_validity_in_hours(cert_ref.not_after()),
         is_expired: has_expired(cert_ref.not_after()),
-        cert_sn: cert_ref.serial_number().to_bn().unwrap().to_string(),
+        cert_sn: cert_ref
+            .serial_number()
+            .to_bn()
+            .map(|bn| bn.to_string())
+            .unwrap_or_else(|_| "Unknown".to_string()),
         cert_ver: cert_ref.version().to_string(),
         cert_alg: cert_ref.signature_algorithm().object().to_string(),
         sans,
@@ -1326,7 +1338,26 @@ fn fingerprint(cert_ref: &X509, digest: openssl::hash::MessageDigest) -> String 
     }
 }
 
+/// Computes the time remaining until certificate expiration.
+///
+/// Returns the openssl `TimeDiff` (days + leftover seconds, both negative when
+/// already expired), or `None` if the current time or the diff cannot be
+/// computed — callers degrade to zero rather than panicking.
+fn validity_diff(not_after: &Asn1TimeRef) -> Option<openssl::asn1::TimeDiff> {
+    let now = Asn1Time::days_from_now(0).ok()?;
+    match now.deref().diff(not_after) {
+        Ok(diff) => Some(diff),
+        Err(_) => {
+            warn!("Failed to compute certificate validity period");
+            None
+        }
+    }
+}
+
 /// Calculates the number of hours until certificate expiration.
+///
+/// Unlike `days * 24`, this includes the sub-day remainder, so a certificate
+/// expiring in 10 hours reports 10 rather than 0.
 ///
 /// # Arguments
 ///
@@ -1336,7 +1367,9 @@ fn fingerprint(cert_ref: &X509, digest: openssl::hash::MessageDigest) -> String 
 ///
 /// Number of hours until expiration (negative if already expired).
 fn get_validity_in_hours(not_after: &Asn1TimeRef) -> i32 {
-    get_validity_days(not_after) * 24
+    validity_diff(not_after)
+        .map(|diff| diff.days * 24 + diff.secs / 3600)
+        .unwrap_or(0)
 }
 
 /// Calculates the number of days until certificate expiration.
@@ -1349,12 +1382,7 @@ fn get_validity_in_hours(not_after: &Asn1TimeRef) -> i32 {
 ///
 /// Number of days until expiration (negative if already expired).
 fn get_validity_days(not_after: &Asn1TimeRef) -> i32 {
-    Asn1Time::days_from_now(0)
-        .unwrap()
-        .deref()
-        .diff(not_after)
-        .unwrap()
-        .days
+    validity_diff(not_after).map(|diff| diff.days).unwrap_or(0)
 }
 
 /// Checks whether a certificate has expired.
@@ -1973,10 +2001,11 @@ mod tests {
         assert!(!tls_result.certificate.is_expired);
         assert!(tls_result.certificate.validity_days > 0);
         assert!(tls_result.certificate.validity_hours > 0);
-        assert_eq!(
-            tls_result.certificate.validity_hours,
-            tls_result.certificate.validity_days * 24
-        );
+        // Hours include the sub-day remainder, so they fall between the whole
+        // days and the next full day.
+        let days = tls_result.certificate.validity_days;
+        let hours = tls_result.certificate.validity_hours;
+        assert!(hours >= days * 24 && hours < (days + 1) * 24);
     }
 
     #[test]
@@ -2028,6 +2057,25 @@ mod tests {
         builder.sign(&pkey, MessageDigest::sha256()).unwrap();
 
         (builder.build(), pkey)
+    }
+
+    #[test]
+    fn test_validity_hours_includes_subday_remainder() {
+        // A certificate expiring in ~10 hours must report 0 days but ~10
+        // hours (regression: hours used to be computed as days * 24).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let not_after = Asn1Time::from_unix(now + 10 * 3600).unwrap();
+
+        assert_eq!(crate::get_validity_days(&not_after), 0);
+        let hours = crate::get_validity_in_hours(&not_after);
+        assert!(
+            (9..=10).contains(&hours),
+            "expected ~10 hours remaining, got {}",
+            hours
+        );
     }
 
     /// Creates a certificate signed by an issuer (not self-signed).
