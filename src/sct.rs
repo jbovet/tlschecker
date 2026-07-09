@@ -17,8 +17,6 @@
 //! TLS-serialized SCT list by hand. It is **best-effort and never fails the
 //! caller** — any malformed or absent structure yields an empty list.
 
-use std::convert::TryInto;
-
 use openssl::x509::X509Ref;
 use serde::{Deserialize, Serialize};
 
