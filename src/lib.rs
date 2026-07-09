@@ -940,6 +940,15 @@ pub fn check_crl_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus,
             continue; // CRL signature verification failed
         }
 
+        // Reject stale CRLs: a correctly-signed but expired CRL (nextUpdate in
+        // the past) may predate a revocation, so trusting it could mask a
+        // revoked certificate — e.g. an on-path attacker replaying an old CRL.
+        // Skipping degrades to `Unknown`, mirroring the OCSP
+        // verification-failure handling.
+        if !is_crl_fresh(&crl, crl_url) {
+            continue;
+        }
+
         // Check if the certificate is in the CRL
         match crl.get_by_cert(cert) {
             CrlStatus::Revoked(revoked) => {
@@ -966,6 +975,36 @@ pub fn check_crl_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus,
 
     // If we've tried all CRLs and none worked or none contained information about this certificate
     Ok(RevocationStatus::Unknown)
+}
+
+/// Checks whether a CRL is still fresh enough to be trusted.
+///
+/// Returns `false` when `nextUpdate` lies in the past — a correctly-signed but
+/// stale CRL may predate a revocation and must not be relied upon. `nextUpdate`
+/// is optional per RFC 5280; when absent the CRL is accepted (returns `true`)
+/// but a warning is logged, since freshness cannot be established. `source` is
+/// only used to make the log messages actionable.
+fn is_crl_fresh(crl: &X509Crl, source: &str) -> bool {
+    match crl.next_update() {
+        Some(next_update) => {
+            if has_expired(next_update) {
+                warn!(
+                    "CRL from {} is stale (nextUpdate {} is in the past); ignoring it",
+                    source, next_update
+                );
+                false
+            } else {
+                true
+            }
+        }
+        None => {
+            warn!(
+                "CRL from {} carries no nextUpdate; accepting it but freshness cannot be verified",
+                source
+            );
+            true
+        }
+    }
 }
 
 impl TLS {
@@ -2057,6 +2096,67 @@ mod tests {
         builder.sign(&pkey, MessageDigest::sha256()).unwrap();
 
         (builder.build(), pkey)
+    }
+
+    /// Builds a signed CRL whose `nextUpdate` is `next_update_offset_secs`
+    /// from now (negative = already stale). The builder requires an AKID,
+    /// a CRL number, and at least one revoked entry, so those are included.
+    fn make_test_crl(next_update_offset_secs: i64) -> openssl::x509::X509Crl {
+        use openssl::x509::extension::AuthorityKeyIdentifier;
+        use openssl::x509::{CrlNumber, X509CrlBuilder, X509RevokedBuilder};
+
+        let (issuer_cert, issuer_key) = make_test_x509("Test CA");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let mut revoked = X509RevokedBuilder::new().unwrap();
+        revoked
+            .set_serial_number(&BigNum::from_u32(1024).unwrap().to_asn1_integer().unwrap())
+            .unwrap();
+        revoked
+            .set_revocation_date(&Asn1Time::from_unix(now - 86_400).unwrap())
+            .unwrap();
+
+        let dummy = X509Builder::new().unwrap();
+        let ctx = dummy.x509v3_context(Some(issuer_cert.as_ref()), None);
+        let aki = AuthorityKeyIdentifier::new()
+            .issuer(true)
+            .build(&ctx)
+            .unwrap();
+        let crl_number = CrlNumber::new(BigNum::from_u32(1).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut builder = X509CrlBuilder::new().unwrap();
+        builder.set_issuer_name(issuer_cert.subject_name()).unwrap();
+        builder
+            .set_last_update(&Asn1Time::from_unix(now - 7 * 86_400).unwrap())
+            .unwrap();
+        builder
+            .set_next_update(&Asn1Time::from_unix(now + next_update_offset_secs).unwrap())
+            .unwrap();
+        builder.append_extension(aki).unwrap();
+        builder.append_extension(crl_number).unwrap();
+        builder.add_revoked(revoked.build()).unwrap();
+        builder.sign(&issuer_key, MessageDigest::sha256()).unwrap();
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn test_stale_crl_is_rejected() {
+        // nextUpdate a day in the past -> stale, must not be trusted.
+        let crl = make_test_crl(-86_400);
+        assert!(!crate::is_crl_fresh(&crl, "test"));
+    }
+
+    #[test]
+    fn test_fresh_crl_is_accepted() {
+        // nextUpdate a week in the future -> fresh.
+        let crl = make_test_crl(7 * 86_400);
+        assert!(crate::is_crl_fresh(&crl, "test"));
     }
 
     #[test]
