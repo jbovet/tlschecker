@@ -44,6 +44,19 @@ sudo install tlschecker /usr/local/bin/tlschecker
 ➜  tlschecker --help
 ```
 
+### Interactive dashboard
+
+When run in an interactive terminal, tlschecker opens a live dashboard by
+default: hosts stream in as they are checked, with a fleet list and verdict
+tally on the left and a detail pane (expiry lifetime gauge, TLS grade
+breakdown, security warnings) for the selected host on the right. Navigate
+with `j`/`k` (or arrow keys), jump with `g`/`G`, quit with `q`.
+
+The classic text outputs are used automatically whenever stdout is piped or
+redirected, and can always be forced with `-o summary|json|text` — so
+scripts, CI pipelines, and `tlschecker -o json | jq` behave exactly as
+before.
+
 ## Examples
 
 Basic usage:
