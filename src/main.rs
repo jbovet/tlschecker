@@ -93,6 +93,16 @@ struct Args {
     #[arg(long)]
     export_pem: bool,
 
+    /// Treat hosts that could not be checked at all as failures for
+    /// exit-code purposes.
+    ///
+    /// By default an unreachable host (DNS failure, refused connection,
+    /// handshake error, invalid address) is only logged and does not affect
+    /// the exit code. With this flag, any such error makes the run exit with
+    /// --exit-code, so CI pipelines can catch hosts that are down entirely.
+    #[arg(long)]
+    fail_on_error: bool,
+
     /// Look the presented leaf certificate up in public Certificate
     /// Transparency logs (via crt.sh).
     ///
@@ -643,6 +653,7 @@ impl FormatterFactory {
 ///
 /// Represents the result of parsing a host address specification,
 /// which may include a port number or use the default port 443.
+#[derive(Debug)]
 struct HostPort {
     /// Hostname or IP address (IPv6 brackets are removed)
     host: String,
@@ -740,12 +751,19 @@ fn main() -> Result<()> {
     let exit_code = final_config.exit_code;
     let mut failed_result = false;
 
-    // Parse hosts and ports
-    let hosts_and_ports: Vec<HostPort> = final_config
-        .addresses
-        .iter()
-        .map(|address| parse_host_port(address))
-        .collect();
+    // Parse hosts and ports; invalid addresses are reported and counted as
+    // errored hosts rather than silently checked as bogus hostnames.
+    let mut error_count: usize = 0;
+    let mut hosts_and_ports: Vec<HostPort> = Vec::with_capacity(final_config.addresses.len());
+    for address in &final_config.addresses {
+        match parse_host_port(address) {
+            Ok(host_port) => hosts_and_ports.push(host_port),
+            Err(msg) => {
+                error!("Skipping '{}': {}", address, msg);
+                error_count += 1;
+            }
+        }
+    }
 
     let hosts_len = hosts_and_ports.len();
     let check_revocation = final_config.check_revocation;
@@ -846,9 +864,10 @@ fn main() -> Result<()> {
     for handle in handles {
         match handle.join() {
             Ok(Some(tls_result)) => results.push(tls_result),
-            Ok(None) => {} // Error already logged inside the thread
+            Ok(None) => error_count += 1, // Error already logged inside the thread
             Err(panic_err) => {
                 error!("A worker thread panicked unexpectedly: {:?}", panic_err);
+                error_count += 1;
             }
         }
     }
@@ -871,6 +890,12 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>();
 
     if !expired_certs.is_empty() || !revoked_certs.is_empty() {
+        failed_result = true;
+    }
+
+    // With --fail-on-error, hosts that could not be checked at all (invalid
+    // address, DNS failure, connection/handshake error) count as failures.
+    if cli.fail_on_error && error_count > 0 {
         failed_result = true;
     }
 
@@ -1018,14 +1043,16 @@ fn should_grade(config_grade: bool, scan: bool) -> bool {
 ///
 /// # Returns
 ///
-/// A `HostPort` struct containing the extracted hostname and optional port.
+/// `Ok(HostPort)` with the extracted hostname and optional port, or an error
+/// message when the address carries a port specification that is not a valid
+/// port number (e.g. `example.com:99999`).
 ///
 /// # Note
 ///
 /// - IPv6 brackets are automatically removed from the hostname
 /// - If no port is specified, returns `None` for the port (defaults to 443)
 /// - URL schemes (http://, https://) are stripped and ignored
-fn parse_host_port(address: &str) -> HostPort {
+fn parse_host_port(address: &str) -> Result<HostPort, String> {
     // Try to fix common user mistakes by adding https:// if missing a scheme
     let address_with_scheme = if !address.contains("://") {
         format!("https://{}", address)
@@ -1037,10 +1064,10 @@ fn parse_host_port(address: &str) -> HostPort {
     if let Ok(url) = Url::parse(&address_with_scheme) {
         // If it's a valid URL, extract host and port
         if let Some(host_str) = url.host_str() {
-            return HostPort {
+            return Ok(HostPort {
                 host: host_str.to_string(),
                 port: url.port(),
-            };
+            });
         }
     }
 
@@ -1050,20 +1077,29 @@ fn parse_host_port(address: &str) -> HostPort {
         if let Ok(port) = port_str.parse::<u16>() {
             // Make sure we don't include IPv6 brackets in the hostname
             let clean_host = host.trim_start_matches('[').trim_end_matches(']');
-            return HostPort {
+            return Ok(HostPort {
                 host: clean_host.to_string(),
                 port: Some(port),
-            };
+            });
+        }
+        // The segment after the colon was clearly meant as a port but is not a
+        // valid one; report it instead of silently treating "host:99999" as a
+        // hostname (which would only surface later as a confusing DNS error).
+        if !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "Invalid port '{}' in address '{}' (ports must be 1-65535)",
+                port_str, address
+            ));
         }
     }
 
     // No port specified, just a hostname
     // For IPv6 addresses, clean up any brackets
     let clean_address = address.trim_start_matches('[').trim_end_matches(']');
-    HostPort {
+    Ok(HostPort {
         host: clean_address.to_string(),
         port: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1074,56 +1110,56 @@ mod tests {
 
     #[test]
     fn test_parse_host_port_hostname_only() {
-        let hp = parse_host_port("example.com");
+        let hp = parse_host_port("example.com").unwrap();
         assert_eq!(hp.host, "example.com");
         assert_eq!(hp.port, None);
     }
 
     #[test]
     fn test_parse_host_port_with_port() {
-        let hp = parse_host_port("example.com:8443");
+        let hp = parse_host_port("example.com:8443").unwrap();
         assert_eq!(hp.host, "example.com");
         assert_eq!(hp.port, Some(8443));
     }
 
     #[test]
     fn test_parse_host_port_https_url() {
-        let hp = parse_host_port("https://example.com:9443");
+        let hp = parse_host_port("https://example.com:9443").unwrap();
         assert_eq!(hp.host, "example.com");
         assert_eq!(hp.port, Some(9443));
     }
 
     #[test]
     fn test_parse_host_port_https_url_no_port() {
-        let hp = parse_host_port("https://example.com");
+        let hp = parse_host_port("https://example.com").unwrap();
         assert_eq!(hp.host, "example.com");
         assert_eq!(hp.port, None);
     }
 
     #[test]
     fn test_parse_host_port_http_url() {
-        let hp = parse_host_port("http://example.com:8080");
+        let hp = parse_host_port("http://example.com:8080").unwrap();
         assert_eq!(hp.host, "example.com");
         assert_eq!(hp.port, Some(8080));
     }
 
     #[test]
     fn test_parse_host_port_ipv4_with_port() {
-        let hp = parse_host_port("192.168.1.1:8443");
+        let hp = parse_host_port("192.168.1.1:8443").unwrap();
         assert_eq!(hp.host, "192.168.1.1");
         assert_eq!(hp.port, Some(8443));
     }
 
     #[test]
     fn test_parse_host_port_ipv4_no_port() {
-        let hp = parse_host_port("10.0.0.1");
+        let hp = parse_host_port("10.0.0.1").unwrap();
         assert_eq!(hp.host, "10.0.0.1");
         assert_eq!(hp.port, None);
     }
 
     #[test]
     fn test_parse_host_port_ipv6_with_port() {
-        let hp = parse_host_port("[::1]:443");
+        let hp = parse_host_port("[::1]:443").unwrap();
         // URL parser keeps brackets for IPv6 addresses
         assert_eq!(hp.host, "[::1]");
         // url.port() returns None for scheme-default ports (443 for HTTPS),
@@ -1133,27 +1169,27 @@ mod tests {
 
     #[test]
     fn test_parse_host_port_ipv6_with_non_default_port() {
-        let hp = parse_host_port("[::1]:8443");
+        let hp = parse_host_port("[::1]:8443").unwrap();
         assert_eq!(hp.host, "[::1]");
         assert_eq!(hp.port, Some(8443));
     }
 
     #[test]
     fn test_parse_host_port_ipv6_no_port() {
-        let hp = parse_host_port("[::1]");
+        let hp = parse_host_port("[::1]").unwrap();
         assert_eq!(hp.host, "[::1]");
         assert_eq!(hp.port, None);
     }
 
     #[test]
     fn test_parse_host_port_default_port_443() {
-        let hp = parse_host_port("example.com");
+        let hp = parse_host_port("example.com").unwrap();
         assert_eq!(hp.port, None); // None means default 443
     }
 
     #[test]
     fn test_parse_host_port_subdomain() {
-        let hp = parse_host_port("sub.domain.example.com:8443");
+        let hp = parse_host_port("sub.domain.example.com:8443").unwrap();
         assert_eq!(hp.host, "sub.domain.example.com");
         assert_eq!(hp.port, Some(8443));
     }
@@ -1204,6 +1240,23 @@ mod tests {
         let final_config = load_config(&cli).unwrap();
         assert!(final_config.check_revocation);
         assert!(final_config.grade);
+    }
+
+    #[test]
+    fn test_parse_host_port_invalid_port_is_error() {
+        let result = parse_host_port("example.com:99999");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid port '99999'"));
+    }
+
+    #[test]
+    fn test_parse_host_port_non_numeric_suffix_is_hostname() {
+        // A colon followed by non-digits is not a port specification; the
+        // address is treated as an (almost certainly unresolvable) hostname
+        // rather than rejected here.
+        let hp = parse_host_port("example.com:abc").unwrap();
+        assert_eq!(hp.host, "example.com:abc");
+        assert_eq!(hp.port, None);
     }
 
     // ── OutFormat Display tests ──────────────────────────────────────
