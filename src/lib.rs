@@ -160,6 +160,14 @@ pub struct CertificateInfo {
     pub valid_from: String,
     /// Certificate expiration date (ISO 8601 format)
     pub valid_to: String,
+    /// Certificate validity start as a Unix timestamp (seconds; 0 if it could
+    /// not be computed)
+    #[serde(default)]
+    pub valid_from_unix: i64,
+    /// Certificate expiration as a Unix timestamp (seconds; 0 if it could not
+    /// be computed)
+    #[serde(default)]
+    pub valid_to_unix: i64,
     /// Number of days until certificate expires (negative if expired)
     pub validity_days: i32,
     /// Number of hours until certificate expires (negative if expired)
@@ -1164,6 +1172,8 @@ impl TLS {
             issued: data.issued,
             valid_from: data.valid_from,
             valid_to: data.valid_to,
+            valid_from_unix: data.valid_from_unix,
+            valid_to_unix: data.valid_to_unix,
             validity_days: data.validity_days,
             validity_hours: data.validity_hours,
             is_expired: data.is_expired,
@@ -1357,6 +1367,8 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         issued: get_issuer(cert_ref),
         valid_from: cert_ref.not_before().to_string(),
         valid_to: cert_ref.not_after().to_string(),
+        valid_from_unix: asn1_time_to_unix(cert_ref.not_before()),
+        valid_to_unix: asn1_time_to_unix(cert_ref.not_after()),
         validity_days: get_validity_days(cert_ref.not_after()),
         validity_hours: get_validity_in_hours(cert_ref.not_after()),
         is_expired: has_expired(cert_ref.not_after()),
@@ -1394,6 +1406,24 @@ fn fingerprint(cert_ref: &X509, digest: openssl::hash::MessageDigest) -> String 
             .collect::<Vec<_>>()
             .join(":"),
         Err(_) => String::new(),
+    }
+}
+
+/// Converts an ASN.1 time to a Unix timestamp (seconds since the epoch).
+///
+/// Returns 0 when the conversion cannot be performed, consistent with the
+/// degrade-rather-than-panic handling elsewhere in certificate parsing.
+fn asn1_time_to_unix(t: &Asn1TimeRef) -> i64 {
+    let epoch = match Asn1Time::from_unix(0) {
+        Ok(epoch) => epoch,
+        Err(_) => return 0,
+    };
+    match epoch.deref().diff(t) {
+        Ok(diff) => i64::from(diff.days) * 86_400 + i64::from(diff.secs),
+        Err(_) => {
+            warn!("Failed to convert certificate timestamp");
+            0
+        }
     }
 }
 
@@ -1552,6 +1582,8 @@ mod tests {
                 },
                 valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
                 valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                valid_from_unix: 1_735_689_600,
+                valid_to_unix: 1_798_761_599,
                 validity_days: 365,
                 validity_hours: 8760,
                 is_expired: false,
@@ -1632,25 +1664,16 @@ mod tests {
         let host = "google.com";
         let tls_result = TLS::from(host, None, true, false).unwrap();
 
-        match tls_result.certificate.revocation_status {
-            RevocationStatus::Good | RevocationStatus::Unknown => {
-                // Either is acceptable since external OCSP responders might be unreliable
-                assert!(true);
-            }
-            RevocationStatus::Revoked(_) => {
-                // This would be unexpected for google.com - log it but don't fail
-                // since it could theoretically happen
-                println!("Unexpected RevocationStatus::Revoked for google.com");
-                assert!(true);
-            }
-            RevocationStatus::NotChecked => {
-                // This should not happen since we requested checking
-                assert!(
-                    false,
-                    "Revocation status should not be NotChecked when enabled"
-                );
-            }
-        }
+        // Good/Unknown are both acceptable (external OCSP responders can be
+        // unreliable) and Revoked would be surprising but is tolerated; only
+        // NotChecked is wrong, since checking was requested.
+        assert!(
+            !matches!(
+                tls_result.certificate.revocation_status,
+                RevocationStatus::NotChecked
+            ),
+            "Revocation status should not be NotChecked when enabled"
+        );
     }
 
     #[test]
@@ -2177,6 +2200,25 @@ mod tests {
         // nextUpdate a week in the future -> fresh.
         let crl = make_test_crl(7 * 86_400);
         assert!(crate::is_crl_fresh(&crl, "test"));
+    }
+
+    #[test]
+    fn test_unix_validity_timestamps() {
+        // make_test_x509 issues a cert valid from now for 365 days.
+        let (cert, _) = make_test_x509("unix.example.com");
+        let info = crate::get_certificate_info(&cert);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            (info.valid_from_unix - now).abs() < 300,
+            "valid_from_unix should be ~now, got {}",
+            info.valid_from_unix
+        );
+        let lifetime = info.valid_to_unix - info.valid_from_unix;
+        assert_eq!(lifetime, 365 * 86_400);
     }
 
     #[test]

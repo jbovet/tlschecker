@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
+use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 mod config;
 mod metrics;
+mod tui;
 
 use clap::{Parser, ValueEnum};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
@@ -187,6 +190,24 @@ trait Formatter {
     fn format(&self, tls: &[TLS]) -> String;
 }
 
+/// Returns the display label and message for a security warning.
+///
+/// Single source of truth for all frontends (text, summary, dashboard) so a
+/// new `SecurityWarning` variant only needs one new arm here.
+pub(crate) fn warning_label(warning: &tlschecker::SecurityWarning) -> (&'static str, &str) {
+    use tlschecker::SecurityWarning::*;
+    match warning {
+        WeakSignatureAlgorithm(msg) => ("WEAK ALGORITHM", msg),
+        IncompleteChain(msg) => ("INCOMPLETE CHAIN", msg),
+        InvalidChainOrder(msg) => ("INVALID CHAIN ORDER", msg),
+        HostnameMismatch(msg) => ("HOSTNAME MISMATCH", msg),
+        ExpiringIntermediate(msg) => ("EXPIRING INTERMEDIATE", msg),
+        WeakProtocol(msg) => ("WEAK PROTOCOL", msg),
+        WeakCipher(msg) => ("WEAK CIPHER", msg),
+        NotInCertificateTransparency(msg) => ("NOT IN CT LOG", msg),
+    }
+}
+
 /// Text formatter - outputs detailed certificate information.
 ///
 /// Displays all certificate fields in a human-readable text format,
@@ -286,32 +307,8 @@ impl Formatter for TextFormat {
             if !cert.security_warnings.is_empty() {
                 writeln!(output, "\nSecurity Warnings:").unwrap();
                 for warning in &cert.security_warnings {
-                    match warning {
-                        tlschecker::SecurityWarning::WeakSignatureAlgorithm(msg) => {
-                            writeln!(output, "  WEAK ALGORITHM: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::IncompleteChain(msg) => {
-                            writeln!(output, "  INCOMPLETE CHAIN: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::InvalidChainOrder(msg) => {
-                            writeln!(output, "  INVALID CHAIN ORDER: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::HostnameMismatch(msg) => {
-                            writeln!(output, "  HOSTNAME MISMATCH: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::ExpiringIntermediate(msg) => {
-                            writeln!(output, "  EXPIRING INTERMEDIATE: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::WeakProtocol(msg) => {
-                            writeln!(output, "  WEAK PROTOCOL: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::WeakCipher(msg) => {
-                            writeln!(output, "  WEAK CIPHER: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::NotInCertificateTransparency(msg) => {
-                            writeln!(output, "  NOT IN CT LOG: {}", msg).unwrap();
-                        }
-                    }
+                    let (label, msg) = warning_label(warning);
+                    writeln!(output, "  {}: {}", label, msg).unwrap();
                 }
             }
 
@@ -587,32 +584,8 @@ impl Formatter for SummaryFormat {
             for rs in certs_with_warnings {
                 writeln!(output, "\n  Host: {}", rs.certificate.hostname).unwrap();
                 for warning in &rs.certificate.security_warnings {
-                    match warning {
-                        tlschecker::SecurityWarning::WeakSignatureAlgorithm(msg) => {
-                            writeln!(output, "    - WEAK ALGORITHM: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::IncompleteChain(msg) => {
-                            writeln!(output, "    - INCOMPLETE CHAIN: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::InvalidChainOrder(msg) => {
-                            writeln!(output, "    - INVALID CHAIN ORDER: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::HostnameMismatch(msg) => {
-                            writeln!(output, "    - HOSTNAME MISMATCH: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::ExpiringIntermediate(msg) => {
-                            writeln!(output, "    - EXPIRING INTERMEDIATE: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::WeakProtocol(msg) => {
-                            writeln!(output, "    - WEAK PROTOCOL: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::WeakCipher(msg) => {
-                            writeln!(output, "    - WEAK CIPHER: {}", msg).unwrap();
-                        }
-                        tlschecker::SecurityWarning::NotInCertificateTransparency(msg) => {
-                            writeln!(output, "    - NOT IN CT LOG: {}", msg).unwrap();
-                        }
-                    }
+                    let (label, msg) = warning_label(warning);
+                    writeln!(output, "    - {}: {}", label, msg).unwrap();
                 }
             }
         }
@@ -672,6 +645,10 @@ struct HostPort {
 struct FinalConfig {
     addresses: Vec<String>,
     output: OutFormat,
+    /// Whether the output format was explicitly requested (CLI `-o` or config
+    /// file `output` key) rather than defaulted — an explicit choice opts out
+    /// of the TTY dashboard.
+    output_explicit: bool,
     exit_code: i32,
     prometheus: bool,
     prometheus_address: String,
@@ -707,6 +684,10 @@ impl FinalConfig {
         Ok(FinalConfig {
             addresses,
             output,
+            // Explicitness cannot be derived from the merged config (the
+            // defaults seed `output` with Some("summary")); `load_config`
+            // overrides this from the file/CLI sources.
+            output_explicit: false,
             exit_code: config.exit_code.unwrap_or(0),
             prometheus: prometheus_config.enabled.unwrap_or(false),
             prometheus_address: prometheus_config
@@ -725,98 +706,165 @@ const MAX_CONCURRENT_CHECKS: usize = 16;
 
 /// Checks a single host: TLS connection plus the optional scan and CT lookup.
 ///
-/// Returns `None` when the host could not be checked at all; the reason is
-/// logged to stderr before returning.
-fn check_host(
-    host_port: &HostPort,
+/// Returns the error unlogged so each frontend can present it its own way:
+/// the CLI path logs to stderr, the dashboard renders it as a failed row.
+fn check_host(host_port: &HostPort, opts: CheckOptions) -> Result<TLS, TLSError> {
+    let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
+
+    let mut cert = TLS::from(
+        &host_port.host,
+        host_port.port,
+        opts.check_revocation,
+        opts.calculate_grade,
+    )?;
+
+    if opts.do_scan {
+        if let Ok(scan) = tlschecker::probe::scan_tls(&host_port.host, host_port.port) {
+            // Fold scan-derived warnings into the result and
+            // recompute the grade to reflect full posture.
+            cert.apply_scan(scan);
+        }
+    }
+    if opts.do_ct {
+        // Look the leaf up in public CT logs (crt.sh, by
+        // SHA-256 fingerprint). A failed/inconclusive lookup
+        // is non-fatal: the reason is logged to stderr and the
+        // result is recorded as `Unknown` rather than dropped,
+        // so "could not check" is never mistaken for "absent".
+        let ct = match tlschecker::ct::check_ct_status(&cert.certificate.cert_sha256) {
+            Ok(ct) => ct,
+            Err(e) => {
+                warn!(
+                    "CT lookup could not be completed for {}{}: {}",
+                    host_port.host, port_display, e
+                );
+                tlschecker::ct::CtStatus::Unknown
+            }
+        };
+        cert.apply_ct(ct);
+    }
+    Ok(cert)
+}
+
+/// Options controlling what a single host check performs.
+#[derive(Clone, Copy)]
+struct CheckOptions {
     check_revocation: bool,
     calculate_grade: bool,
     do_scan: bool,
     do_ct: bool,
-) -> Option<TLS> {
-    let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
+}
 
-    match TLS::from(
-        &host_port.host,
-        host_port.port,
-        check_revocation,
-        calculate_grade,
-    ) {
-        Ok(mut cert) => {
-            if do_scan {
-                if let Ok(scan) = tlschecker::probe::scan_tls(&host_port.host, host_port.port) {
-                    // Fold scan-derived warnings into the result and
-                    // recompute the grade to reflect full posture.
-                    cert.apply_scan(scan);
-                }
-            }
-            if do_ct {
-                // Look the leaf up in public CT logs (crt.sh, by
-                // SHA-256 fingerprint). A failed/inconclusive lookup
-                // is non-fatal: the reason is logged to stderr and the
-                // result is recorded as `Unknown` rather than dropped,
-                // so "could not check" is never mistaken for "absent".
-                let ct = match tlschecker::ct::check_ct_status(&cert.certificate.cert_sha256) {
-                    Ok(ct) => ct,
-                    Err(e) => {
-                        warn!(
-                            "CT lookup could not be completed for {}{}: {}",
-                            host_port.host, port_display, e
-                        );
-                        tlschecker::ct::CtStatus::Unknown
-                    }
-                };
-                cert.apply_ct(ct);
-            }
-            Some(cert)
-        }
-        Err(err) => {
-            match err {
-                TLSError::DNS(msg) => {
-                    error!(
-                        "Cannot resolve hostname: {}{}",
-                        host_port.host, port_display
-                    );
-                    error!("  - {}", msg);
-                }
-                TLSError::Connection(e) => {
-                    error!(
-                        "Connection refused for host: {}{}",
-                        host_port.host, port_display
-                    );
-                    error!("  - {}", e);
-                }
-                TLSError::Certificate(msg) => {
-                    error!(
-                        "Certificate issue with host: {}{}",
-                        host_port.host, port_display
-                    );
-                    error!("  - {}", msg);
-                }
-                TLSError::Validation(msg) => {
-                    error!(
-                        "Validation error for host: {}{}",
-                        host_port.host, port_display
-                    );
-                    error!("  - {}", msg);
-                }
-                _ => {
-                    error!("Failed to check host: {}{}", host_port.host, port_display);
-                    error!("  - {}", err);
-                }
-            }
-            None
-        }
+/// The result of attempting to check one host.
+enum HostOutcome {
+    /// The check completed and produced certificate information.
+    Checked(Box<TLS>),
+    /// The host could not be checked at all.
+    Failed {
+        /// Short failure class for compact display (e.g. "DNS", "connection").
+        kind: &'static str,
+        /// Full error message for logs / detail views.
+        detail: String,
+    },
+}
+
+/// Maps a check error onto a short failure class for compact display.
+fn error_kind(err: &TLSError) -> &'static str {
+    match err {
+        TLSError::DNS(_) => "DNS",
+        TLSError::Connection(_) => "connection",
+        TLSError::Handshake(_) => "handshake",
+        TLSError::Certificate(_) => "certificate",
+        TLSError::Validation(_) => "invalid",
+        _ => "error",
     }
+}
+
+/// Runs all host checks on a bounded worker pool, streaming each outcome over
+/// a channel as soon as it completes.
+///
+/// `jobs` pairs each host's input-order index with either a parsed address or
+/// the parse-failure message (which is reported as an immediate
+/// [`HostOutcome::Failed`], so invalid addresses still occupy a row). Worker
+/// threads are detached; the channel closes once every job has been sent.
+/// A host check job: the host's input-order index paired with its parsed
+/// address (or the address parse error).
+type HostJob = (usize, Result<HostPort, String>);
+
+fn spawn_checks(
+    jobs: Vec<HostJob>,
+    opts: CheckOptions,
+) -> std::sync::mpsc::Receiver<(usize, HostOutcome)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // Bounded pool: a large host list would otherwise spawn an unbounded
+    // number of threads, each potentially holding a 30s connection timeout.
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(MAX_CONCURRENT_CHECKS)
+        .min(jobs.len().max(1));
+
+    let queue: Arc<Mutex<VecDeque<HostJob>>> = Arc::new(Mutex::new(jobs.into_iter().collect()));
+
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        thread::spawn(move || loop {
+            let job = queue.lock().unwrap().pop_front();
+            let Some((index, job)) = job else { break };
+            let outcome = match job {
+                Ok(host_port) => match check_host(&host_port, opts) {
+                    Ok(tls) => HostOutcome::Checked(Box::new(tls)),
+                    Err(err) => HostOutcome::Failed {
+                        kind: error_kind(&err),
+                        detail: err.to_string(),
+                    },
+                },
+                Err(msg) => HostOutcome::Failed {
+                    kind: "invalid",
+                    detail: msg,
+                },
+            };
+            // A closed receiver means the frontend is gone; stop working.
+            if tx.send((index, outcome)).is_err() {
+                break;
+            }
+        });
+    }
+
+    rx
+}
+
+/// True while the dashboard owns the terminal. Checked by the tracing writer
+/// so diagnostics are discarded instead of corrupting the alternate screen.
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Tracing writer: stderr normally, discarded while the dashboard is active.
+fn tracing_writer() -> Box<dyn std::io::Write> {
+    if TUI_ACTIVE.load(Ordering::Relaxed) {
+        Box::new(std::io::sink())
+    } else {
+        Box::new(std::io::stderr())
+    }
+}
+
+/// Whether to run the interactive dashboard instead of a text formatter.
+///
+/// The dashboard is the default on an interactive terminal, but never when the
+/// user asked for a specific output format (CLI `-o` or config `output` key)
+/// or a PEM export — those must keep producing the classic stream, and any
+/// piped/redirected stdout does too.
+fn use_dashboard(stdout_is_tty: bool, output_explicit: bool, export_pem: bool) -> bool {
+    stdout_is_tty && !output_explicit && !export_pem
 }
 
 fn main() -> Result<()> {
     // Initialize tracing. Diagnostics (errors, warnings) go to stderr so stdout
     // stays a clean machine-readable stream — e.g. `-o json ... | jq` is not
-    // corrupted by log lines.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .init();
+    // corrupted by log lines. (While the dashboard runs, they are discarded —
+    // see `tracing_writer`.)
+    tracing_subscriber::fmt().with_writer(tracing_writer).init();
 
     let cli = Args::parse();
 
@@ -844,83 +892,66 @@ fn main() -> Result<()> {
     let exit_code = final_config.exit_code;
     let mut failed_result = false;
 
-    // Parse hosts and ports; invalid addresses are reported and counted as
-    // errored hosts rather than silently checked as bogus hostnames.
-    let mut error_count: usize = 0;
-    let mut hosts_and_ports: Vec<HostPort> = Vec::with_capacity(final_config.addresses.len());
-    for address in &final_config.addresses {
-        match parse_host_port(address) {
-            Ok(host_port) => hosts_and_ports.push(host_port),
-            Err(msg) => {
-                error!("Skipping '{}': {}", address, msg);
-                error_count += 1;
-            }
-        }
-    }
+    // The dashboard is the default on a TTY; explicit output selection, PEM
+    // export, or piped stdout keep the classic formatters.
+    let dashboard = use_dashboard(
+        std::io::stdout().is_terminal(),
+        final_config.output_explicit,
+        cli.export_pem,
+    );
 
-    let hosts_len = hosts_and_ports.len();
-    let check_revocation = final_config.check_revocation;
-    let do_scan = cli.scan;
-    let do_ct = cli.ct_check;
-    // `--scan` implies `--grade`: a scan is only surfaced in the summary table
-    // via the grade, and the grade is most meaningful when it reflects the full
-    // scanned posture, so enable grading whenever scanning.
-    let calculate_grade = should_grade(final_config.grade, do_scan);
+    // Parse hosts and ports. Invalid addresses stay in the job list so they
+    // surface as failed rows (dashboard) / logged errors (CLI) in input order.
+    let labels: Vec<String> = final_config.addresses.clone();
+    let jobs: Vec<HostJob> = final_config
+        .addresses
+        .iter()
+        .map(|address| parse_host_port(address))
+        .enumerate()
+        .collect();
+    let hosts_len = jobs.len();
 
-    // Check hosts through a bounded worker pool rather than one thread per
-    // host: a large host list would otherwise spawn an unbounded number of
-    // threads, each potentially holding a 30s connection timeout.
-    let worker_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(MAX_CONCURRENT_CHECKS)
-        .min(hosts_len.max(1));
+    let opts = CheckOptions {
+        check_revocation: final_config.check_revocation,
+        // `--scan` implies `--grade` (the scan is surfaced via the grade), and
+        // the dashboard always grades: its detail pane shows the breakdown and
+        // grading is offline and cheap.
+        calculate_grade: should_grade(final_config.grade, cli.scan) || dashboard,
+        do_scan: cli.scan,
+        do_ct: cli.ct_check,
+    };
 
-    let queue: Arc<Mutex<VecDeque<(usize, HostPort)>>> =
-        Arc::new(Mutex::new(hosts_and_ports.into_iter().enumerate().collect()));
-
-    let mut handles = Vec::with_capacity(worker_count);
-    for _ in 0..worker_count {
-        let queue = Arc::clone(&queue);
-        handles.push(thread::spawn(move || {
-            let mut outcomes = Vec::new();
-            loop {
-                let job = queue.lock().unwrap().pop_front();
-                let Some((index, host_port)) = job else { break };
-                outcomes.push((
-                    index,
-                    check_host(&host_port, check_revocation, calculate_grade, do_scan, do_ct),
-                ));
-            }
-            outcomes
-        }));
-    }
+    let rx = spawn_checks(jobs, opts);
 
     // Collect into index-order slots so the output order matches the input
     // order regardless of which worker handled which host.
-    let mut slots: Vec<Option<Option<TLS>>> = std::iter::repeat_with(|| None)
-        .take(hosts_len)
-        .collect();
-    for handle in handles {
-        match handle.join() {
-            Ok(outcomes) => {
-                for (index, outcome) in outcomes {
-                    slots[index] = Some(outcome);
-                }
+    let mut error_count: usize = 0;
+    let slots: Vec<Option<HostOutcome>> = if dashboard {
+        TUI_ACTIVE.store(true, Ordering::Relaxed);
+        let outcome = tui::run(&labels, rx);
+        TUI_ACTIVE.store(false, Ordering::Relaxed);
+        outcome?
+    } else {
+        let mut slots: Vec<Option<HostOutcome>> =
+            (0..hosts_len).map(|_| None).collect();
+        for (index, outcome) in rx.iter() {
+            if let HostOutcome::Failed { detail, .. } = &outcome {
+                error!("Failed to check '{}': {}", labels[index], detail);
             }
-            Err(panic_err) => {
-                error!("A worker thread panicked unexpectedly: {:?}", panic_err);
-            }
+            slots[index] = Some(outcome);
         }
-    }
+        slots
+    };
 
     let mut results: Vec<TLS> = Vec::with_capacity(hosts_len);
     for slot in slots {
         match slot {
-            Some(Some(tls_result)) => results.push(tls_result),
-            // Error already logged inside the worker, or the host was lost to
-            // a worker panic.
-            Some(None) | None => error_count += 1,
+            Some(HostOutcome::Checked(tls_result)) => results.push(*tls_result),
+            // Error already reported by the frontend that observed it.
+            Some(HostOutcome::Failed { .. }) => error_count += 1,
+            // The dashboard was quit before this host finished; deliberately
+            // not counted as an error.
+            None => {}
         }
     }
 
@@ -956,7 +987,8 @@ fn main() -> Result<()> {
         for r in &results {
             print!("{}", r.certificate.pem);
         }
-    } else {
+    } else if !dashboard {
+        // The dashboard already presented the results interactively.
         let formatter = FormatterFactory::new_formatter(&final_config.output);
         print!("{}", formatter.format(&results));
     }
@@ -998,13 +1030,20 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
     // Start with default configuration
     let mut config = Config::default();
 
+    // Whether the user chose an output format themselves (config file or CLI),
+    // as opposed to inheriting the default. Must be captured before merging,
+    // because the defaults seed `output` with Some("summary").
+    let mut output_explicit = cli.output.is_some();
+
     // Load from config file if specified, otherwise try tlschecker.toml
     if let Some(config_path) = &cli.config {
         let file_config = Config::from_file(config_path)?;
+        output_explicit |= file_config.output.is_some();
         config = config.merge_with(file_config);
     } else {
         // Try to load from default tlschecker.toml if it exists
         if let Ok(file_config) = Config::from_file("tlschecker.toml") {
+            output_explicit |= file_config.output.is_some();
             config = config.merge_with(file_config);
         }
     }
@@ -1033,7 +1072,9 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
     config = config.merge_with(cli_config);
 
     // Convert to final configuration and validate
-    FinalConfig::from_merged_config(config)
+    let mut final_config = FinalConfig::from_merged_config(config)?;
+    final_config.output_explicit = output_explicit;
+    Ok(final_config)
 }
 
 /// Exits the program with the appropriate exit code.
@@ -1141,7 +1182,7 @@ fn parse_host_port(address: &str) -> Result<HostPort, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // ── parse_host_port tests ────────────────────────────────────────
@@ -1481,7 +1522,7 @@ mod tests {
 
     // ── Formatter output tests ───────────────────────────────────────
 
-    fn make_test_tls() -> TLS {
+    pub(crate) fn make_test_tls() -> TLS {
         TLS {
             cipher: tlschecker::Cipher {
                 name: "TLS_AES_256_GCM_SHA384".to_string(),
@@ -1505,6 +1546,8 @@ mod tests {
                 },
                 valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
                 valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                valid_from_unix: 1_735_689_600,
+                valid_to_unix: 1_798_761_599,
                 validity_days: 365,
                 validity_hours: 8760,
                 is_expired: false,

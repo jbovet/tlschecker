@@ -304,7 +304,7 @@ mod tests {
     fn test_parse_sct_list() {
         fn one_sct(log_byte: u8, ts_ms: u64) -> Vec<u8> {
             let mut s = vec![0x00]; // version v1
-            s.extend(std::iter::repeat(log_byte).take(32)); // log id
+            s.extend(std::iter::repeat_n(log_byte, 32)); // log id
             s.extend_from_slice(&ts_ms.to_be_bytes()); // timestamp
             s.extend_from_slice(&[0x00, 0x00]); // empty extensions
             s.extend_from_slice(&[0x04, 0x03, 0x00, 0x01, 0xab]); // dummy signature
@@ -334,7 +334,7 @@ mod tests {
     fn test_parse_scts_from_extension_unwraps_octet_string() {
         // extnValue is a DER OCTET STRING wrapping the TLS list.
         let mut s = vec![0x00];
-        s.extend(std::iter::repeat(0x33).take(32));
+        s.extend(std::iter::repeat_n(0x33, 32));
         s.extend_from_slice(&1_234_567_890_000u64.to_be_bytes());
         s.extend_from_slice(&[0x00, 0x00, 0x04, 0x03, 0x00, 0x01, 0xab]);
 

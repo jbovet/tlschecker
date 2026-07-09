@@ -196,6 +196,8 @@ mod tests {
                 },
                 valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
                 valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                valid_from_unix: 1_735_689_600,
+                valid_to_unix: 1_798_761_599,
                 validity_days: 100,
                 validity_hours: 2400,
                 is_expired: false,
