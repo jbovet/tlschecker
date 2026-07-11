@@ -8,9 +8,25 @@ Experimental TLS/SSL certificate command-line checker
 
 [DockerHub](https://hub.docker.com/repository/docker/josebovet/tlschecker)
 
+Build the image locally:
+
 ```sh
-docker run josebovet/tlschecker:1.1.1 jpbd.dev
+docker build -t tlschecker:local .
 ```
+
+Run the CLI from the container:
+
+```sh
+docker run --rm tlschecker:local example.com
+```
+
+For the interactive TUI, run the container with a pseudo-TTY and stdin attached:
+
+```sh
+docker run --rm -it tlschecker:local example.com
+```
+
+The TUI is only used when stdout is an interactive terminal. In non-interactive environments (pipelines, redirected output, CI), the container falls back to the classic text output.
 
 If you are utilizing M1 or higher, please add the option --platform linux/x86_64.
 
@@ -58,10 +74,13 @@ presented chain, embedded SCTs, the grade breakdown with reasons, and scan
 results when `--scan` was used. Scroll with `j`/`k` or `PgUp`/`PgDn`, and
 return with `Esc`.
 
-The classic text outputs are used automatically whenever stdout is piped or
-redirected, and can always be forced with `-o summary|json|text` or
-`--no-dashboard` (keeps the configured/`-o` format) — so scripts, CI
-pipelines, and `tlschecker -o json | jq` behave exactly as before.
+The TUI requires an attached terminal. In Docker, that means using `-it` so the
+container gets a pseudo-TTY and stdin. Without that, Docker will fall back to
+the classic text output. The classic text outputs are also used automatically
+whenever stdout is piped or redirected, and can always be forced with
+`-o summary|json|text` or `--no-dashboard` (keeps the configured/`-o`
+format) — so scripts, CI pipelines, and `tlschecker -o json | jq` behave
+exactly as before.
 
 ## Examples
 
