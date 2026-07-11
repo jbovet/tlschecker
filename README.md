@@ -91,6 +91,22 @@ TLSChecker verifies that the presented certificate chain builds to a trusted roo
 
 An untrusted chain adds an `UNTRUSTED` security warning and caps the configuration grade at C. Because verification happens *after* inspection, expired and self-signed certificates are still fully reported rather than rejected at the handshake.
 
+### Certificate Metadata
+
+Every check also reports (offline, no extra flags) a set of certificate and
+connection details:
+
+- **ALPN** — the negotiated application protocol (`h2` / `http/1.1`).
+- **Subject / Authority Key ID** — the SKI/AKI identifiers.
+- **Validation Level** — `DV` / `OV` / `EV` / `IV`, derived from the CA/Browser-Forum policy OIDs.
+- **Key Usage / Extended Key Usage / Basic Constraints** — what the certificate is authorized for.
+
+It also raises **informational warnings** (which do *not* affect the grade, so
+legitimate private/internal certificates are never penalized) for issuance
+problems: a leaf asserting `CA:TRUE`, a missing `serverAuth` EKU, a low-entropy
+serial, an over-long (> 398-day) validity period, or a chain link whose
+signature does not cryptographically verify.
+
 ### Certificate Revocation Checking
 
 TLSChecker supports comprehensive certificate revocation checking via both OCSP (Online Certificate Status Protocol) and CRL (Certificate Revocation List). These features allow you to verify if a certificate has been revoked by its issuing Certificate Authority.

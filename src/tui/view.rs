@@ -251,7 +251,10 @@ fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
     let info = vec![
         Line::from(vec![
             Span::styled("Protocol  ", DIM),
-            Span::raw(format!("{} · {}", tls.cipher.version, tls.cipher.name)),
+            Span::raw(match &tls.cipher.alpn {
+                Some(alpn) => format!("{} · {} · {}", tls.cipher.version, tls.cipher.name, alpn),
+                None => format!("{} · {}", tls.cipher.version, tls.cipher.name),
+            }),
         ]),
         Line::from(vec![
             Span::styled("Issuer    ", DIM),
@@ -444,6 +447,28 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
             ));
             lines.push(kv("SHA-256", cert.cert_sha256.clone()));
             lines.push(kv("SHA-1", cert.cert_sha1.clone()));
+            if let Some(skid) = &cert.subject_key_id {
+                lines.push(kv("Subject Key ID", skid.clone()));
+            }
+            if let Some(akid) = &cert.authority_key_id {
+                lines.push(kv("Authority Key ID", akid.clone()));
+            }
+            if let Some(level) = &cert.validation_level {
+                lines.push(kv("Validation Level", level.clone()));
+            }
+            if !cert.key_usage.is_empty() {
+                lines.push(kv("Key Usage", cert.key_usage.join(", ")));
+            }
+            if !cert.ext_key_usage.is_empty() {
+                lines.push(kv("Ext Key Usage", cert.ext_key_usage.join(", ")));
+            }
+            lines.push(kv(
+                "Basic Constraints",
+                match cert.path_len {
+                    Some(n) => format!("CA:{}, pathlen:{}", cert.is_ca, n),
+                    None => format!("CA:{}", cert.is_ca),
+                },
+            ));
 
             lines.push(section("Connection"));
             lines.push(kv("Protocol", tls.cipher.version.clone()));
@@ -451,6 +476,9 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                 "Cipher Suite",
                 format!("{} ({}-bit)", tls.cipher.name, tls.cipher.bits),
             ));
+            if let Some(alpn) = &tls.cipher.alpn {
+                lines.push(kv("ALPN", alpn.clone()));
+            }
 
             lines.push(section(&format!(
                 "Subject Alternative Names ({})",

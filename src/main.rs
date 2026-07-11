@@ -227,6 +227,8 @@ pub(crate) fn warning_label(warning: &tlschecker::SecurityWarning) -> (&'static 
         WeakCipher(msg) => ("WEAK CIPHER", msg),
         NotInCertificateTransparency(msg) => ("NOT IN CT LOG", msg),
         Untrusted(msg) => ("UNTRUSTED", msg),
+        CertificateMisissuance(msg) => ("MISISSUANCE", msg),
+        InvalidChainSignature(msg) => ("INVALID CHAIN SIGNATURE", msg),
     }
 }
 
@@ -300,6 +302,36 @@ impl Formatter for TextFormat {
             writeln!(output, "Certificate S/N: {}", cert.cert_sn).unwrap();
             writeln!(output, "SHA-256 Fingerprint: {}", cert.cert_sha256).unwrap();
             writeln!(output, "SHA-1 Fingerprint: {}", cert.cert_sha1).unwrap();
+            if let Some(skid) = &cert.subject_key_id {
+                writeln!(output, "Subject Key ID: {}", skid).unwrap();
+            }
+            if let Some(akid) = &cert.authority_key_id {
+                writeln!(output, "Authority Key ID: {}", akid).unwrap();
+            }
+            if let Some(level) = &cert.validation_level {
+                writeln!(output, "Validation Level: {}", level).unwrap();
+            }
+            if !cert.key_usage.is_empty() {
+                writeln!(output, "Key Usage: {}", cert.key_usage.join(", ")).unwrap();
+            }
+            if !cert.ext_key_usage.is_empty() {
+                writeln!(
+                    output,
+                    "Extended Key Usage: {}",
+                    cert.ext_key_usage.join(", ")
+                )
+                .unwrap();
+            }
+            writeln!(
+                output,
+                "Basic Constraints: CA:{}{}",
+                if cert.is_ca { "TRUE" } else { "FALSE" },
+                match cert.path_len {
+                    Some(n) => format!(", pathlen:{}", n),
+                    None => String::new(),
+                }
+            )
+            .unwrap();
             writeln!(
                 output,
                 "Certificate key: {} {}-bit",
@@ -313,6 +345,9 @@ impl Formatter for TextFormat {
             )
             .unwrap();
             writeln!(output, "Protocol: {}", rs.cipher.version).unwrap();
+            if let Some(alpn) = &rs.cipher.alpn {
+                writeln!(output, "ALPN: {}", alpn).unwrap();
+            }
 
             writeln!(
                 output,
@@ -1565,6 +1600,7 @@ pub(crate) mod tests {
                 name: "TLS_AES_256_GCM_SHA384".to_string(),
                 version: "TLSv1.3".to_string(),
                 bits: 256,
+                alpn: Some("h2".to_string()),
             },
             certificate: tlschecker::CertificateInfo {
                 hostname: "test.example.com".to_string(),
@@ -1610,6 +1646,13 @@ pub(crate) mod tests {
                 cert_key_algorithm: "RSA".to_string(),
                 cert_sha256: "AB:CD:EF".to_string(),
                 cert_sha1: "12:34:56".to_string(),
+                subject_key_id: Some("AA:BB:CC".to_string()),
+                authority_key_id: Some("DD:EE:FF".to_string()),
+                validation_level: Some("OV".to_string()),
+                key_usage: vec!["digitalSignature".to_string()],
+                ext_key_usage: vec!["serverAuth".to_string()],
+                is_ca: false,
+                path_len: None,
                 scts: Vec::new(),
                 pem: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n".to_string(),
             },

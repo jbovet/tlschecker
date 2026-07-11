@@ -25,7 +25,9 @@
 //! # Ok::<(), tlschecker::TLSError>(())
 //! ```
 
+pub mod certext;
 pub mod ct;
+mod der;
 pub mod grading;
 pub mod probe;
 pub mod sct;
@@ -115,6 +117,13 @@ pub enum SecurityWarning {
     NotInCertificateTransparency(String),
     /// The certificate chain did not build to a trusted system root
     Untrusted(String),
+    /// The certificate deviates from issuance best practice (e.g. CA:TRUE on a
+    /// leaf, missing serverAuth EKU, over-long validity). Informational — it
+    /// does not affect the grade.
+    CertificateMisissuance(String),
+    /// A link in the presented chain is not cryptographically signed by the
+    /// certificate that follows it. Informational — it does not affect the grade.
+    InvalidChainSignature(String),
 }
 
 /// Represents a certificate in the certificate chain.
@@ -167,6 +176,10 @@ pub struct Cipher {
     pub version: String,
     /// Cipher suite key length in bits
     pub bits: i32,
+    /// Application-layer protocol negotiated via ALPN (e.g. "h2", "http/1.1"),
+    /// or `None` if the server did not select one.
+    #[serde(default)]
+    pub alpn: Option<String>,
 }
 
 /// Comprehensive X.509 certificate information.
@@ -228,6 +241,28 @@ pub struct CertificateInfo {
     pub cert_sha256: String,
     /// SHA-1 fingerprint of the DER-encoded certificate (colon-separated hex)
     pub cert_sha1: String,
+    /// Subject Key Identifier (colon-hex), if the extension is present
+    #[serde(default)]
+    pub subject_key_id: Option<String>,
+    /// Authority Key Identifier (colon-hex), if the extension is present
+    #[serde(default)]
+    pub authority_key_id: Option<String>,
+    /// CA/Browser-Forum validation level ("EV"/"OV"/"DV"/"IV") from the
+    /// Certificate Policies extension, or `None` if no CABF policy OID is present
+    #[serde(default)]
+    pub validation_level: Option<String>,
+    /// Key Usage flag names present (e.g. `digitalSignature`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_usage: Vec<String>,
+    /// Extended Key Usage purpose names / OIDs (e.g. `serverAuth`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ext_key_usage: Vec<String>,
+    /// Whether Basic Constraints asserts `CA:TRUE`
+    #[serde(default)]
+    pub is_ca: bool,
+    /// Basic Constraints path-length constraint, if present
+    #[serde(default)]
+    pub path_len: Option<u32>,
     /// Signed Certificate Timestamps embedded in the leaf (offline proof the
     /// certificate was submitted to CT logs). Empty when none are present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -300,21 +335,30 @@ pub struct Subject {
 /// # }
 /// ```
 pub fn find_issuer_cert<'a>(cert: &X509Ref, chain: &'a [X509]) -> Option<&'a X509> {
-    let cert_issuer = cert.issuer_name();
-
-    for potential_issuer in chain {
-        // Get the subject name of the potential issuer
-        let potential_subject = potential_issuer.subject_name();
-
-        // Compare the issuer name of our certificate with the subject name of the potential issuer
-        if cert_issuer
-            .try_cmp(potential_subject)
-            .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
-        {
-            return Some(potential_issuer);
+    // Prefer the RFC 5280 key-identifier match: the cert's Authority Key
+    // Identifier should equal the issuer's Subject Key Identifier. This is
+    // unambiguous even when multiple certs share a subject name (e.g. a CA
+    // cross-signed by two roots). Only when AKI/SKI are absent or don't match
+    // do we fall back to the DN comparison below, so this can only add matches,
+    // never remove the ones the name check already found.
+    if let Some(akid) = cert.authority_key_id() {
+        let by_key_id = chain.iter().find(|c| {
+            c.subject_key_id()
+                .is_some_and(|skid| skid.as_slice() == akid.as_slice())
+        });
+        if by_key_id.is_some() {
+            return by_key_id;
         }
     }
-    None
+
+    // Fall back to matching the certificate's issuer DN against a candidate's
+    // subject DN.
+    let cert_issuer = cert.issuer_name();
+    chain.iter().find(|c| {
+        cert_issuer
+            .try_cmp(c.subject_name())
+            .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
+    })
 }
 
 /// Analyzes a certificate chain for security issues.
@@ -421,6 +465,44 @@ pub fn analyze_certificate_chain(cert: &X509, chain: &[X509]) -> Vec<SecurityWar
                     chain_cert.not_after()
                 )));
             }
+        }
+    }
+
+    // Cryptographically verify that each certificate is actually signed by its
+    // issuer. The issuer is located by *identity* (`find_issuer_cert`), not by
+    // chain position, so a merely mis-ordered chain — already reported above —
+    // does not produce spurious signature failures. Self-signed roots are
+    // skipped (nothing to prove), and a certificate whose issuer isn't present
+    // is left to the incomplete-chain check rather than flagged here. Only a
+    // real forgery — the named issuer is present but the signature does not
+    // validate against its key — warns.
+    for chain_cert in chain.iter() {
+        if is_self_signed_certificate(chain_cert) {
+            continue;
+        }
+        let Some(issuer) = find_issuer_cert(chain_cert, chain) else {
+            continue;
+        };
+        let Ok(issuer_key) = issuer.public_key() else {
+            continue;
+        };
+        if matches!(chain_cert.verify(&issuer_key), Ok(false)) {
+            let subject = chain_cert
+                .subject_name()
+                .entries_by_nid(Nid::COMMONNAME)
+                .next()
+                .and_then(|e| e.data().to_string().ok())
+                .unwrap_or_else(|| "Unknown".to_string());
+            warnings.push(SecurityWarning::InvalidChainSignature(format!(
+                "Certificate '{}' is not validly signed by its issuer '{}'",
+                subject,
+                issuer
+                    .subject_name()
+                    .entries_by_nid(Nid::COMMONNAME)
+                    .next()
+                    .and_then(|e| e.data().to_string().ok())
+                    .unwrap_or_else(|| "Unknown".to_string())
+            )));
         }
     }
 
@@ -1179,6 +1261,11 @@ impl TLS {
 
         let mut context = SslContext::builder(SslMethod::tls())?;
         context.set_verify(SslVerifyMode::empty());
+        // Advertise HTTP/2 and HTTP/1.1 via ALPN so we can report what the
+        // server negotiates. Wire format: each protocol is a length-prefixed
+        // byte string. Best-effort — a server that ignores ALPN just yields
+        // `None`, and a failure to set it must not abort the diagnostic.
+        let _ = context.set_alpn_protos(b"\x02h2\x08http/1.1");
         let context_builder = context.build();
 
         let mut connector = Ssl::new(&context_builder)?;
@@ -1211,6 +1298,10 @@ impl TLS {
                 .map(|c| c.version().to_string())
                 .unwrap_or_else(|| "Unknown".to_string()),
             bits: ssl.current_cipher().map(|c| c.bits().secret).unwrap_or(0),
+            // The negotiated ALPN protocol, if any (e.g. "h2", "http/1.1").
+            alpn: ssl
+                .selected_alpn_protocol()
+                .map(|p| String::from_utf8_lossy(p).into_owned()),
         };
 
         // Get the peer certificate chain
@@ -1275,6 +1366,55 @@ impl TLS {
             )));
         }
 
+        // Misissuance checks on the leaf (informational — no grade impact).
+        if data.is_ca {
+            security_warnings.push(SecurityWarning::CertificateMisissuance(
+                "Leaf certificate asserts CA:TRUE in Basic Constraints".to_string(),
+            ));
+        }
+        if !data.ext_key_usage.is_empty()
+            && !data
+                .ext_key_usage
+                .iter()
+                .any(|p| p == "serverAuth" || p == "anyExtendedKeyUsage")
+        {
+            security_warnings.push(SecurityWarning::CertificateMisissuance(
+                "Leaf Extended Key Usage does not include serverAuth".to_string(),
+            ));
+        }
+        if !data.key_usage.is_empty()
+            && !data
+                .key_usage
+                .iter()
+                .any(|k| k == "digitalSignature" || k == "keyEncipherment")
+        {
+            security_warnings.push(SecurityWarning::CertificateMisissuance(
+                "Leaf Key Usage lacks digitalSignature and keyEncipherment".to_string(),
+            ));
+        }
+
+        // CA/Browser-Forum baseline sanity (informational). Serial numbers must
+        // carry >= 64 bits of entropy; a low bit-count signals a predictable
+        // serial. Zero is a parse failure, not a real serial, so it's ignored.
+        if let Ok(bits) = x509_ref.serial_number().to_bn().map(|bn| bn.num_bits()) {
+            if bits > 0 && bits < 64 {
+                security_warnings.push(SecurityWarning::CertificateMisissuance(format!(
+                    "Serial number has only {} bits of entropy (CA/B Forum requires >= 64)",
+                    bits
+                )));
+            }
+        }
+        // Publicly-trusted leaf validity must not exceed 398 days.
+        if data.valid_from_unix != 0 && data.valid_to_unix != 0 {
+            let span_days = (data.valid_to_unix - data.valid_from_unix) / 86_400;
+            if span_days > 398 {
+                security_warnings.push(SecurityWarning::CertificateMisissuance(format!(
+                    "Validity period is {} days (CA/B Forum limits leaf certs to 398)",
+                    span_days
+                )));
+            }
+        }
+
         // Concatenate the presented chain (leaf first) as PEM for `--export-pem`.
         let pem = cert_chain
             .iter()
@@ -1321,6 +1461,13 @@ impl TLS {
             cert_key_algorithm,
             cert_sha256: data.cert_sha256,
             cert_sha1: data.cert_sha1,
+            subject_key_id: data.subject_key_id,
+            authority_key_id: data.authority_key_id,
+            validation_level: data.validation_level,
+            key_usage: data.key_usage,
+            ext_key_usage: data.ext_key_usage,
+            is_ca: data.is_ca,
+            path_len: data.path_len,
             scts: data.scts,
             pem,
         };
@@ -1493,6 +1640,7 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
             }
         }
     }
+    let usage = certext::usage(cert_ref);
     CertificateInfo {
         hostname: "None".to_string(),
         subject: get_subject(cert_ref),
@@ -1521,6 +1669,17 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         cert_key_algorithm: String::new(),
         cert_sha256: fingerprint(cert_ref, openssl::hash::MessageDigest::sha256()),
         cert_sha1: fingerprint(cert_ref, openssl::hash::MessageDigest::sha1()),
+        subject_key_id: cert_ref
+            .subject_key_id()
+            .map(|id| bytes_to_hex_colon(id.as_slice())),
+        authority_key_id: cert_ref
+            .authority_key_id()
+            .map(|id| bytes_to_hex_colon(id.as_slice())),
+        validation_level: certext::validation_level(cert_ref),
+        key_usage: usage.key_usage,
+        ext_key_usage: usage.ext_key_usage,
+        is_ca: usage.is_ca,
+        path_len: cert_ref.pathlen(),
         scts: sct::embedded_scts(cert_ref),
         pem: String::new(),
     }
@@ -1533,13 +1692,19 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
 /// string if the digest cannot be computed.
 fn fingerprint(cert_ref: &X509, digest: openssl::hash::MessageDigest) -> String {
     match cert_ref.digest(digest) {
-        Ok(bytes) => bytes
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(":"),
+        Ok(bytes) => bytes_to_hex_colon(&bytes),
         Err(_) => String::new(),
     }
+}
+
+/// Formats bytes as colon-separated uppercase hex (e.g. `AB:CD:EF`), the
+/// conventional rendering for fingerprints and key identifiers.
+fn bytes_to_hex_colon(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// Converts an ASN.1 time to a Unix timestamp (seconds since the epoch).
@@ -1697,6 +1862,7 @@ mod tests {
                 name: "TLS_AES_256_GCM_SHA384".to_string(),
                 version: "TLSv1.3".to_string(),
                 bits: 256,
+                alpn: Some("h2".to_string()),
             },
             certificate: CertificateInfo {
                 hostname: "test.example.com".to_string(),
@@ -1742,6 +1908,13 @@ mod tests {
                 cert_key_algorithm: "RSA".to_string(),
                 cert_sha256: "AB:CD".to_string(),
                 cert_sha1: "12:34".to_string(),
+                subject_key_id: Some("AA:BB".to_string()),
+                authority_key_id: Some("CC:DD".to_string()),
+                validation_level: Some("DV".to_string()),
+                key_usage: vec!["digitalSignature".to_string()],
+                ext_key_usage: vec!["serverAuth".to_string()],
+                is_ca: false,
+                path_len: None,
                 scts: Vec::new(),
                 pem: String::new(),
             },
@@ -1788,6 +1961,19 @@ mod tests {
         assert_eq!(
             tls_result.certificate.revocation_status,
             RevocationStatus::Good
+        );
+    }
+
+    #[test]
+    #[ignore] // requires network: connects to google.com
+    fn test_alpn_negotiated_with_google() {
+        let tls_result = TLS::from("google.com", None, false, false).unwrap();
+        // google.com supports HTTP/2, so ALPN should select "h2". Tolerate
+        // "http/1.1" in case of an intermediary, but it must be populated.
+        let alpn = tls_result.cipher.alpn.expect("ALPN should be negotiated");
+        assert!(
+            alpn == "h2" || alpn == "http/1.1",
+            "unexpected ALPN protocol: {alpn}"
         );
     }
 
@@ -2114,6 +2300,87 @@ mod tests {
             chain.len() >= 2,
             "Expected at least 2 certs in chain, got {}",
             chain.len()
+        );
+    }
+
+    #[test]
+    fn test_find_issuer_cert_prefers_key_id_over_name() {
+        use openssl::x509::extension::{
+            AuthorityKeyIdentifier, BasicConstraints, SubjectKeyIdentifier,
+        };
+
+        // A real CA carrying a Subject Key Identifier.
+        let (ca_key, ca_cert) = {
+            let rsa = Rsa::generate(2048).unwrap();
+            let key = PKey::from_rsa(rsa).unwrap();
+            let mut name = X509NameBuilder::new().unwrap();
+            name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "Shared CA Name")
+                .unwrap();
+            let name = name.build();
+            let mut b = X509Builder::new().unwrap();
+            b.set_version(2).unwrap();
+            let mut serial = BigNum::new().unwrap();
+            serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+            b.set_serial_number(&serial.to_asn1_integer().unwrap())
+                .unwrap();
+            b.set_subject_name(&name).unwrap();
+            b.set_issuer_name(&name).unwrap();
+            b.set_pubkey(&key).unwrap();
+            b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+                .unwrap();
+            b.set_not_after(&Asn1Time::days_from_now(3650).unwrap())
+                .unwrap();
+            b.append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+                .unwrap();
+            let ctx = b.x509v3_context(None, None);
+            let skid = SubjectKeyIdentifier::new().build(&ctx).unwrap();
+            b.append_extension(skid).unwrap();
+            b.sign(&key, MessageDigest::sha256()).unwrap();
+            (key, b.build())
+        };
+
+        // A leaf whose Authority Key Identifier points at that CA's SKI.
+        let leaf = {
+            let rsa = Rsa::generate(2048).unwrap();
+            let key = PKey::from_rsa(rsa).unwrap();
+            let mut name = X509NameBuilder::new().unwrap();
+            name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "leaf.example.com")
+                .unwrap();
+            let name = name.build();
+            let mut b = X509Builder::new().unwrap();
+            b.set_version(2).unwrap();
+            let mut serial = BigNum::new().unwrap();
+            serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+            b.set_serial_number(&serial.to_asn1_integer().unwrap())
+                .unwrap();
+            b.set_subject_name(&name).unwrap();
+            b.set_issuer_name(ca_cert.subject_name()).unwrap();
+            b.set_pubkey(&key).unwrap();
+            b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+                .unwrap();
+            b.set_not_after(&Asn1Time::days_from_now(365).unwrap())
+                .unwrap();
+            let ctx = b.x509v3_context(Some(&ca_cert), None);
+            let akid = AuthorityKeyIdentifier::new()
+                .keyid(true)
+                .build(&ctx)
+                .unwrap();
+            b.append_extension(akid).unwrap();
+            b.sign(&ca_key, MessageDigest::sha256()).unwrap();
+            b.build()
+        };
+
+        // A decoy sharing the CA's subject *name* but a different key (hence a
+        // different/absent SKI). Placed first so a name-only match would pick it.
+        let (decoy, _) = make_test_x509("Shared CA Name");
+
+        let chain = [decoy.clone(), ca_cert.clone()];
+        let found = super::find_issuer_cert(&leaf, &chain).expect("issuer should be found");
+        // AKI→SKI must select the real CA, not the same-named decoy.
+        assert_eq!(
+            found.digest(MessageDigest::sha256()).unwrap().to_vec(),
+            ca_cert.digest(MessageDigest::sha256()).unwrap().to_vec(),
+            "find_issuer_cert should prefer the key-id match over the name match"
         );
     }
 
@@ -2622,6 +2889,60 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "Clean chain should have no warnings, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_analyze_chain_signature_verification() {
+        let (ca, ca_key) = make_test_x509("Real CA");
+        // An impostor CA sharing the *same subject name* but a different key.
+        let (_, impostor_key) = make_test_x509("Real CA");
+
+        // Correct chain: leaf genuinely signed by `ca` → no signature warning.
+        let good_leaf = make_test_x509_signed_by("leaf.example.com", &ca, &ca_key);
+        let good = super::analyze_certificate_chain(&good_leaf, &[good_leaf.clone(), ca.clone()]);
+        assert!(
+            !good
+                .iter()
+                .any(|w| matches!(w, SecurityWarning::InvalidChainSignature(_))),
+            "validly signed chain should not warn, got: {:?}",
+            good
+        );
+
+        // Forged chain: the leaf names `ca` as its issuer (so the issuer *is*
+        // found in the chain) but was signed by the impostor's key, so the
+        // signature does not validate against `ca`'s key.
+        let forged_leaf = make_test_x509_signed_by("leaf.example.com", &ca, &impostor_key);
+        let bad =
+            super::analyze_certificate_chain(&forged_leaf, &[forged_leaf.clone(), ca.clone()]);
+        assert!(
+            bad.iter()
+                .any(|w| matches!(w, SecurityWarning::InvalidChainSignature(_))),
+            "a cryptographically invalid signature should warn, got: {:?}",
+            bad
+        );
+    }
+
+    #[test]
+    fn test_analyze_chain_misordered_valid_signatures_no_false_positive() {
+        // A valid chain presented out of issuer order must NOT be reported as
+        // having invalid signatures — only as mis-ordered.
+        let (root, root_key) = make_test_x509("Root");
+        let intermediate = make_test_x509_signed_by("Intermediate", &root, &root_key);
+        // Note: our synthetic intermediate is signed by the root's key, and the
+        // leaf below is signed by the root too (make_test_x509_signed_by signs
+        // with the passed key); presenting them out of order still yields valid
+        // signatures against each cert's real issuer.
+        let leaf = make_test_x509_signed_by("leaf.example.com", &root, &root_key);
+        // Deliberately mis-ordered: [leaf, root, intermediate].
+        let chain = [leaf.clone(), root.clone(), intermediate.clone()];
+        let warnings = super::analyze_certificate_chain(&leaf, &chain);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, SecurityWarning::InvalidChainSignature(_))),
+            "mis-ordered but validly-signed chain must not warn about signatures, got: {:?}",
             warnings
         );
     }
