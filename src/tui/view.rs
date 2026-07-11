@@ -230,12 +230,22 @@ fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
         .map(|g| g.categories.len() as u16 + 1)
         .unwrap_or(0);
     let [info_area, gauge_area, grade_area, warn_area] = Layout::vertical([
-        Constraint::Length(5),
+        Constraint::Length(6),
         Constraint::Length(1),
         Constraint::Length(grade_rows),
         Constraint::Min(0),
     ])
     .areas(inner);
+
+    // Trust is always computed; show it red when the chain doesn't verify.
+    let (trust_text, trust_style) = match &cert.trust {
+        tlschecker::TrustStatus::Trusted => ("trusted".to_string(), Style::new().fg(Color::Green)),
+        tlschecker::TrustStatus::Untrusted { reason } => (
+            format!("untrusted · {}", reason),
+            Style::new().fg(Color::Red),
+        ),
+        tlschecker::TrustStatus::Unknown => ("unknown".to_string(), DIM),
+    };
 
     // Basic facts.
     let info = vec![
@@ -260,6 +270,10 @@ fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
         Line::from(vec![
             Span::styled("Revocation", DIM),
             Span::raw(format!(" {:?}", cert.revocation_status)),
+        ]),
+        Line::from(vec![
+            Span::styled("Trust     ", DIM),
+            Span::styled(trust_text, trust_style),
         ]),
         Line::from(vec![
             Span::styled("SHA-256   ", DIM),
@@ -397,6 +411,16 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                 if cert.is_self_signed { "yes" } else { "no" },
             ));
             lines.push(kv("Revocation", format!("{:?}", cert.revocation_status)));
+            lines.push(kv(
+                "Trust",
+                match &cert.trust {
+                    tlschecker::TrustStatus::Trusted => "trusted".to_string(),
+                    tlschecker::TrustStatus::Untrusted { reason } => {
+                        format!("untrusted · {}", reason)
+                    }
+                    tlschecker::TrustStatus::Unknown => "unknown".to_string(),
+                },
+            ));
             if let Some(ct) = &tls.ct {
                 lines.push(kv(
                     "CT (crt.sh)",
@@ -619,6 +643,30 @@ mod tests {
         assert!(content.contains("TLSv1.3"));
         assert!(content.contains("1 healthy"));
         assert!(content.contains("Healthy"));
+    }
+
+    #[test]
+    fn test_draw_untrusted_host_shows_trust_fact() {
+        let mut tls = make_test_tls();
+        tls.certificate.trust = tlschecker::TrustStatus::Untrusted {
+            reason: "self-signed certificate".to_string(),
+        };
+        // TLS::from appends this alongside setting the trust field; mirror that
+        // so the fleet verdict reflects it too.
+        tls.certificate
+            .security_warnings
+            .push(tlschecker::SecurityWarning::Untrusted(
+                "Certificate chain is not trusted: self-signed certificate".to_string(),
+            ));
+        let app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(tls)))],
+            &["test.example.com"],
+        );
+        let content = render(&app);
+        assert!(content.contains("Trust"));
+        assert!(content.contains("untrusted"));
+        // A trust failure downgrades the fleet verdict out of Healthy.
+        assert!(content.contains("1 warning"));
     }
 
     #[test]

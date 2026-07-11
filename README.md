@@ -81,6 +81,16 @@ You can specify the port in three ways:
 2. Using a full URL: `https://example.com:8443`
 3. Using the default port (443) by just specifying the hostname: `example.com`
 
+### Trust Validation
+
+TLSChecker verifies that the presented certificate chain builds to a trusted root in your operating system's trust store — the same authoritative check a browser performs. This runs automatically for every host (it is offline and adds no latency) and is reported as a `Trust:` line and, in JSON, a `trust` field:
+
+- **Trusted**: the chain builds to a system root CA
+- **Untrusted (reason)**: the chain does not verify — the reason is the underlying error, e.g. `self-signed certificate`, `unable to get local issuer certificate`, or `certificate has expired`
+- **Unknown**: no system trust store was available, so trust could not be determined (never reported as a problem)
+
+An untrusted chain adds an `UNTRUSTED` security warning and caps the configuration grade at C. Because verification happens *after* inspection, expired and self-signed certificates are still fully reported rather than rejected at the handshake.
+
 ### Certificate Revocation Checking
 
 TLSChecker supports comprehensive certificate revocation checking via both OCSP (Online Certificate Status Protocol) and CRL (Certificate Revocation List). These features allow you to verify if a certificate has been revoked by its issuing Certificate Authority.

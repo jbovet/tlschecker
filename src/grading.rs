@@ -47,6 +47,8 @@ pub struct GradingInput {
     /// Server accepts a weak cipher suite, via `--scan`.
     pub accepts_weak_cipher: bool,
     pub is_revoked: bool,
+    /// The presented chain did not build to a trusted system root.
+    pub is_untrusted: bool,
 }
 
 /// Score the TLS protocol version.
@@ -143,6 +145,10 @@ fn score_certificate_trust(input: &GradingInput) -> (u8, String) {
         score = score.min(20);
         reasons.push("Self-signed certificate");
     }
+    if input.is_untrusted {
+        score = score.min(20);
+        reasons.push("Chain not trusted");
+    }
     if input.has_hostname_mismatch {
         score = score.min(20);
         reasons.push("Hostname mismatch");
@@ -201,6 +207,7 @@ const CAP_TRUST_OR_WEAKNESS: u8 = 69; // C max
 /// - Expired or Revoked cert: score forced to 0 (F)
 /// - SSLv3 or TLS 1.0 negotiated: score capped at 54 (D max)
 /// - Self-signed cert: score capped at 69 (C max)
+/// - Untrusted chain (does not build to a system root): score capped at 69 (C max)
 /// - Hostname mismatch: score capped at 69 (C max)
 /// - Accepts a weak cipher (negotiated, or discovered via `--scan`) or supports
 ///   an obsolete protocol (SSLv3/TLS 1.0, via `--scan`): score capped at 69 (C max)
@@ -257,6 +264,9 @@ pub fn calculate_grade(input: &GradingInput) -> TLSGrade {
     if input.is_self_signed {
         composite = composite.min(CAP_TRUST_OR_WEAKNESS);
     }
+    if input.is_untrusted {
+        composite = composite.min(CAP_TRUST_OR_WEAKNESS);
+    }
     if input.has_hostname_mismatch {
         composite = composite.min(CAP_TRUST_OR_WEAKNESS);
     }
@@ -292,6 +302,7 @@ mod tests {
             supports_obsolete_protocol: false,
             accepts_weak_cipher: false,
             is_revoked: false,
+            is_untrusted: false,
         };
         overrides(&mut input);
         input
@@ -381,6 +392,28 @@ mod tests {
             trust.score
         );
         assert!(trust.reason.contains("Hostname mismatch"));
+    }
+
+    #[test]
+    fn test_untrusted_chain_lowers_trust_and_caps_grade() {
+        let input = make_input(|i| i.is_untrusted = true);
+        let grade = calculate_grade(&input);
+        let trust = grade
+            .categories
+            .iter()
+            .find(|c| c.category == "Certificate Trust")
+            .unwrap();
+        assert!(
+            trust.score <= 20,
+            "Expected trust score <= 20 for untrusted chain, got {}",
+            trust.score
+        );
+        assert!(trust.reason.contains("Chain not trusted"));
+        assert!(
+            grade.score <= 69,
+            "Expected composite <= 69 (C max) for untrusted chain, got {}",
+            grade.score
+        );
     }
 
     #[test]

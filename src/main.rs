@@ -13,6 +13,7 @@ use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 
 use tlschecker::RevocationStatus;
+use tlschecker::TrustStatus;
 use tlschecker::TLS;
 use url::Url;
 
@@ -225,6 +226,7 @@ pub(crate) fn warning_label(warning: &tlschecker::SecurityWarning) -> (&'static 
         WeakProtocol(msg) => ("WEAK PROTOCOL", msg),
         WeakCipher(msg) => ("WEAK CIPHER", msg),
         NotInCertificateTransparency(msg) => ("NOT IN CT LOG", msg),
+        Untrusted(msg) => ("UNTRUSTED", msg),
     }
 }
 
@@ -320,6 +322,17 @@ impl Formatter for TextFormat {
                     RevocationStatus::Revoked(reason) => format!("Revoked ({})", reason),
                     RevocationStatus::Unknown => "Unknown (Could not determine)".to_string(),
                     RevocationStatus::NotChecked => "Not Checked".to_string(),
+                }
+            )
+            .unwrap();
+
+            writeln!(
+                output,
+                "Trust: {}",
+                match &cert.trust {
+                    TrustStatus::Trusted => "Trusted (chains to a system root)".to_string(),
+                    TrustStatus::Untrusted { reason } => format!("Untrusted ({})", reason),
+                    TrustStatus::Unknown => "Unknown (no system trust store)".to_string(),
                 }
             )
             .unwrap();
@@ -1590,6 +1603,7 @@ pub(crate) mod tests {
                     signature_algorithm: "sha256WithRSAEncryption".to_string(),
                 }]),
                 revocation_status: RevocationStatus::NotChecked,
+                trust: TrustStatus::Unknown,
                 is_self_signed: false,
                 security_warnings: vec![],
                 cert_key_bits: 2048,

@@ -207,6 +207,7 @@ mod tests {
                 sans: vec![],
                 chain: None,
                 revocation_status: RevocationStatus::NotChecked,
+                trust: tlschecker::TrustStatus::Unknown,
                 is_self_signed: false,
                 security_warnings: vec![],
                 cert_key_bits: 2048,

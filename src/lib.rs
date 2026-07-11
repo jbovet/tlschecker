@@ -66,6 +66,31 @@ impl Default for RevocationStatus {
     }
 }
 
+/// Whether the presented certificate chain builds to a trusted system root.
+///
+/// This is the authoritative trust verdict computed *after* inspection (the
+/// handshake itself runs with verification disabled so broken certs can still
+/// be examined), mirroring the tri-state shape of [`RevocationStatus`].
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum TrustStatus {
+    /// The chain verified against the system trust store.
+    Trusted,
+    /// The chain did not verify; `reason` is OpenSSL's verification error
+    /// (e.g. "unable to get local issuer certificate", "certificate has expired").
+    Untrusted { reason: String },
+    /// Trust could not be determined — no system trust store was available or
+    /// the store could not be built. Never treated as a problem (no warning,
+    /// no grade cap), consistent with the degrade-rather-than-panic ethos.
+    Unknown,
+}
+
+impl Default for TrustStatus {
+    /// Returns `Unknown` as the default trust status.
+    fn default() -> Self {
+        TrustStatus::Unknown
+    }
+}
+
 /// Security warnings identified during certificate analysis.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum SecurityWarning {
@@ -88,6 +113,8 @@ pub enum SecurityWarning {
     /// The presented certificate was not found in any public Certificate
     /// Transparency log (discovered via `--ct-check`)
     NotInCertificateTransparency(String),
+    /// The certificate chain did not build to a trusted system root
+    Untrusted(String),
 }
 
 /// Represents a certificate in the certificate chain.
@@ -185,6 +212,10 @@ pub struct CertificateInfo {
     pub chain: Option<Vec<Chain>>,
     /// Certificate revocation status (if checked)
     pub revocation_status: RevocationStatus,
+    /// Whether the chain builds to a trusted system root (always computed;
+    /// `Unknown` when no trust store is available)
+    #[serde(default)]
+    pub trust: TrustStatus,
     /// Whether this is a self-signed certificate
     pub is_self_signed: bool,
     /// Security warnings identified during analysis
@@ -420,6 +451,95 @@ fn is_chain_well_ordered(chain: &[X509]) -> bool {
         }
     }
     true
+}
+
+/// Validates that `leaf` builds to a trusted root using the OS trust store.
+///
+/// This is the authoritative trust check a browser performs, computed *after*
+/// the inspecting handshake (which runs with verification disabled). `chain`
+/// supplies the presented intermediates used to build the path; the trust
+/// anchors come solely from the system store.
+///
+/// Returns [`TrustStatus::Unknown`] — never an error — when the system trust
+/// store cannot be located or built, so hosts on a machine without a CA bundle
+/// are not mislabelled untrusted.
+pub fn validate_trust(leaf: &X509, chain: &[X509]) -> TrustStatus {
+    use openssl::x509::store::X509StoreBuilder;
+
+    // `openssl` is vendored, so its compiled-in default cert paths are wrong on
+    // macOS and vary on Linux. `openssl-probe` finds the OS bundle and exports
+    // SSL_CERT_FILE / SSL_CERT_DIR, which `set_default_paths` then honors.
+    //
+    // Crucially we also record *whether a trust source was found*: on a machine
+    // without any CA bundle, `set_default_paths` still succeeds with an empty
+    // store, and every host would then verify as "unable to get local issuer"
+    // — a false Untrusted. Gating on the probe result keeps that case `Unknown`.
+    // Cached once: the env vars and the filesystem layout don't change mid-run.
+    static TRUST_SOURCE_FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let found = *TRUST_SOURCE_FOUND.get_or_init(|| {
+        let probe = openssl_probe::probe();
+        // SAFETY: runs exactly once via `OnceLock`, before any store is built.
+        // It only sets SSL_CERT_FILE/SSL_CERT_DIR if unset; nothing else is
+        // reading those env vars at this point in startup.
+        unsafe { openssl_probe::init_openssl_env_vars() };
+        probe.cert_file.is_some() || probe.cert_dir.is_some()
+    });
+    if !found {
+        return TrustStatus::Unknown;
+    }
+
+    let mut builder = match X509StoreBuilder::new() {
+        Ok(b) => b,
+        Err(_) => return TrustStatus::Unknown,
+    };
+    if builder.set_default_paths().is_err() {
+        return TrustStatus::Unknown;
+    }
+    let store = builder.build();
+
+    validate_trust_with_store(&store, leaf, chain)
+}
+
+/// Verifies `leaf` against an explicit trust `store`, using `chain` as the
+/// untrusted intermediates for path building.
+///
+/// Split out from [`validate_trust`] so it can be unit-tested with a synthetic
+/// root instead of the OS trust store. A build/verify error that is *not* a
+/// certificate rejection degrades to [`TrustStatus::Unknown`].
+fn validate_trust_with_store(
+    store: &openssl::x509::store::X509Store,
+    leaf: &X509,
+    chain: &[X509],
+) -> TrustStatus {
+    use openssl::x509::X509StoreContext;
+
+    // Untrusted intermediates: everything the server presented except the leaf.
+    // Passing the leaf again is harmless, but skip it to keep the stack minimal.
+    let mut intermediates = match openssl::stack::Stack::<X509>::new() {
+        Ok(s) => s,
+        Err(_) => return TrustStatus::Unknown,
+    };
+    for cert in chain.iter().skip(1) {
+        let _ = intermediates.push(cert.to_owned());
+    }
+
+    let mut ctx = match X509StoreContext::new() {
+        Ok(c) => c,
+        Err(_) => return TrustStatus::Unknown,
+    };
+
+    // Read the verdict — and, on failure, the reason — inside the closure while
+    // the store context is live (`error()` reflects the last `verify_cert`).
+    let result = ctx.init(store, leaf, &intermediates, |c| match c.verify_cert() {
+        Ok(true) => Ok(TrustStatus::Trusted),
+        Ok(false) => Ok(TrustStatus::Untrusted {
+            reason: c.error().error_string().to_string(),
+        }),
+        Err(e) => Err(e),
+    });
+
+    // An internal error (not a verdict) degrades to Unknown — never Untrusted.
+    result.unwrap_or(TrustStatus::Unknown)
 }
 
 /// Determines whether `cert` is valid for `hostname`.
@@ -678,6 +798,7 @@ fn build_grading_input(
         accepts_weak_cipher: is_weak_cipher(&cipher.name)
             || scan.map(scan_accepts_weak_cipher).unwrap_or(false),
         is_revoked: matches!(certificate.revocation_status, RevocationStatus::Revoked(_)),
+        is_untrusted: matches!(certificate.trust, TrustStatus::Untrusted { .. }),
     }
 }
 
@@ -1143,6 +1264,17 @@ impl TLS {
             )));
         }
 
+        // Authoritative trust: does the presented chain build to a system root?
+        // Offline and always computed. Only a definitive `Untrusted` adds a
+        // warning; `Unknown` (no trust store) is silent so it can't false-flag.
+        let trust = validate_trust(&x509_ref, &cert_chain);
+        if let TrustStatus::Untrusted { reason } = &trust {
+            security_warnings.push(SecurityWarning::Untrusted(format!(
+                "Certificate chain is not trusted: {}",
+                reason
+            )));
+        }
+
         // Concatenate the presented chain (leaf first) as PEM for `--export-pem`.
         let pem = cert_chain
             .iter()
@@ -1182,6 +1314,7 @@ impl TLS {
             sans: data.sans,
             chain: Some(chain_info),
             revocation_status: data.revocation_status,
+            trust,
             is_self_signed: data.is_self_signed,
             security_warnings,
             cert_key_bits,
@@ -1381,6 +1514,7 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         sans,
         chain: None,
         revocation_status: RevocationStatus::NotChecked,
+        trust: TrustStatus::Unknown,
         is_self_signed: is_self_signed_certificate(cert_ref),
         security_warnings: Vec::new(),
         cert_key_bits: 0,
@@ -1552,7 +1686,7 @@ mod tests {
     use crate::probe::ProtoVersion;
     use crate::{
         CertificateInfo, Chain, Cipher, Issuer, RevocationStatus, SecurityWarning, Subject,
-        TLSError, TLS,
+        TLSError, TrustStatus, TLS,
     };
 
     /// Creates a synthetic TLS struct for offline testing.
@@ -1601,6 +1735,7 @@ mod tests {
                     signature_algorithm: "sha256WithRSAEncryption".to_string(),
                 }]),
                 revocation_status: RevocationStatus::NotChecked,
+                trust: TrustStatus::Unknown,
                 is_self_signed: false,
                 security_warnings: vec![],
                 cert_key_bits: 2048,
@@ -1633,6 +1768,7 @@ mod tests {
             supports_obsolete_protocol: false,
             accepts_weak_cipher: false,
             is_revoked: false,
+            is_untrusted: false,
         };
         tls.grade = Some(grading::calculate_grade(&input));
         tls
@@ -1652,6 +1788,34 @@ mod tests {
         assert_eq!(
             tls_result.certificate.revocation_status,
             RevocationStatus::Good
+        );
+    }
+
+    #[test]
+    #[ignore] // requires network + a system trust store: connects to google.com
+    fn test_trust_valid_host_is_trusted() {
+        let tls_result = TLS::from("google.com", None, false, false).unwrap();
+        // On a machine with a CA bundle this is Trusted; tolerate Unknown so the
+        // test doesn't fail in a bare container without system roots.
+        assert!(
+            matches!(
+                tls_result.certificate.trust,
+                TrustStatus::Trusted | TrustStatus::Unknown
+            ),
+            "expected Trusted/Unknown, got {:?}",
+            tls_result.certificate.trust
+        );
+    }
+
+    #[test]
+    #[ignore] // requires network: connects to untrusted-root.badssl.com
+    fn test_trust_untrusted_host_reports_untrusted() {
+        let tls_result = TLS::from("untrusted-root.badssl.com", None, false, false).unwrap();
+        // Tolerate Unknown (no system roots) but never claim Trusted.
+        assert!(
+            !matches!(tls_result.certificate.trust, TrustStatus::Trusted),
+            "an untrusted-root host must not be reported Trusted, got {:?}",
+            tls_result.certificate.trust
         );
     }
 
@@ -2275,6 +2439,95 @@ mod tests {
         builder.sign(issuer_key, MessageDigest::sha256()).unwrap();
 
         builder.build()
+    }
+
+    /// Creates a self-signed CA root: like `make_test_x509` but with
+    /// `basicConstraints: CA:TRUE` + `keyCertSign`, which OpenSSL's
+    /// `verify_cert` requires of a trust anchor / signer.
+    fn make_test_ca(common_name: &str) -> (X509, PKey<Private>) {
+        use openssl::x509::extension::{BasicConstraints, KeyUsage};
+
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, common_name)
+            .unwrap();
+        let name = name.build();
+
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(3650).unwrap())
+            .unwrap();
+        builder
+            .append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+            .unwrap();
+        builder
+            .append_extension(
+                KeyUsage::new()
+                    .critical()
+                    .key_cert_sign()
+                    .crl_sign()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+
+        (builder.build(), pkey)
+    }
+
+    /// Builds an `X509Store` trusting exactly the given roots.
+    fn make_store(roots: &[&X509]) -> openssl::x509::store::X509Store {
+        let mut builder = openssl::x509::store::X509StoreBuilder::new().unwrap();
+        for root in roots {
+            builder.add_cert((*root).clone()).unwrap();
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn test_validate_trust_trusted_when_root_in_store() {
+        let (ca, ca_key) = make_test_ca("Test Trust Root");
+        let leaf = make_test_x509_signed_by("leaf.example.com", &ca, &ca_key);
+        let store = make_store(&[&ca]);
+
+        // The presented chain is [leaf, ca]; the store trusts the root.
+        let status = super::validate_trust_with_store(&store, &leaf, &[leaf.clone(), ca.clone()]);
+        assert_eq!(status, TrustStatus::Trusted);
+    }
+
+    #[test]
+    fn test_validate_trust_untrusted_when_root_absent() {
+        let (ca, ca_key) = make_test_ca("Test Trust Root");
+        let leaf = make_test_x509_signed_by("leaf.example.com", &ca, &ca_key);
+        // Store trusts an unrelated root, so the leaf cannot build a path.
+        let (other, _) = make_test_ca("Unrelated Root");
+        let store = make_store(&[&other]);
+
+        let status = super::validate_trust_with_store(&store, &leaf, &[leaf.clone()]);
+        match status {
+            TrustStatus::Untrusted { reason } => {
+                assert!(
+                    reason.contains("unable to get local issuer"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected Untrusted, got {other:?}"),
+        }
     }
 
     /// Creates a certificate signed with a weak algorithm (SHA1).
