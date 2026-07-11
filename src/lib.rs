@@ -31,7 +31,6 @@ pub mod probe;
 pub mod sct;
 
 use std::fmt::Debug;
-use std::ops::Deref;
 use std::time::Duration;
 
 use openssl::asn1::{Asn1Time, Asn1TimeRef};
@@ -1418,7 +1417,7 @@ fn asn1_time_to_unix(t: &Asn1TimeRef) -> i64 {
         Ok(epoch) => epoch,
         Err(_) => return 0,
     };
-    match epoch.deref().diff(t) {
+    match epoch.diff(t) {
         Ok(diff) => i64::from(diff.days) * 86_400 + i64::from(diff.secs),
         Err(_) => {
             warn!("Failed to convert certificate timestamp");
@@ -1434,7 +1433,7 @@ fn asn1_time_to_unix(t: &Asn1TimeRef) -> i64 {
 /// computed — callers degrade to zero rather than panicking.
 fn validity_diff(not_after: &Asn1TimeRef) -> Option<openssl::asn1::TimeDiff> {
     let now = Asn1Time::days_from_now(0).ok()?;
-    match now.deref().diff(not_after) {
+    match now.diff(not_after) {
         Ok(diff) => Some(diff),
         Err(_) => {
             warn!("Failed to compute certificate validity period");

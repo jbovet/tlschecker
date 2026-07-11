@@ -85,10 +85,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 fn host_row(app: &App, index: usize) -> Line<'_> {
     let label = app.labels[index].as_str();
     match &app.slots[index] {
-        None => Line::from(vec![
-            Span::styled("⋯ ", DIM),
-            Span::styled(label, DIM),
-        ]),
+        None => Line::from(vec![Span::styled("⋯ ", DIM), Span::styled(label, DIM)]),
         Some(HostOutcome::Failed { kind, .. }) => Line::from(vec![
             Span::styled("✗ ", Style::new().fg(Color::Red)),
             Span::raw(label),
@@ -115,7 +112,9 @@ fn draw_host_list(frame: &mut Frame, app: &App, area: Rect) {
     let [list_area, tally_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).areas(area);
 
-    let items: Vec<ListItem> = (0..app.total()).map(|i| ListItem::new(host_row(app, i))).collect();
+    let items: Vec<ListItem> = (0..app.total())
+        .map(|i| ListItem::new(host_row(app, i)))
+        .collect();
     let list = List::new(items)
         .block(Block::bordered().title(" Hosts "))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
@@ -200,7 +199,9 @@ fn expiry_text(tls: &TLS) -> String {
 fn lifetime_consumed(tls: &TLS) -> f64 {
     let from = tls.certificate.valid_from_unix;
     let to = tls.certificate.valid_to_unix;
-    if to <= from {
+    // `from == 0` is the fallback `asn1_time_to_unix` returns on a parse
+    // failure; `to <= from` covers `to == 0` and any inverted/degenerate range.
+    if from == 0 || to <= from {
         return 1.0; // unknown or degenerate; render as fully consumed
     }
     let now = std::time::SystemTime::now()
@@ -216,10 +217,9 @@ fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
     let cert = &tls.certificate;
 
     let block = Block::bordered().title(format!(" {} ", label)).title(
-        Line::from(format!(" {} {:?} ", verdict_symbol(v), v)).style(
-            Style::new().fg(color).add_modifier(Modifier::BOLD),
-        )
-        .right_aligned(),
+        Line::from(format!(" {} {:?} ", verdict_symbol(v), v))
+            .style(Style::new().fg(color).add_modifier(Modifier::BOLD))
+            .right_aligned(),
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -282,9 +282,8 @@ fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
         constraints[0] = Constraint::Length(1);
         let rows = Layout::vertical(constraints).split(grade_area);
         frame.render_widget(
-            Line::from(format!("Grade {} ({}/100)", grade.grade, grade.score)).style(
-                Style::new().fg(color).add_modifier(Modifier::BOLD),
-            ),
+            Line::from(format!("Grade {} ({}/100)", grade.grade, grade.score))
+                .style(Style::new().fg(color).add_modifier(Modifier::BOLD)),
             rows[0],
         );
         for (i, cat) in grade.categories.iter().enumerate() {
@@ -301,9 +300,7 @@ fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
     if !cert.security_warnings.is_empty() {
         let mut lines = vec![Line::from(Span::styled(
             "Warnings",
-            Style::new()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ))];
         for warning in &cert.security_warnings {
             let (kind, msg) = warning_label(warning);
@@ -395,7 +392,10 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                     format!("{}d ({}h)", cert.validity_days, cert.validity_hours)
                 },
             ));
-            lines.push(kv("Self-signed", if cert.is_self_signed { "yes" } else { "no" }));
+            lines.push(kv(
+                "Self-signed",
+                if cert.is_self_signed { "yes" } else { "no" },
+            ));
             lines.push(kv("Revocation", format!("{:?}", cert.revocation_status)));
             if let Some(ct) = &tls.ct {
                 lines.push(kv(
@@ -451,7 +451,10 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                         Style::new().add_modifier(Modifier::BOLD),
                     )));
                     lines.push(kv("  Issuer", link.issuer.clone()));
-                    lines.push(kv("  Valid", format!("{} → {}", link.valid_from, link.valid_to)));
+                    lines.push(kv(
+                        "  Valid",
+                        format!("{} → {}", link.valid_from, link.valid_to),
+                    ));
                     lines.push(kv("  Signature", link.signature_algorithm.clone()));
                 }
             }

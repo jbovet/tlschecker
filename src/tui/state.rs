@@ -30,9 +30,7 @@ pub fn verdict(tls: &TLS) -> Verdict {
         || cert.validity_days <= 15
     {
         Verdict::Critical
-    } else if cert.is_self_signed
-        || !cert.security_warnings.is_empty()
-        || cert.validity_days <= 30
+    } else if cert.is_self_signed || !cert.security_warnings.is_empty() || cert.validity_days <= 30
     {
         Verdict::Warning
     } else {

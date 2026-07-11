@@ -396,8 +396,7 @@ impl Formatter for TextFormat {
                     writeln!(output, "\tValid from: {:?}", c.valid_from).unwrap();
                     writeln!(output, "\tValid until: {:?}", c.valid_to).unwrap();
                     writeln!(output, "\tIssuer: {:?}", c.issuer).unwrap();
-                    writeln!(output, "\tSignature algorithm: {:?}", c.signature_algorithm)
-                        .unwrap();
+                    writeln!(output, "\tSignature algorithm: {:?}", c.signature_algorithm).unwrap();
                 }
             }
         }
@@ -780,6 +779,10 @@ fn error_kind(err: &TLSError) -> &'static str {
     }
 }
 
+/// A host check job: the host's input-order index paired with its parsed
+/// address (or the address parse error).
+type HostJob = (usize, Result<HostPort, String>);
+
 /// Runs all host checks on a bounded worker pool, streaming each outcome over
 /// a channel as soon as it completes.
 ///
@@ -787,10 +790,6 @@ fn error_kind(err: &TLSError) -> &'static str {
 /// the parse-failure message (which is reported as an immediate
 /// [`HostOutcome::Failed`], so invalid addresses still occupy a row). Worker
 /// threads are detached; the channel closes once every job has been sent.
-/// A host check job: the host's input-order index paired with its parsed
-/// address (or the address parse error).
-type HostJob = (usize, Result<HostPort, String>);
-
 fn spawn_checks(
     jobs: Vec<HostJob>,
     opts: CheckOptions,
@@ -932,8 +931,7 @@ fn main() -> Result<()> {
         TUI_ACTIVE.store(false, Ordering::Relaxed);
         outcome?
     } else {
-        let mut slots: Vec<Option<HostOutcome>> =
-            (0..hosts_len).map(|_| None).collect();
+        let mut slots: Vec<Option<HostOutcome>> = (0..hosts_len).map(|_| None).collect();
         for (index, outcome) in rx.iter() {
             if let HostOutcome::Failed { detail, .. } = &outcome {
                 error!("Failed to check '{}': {}", labels[index], detail);
