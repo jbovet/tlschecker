@@ -510,7 +510,12 @@ impl Formatter for SummaryFormat {
             header.push("CT");
         }
         table
-            .set_content_arrangement(ContentArrangement::Dynamic)
+            // `Disabled` (natural width, no wrapping) rather than `Dynamic`:
+            // `Dynamic` queries the ambient terminal width and wraps cells to
+            // fit, which makes the output non-deterministic (it differs between
+            // a TTY and a pipe, breaking tests) and mangles values like
+            // hostnames and fingerprints mid-word. A wide table simply scrolls.
+            .set_content_arrangement(ContentArrangement::Disabled)
             .apply_modifier(UTF8_ROUND_CORNERS)
             .load_preset(UTF8_FULL)
             .set_header(header);

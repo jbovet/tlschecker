@@ -546,40 +546,82 @@ fn is_chain_well_ordered(chain: &[X509]) -> bool {
 /// store cannot be located or built, so hosts on a machine without a CA bundle
 /// are not mislabelled untrusted.
 pub fn validate_trust(leaf: &X509, chain: &[X509]) -> TrustStatus {
+    match system_trust_store() {
+        Some(store) => validate_trust_with_store(store, leaf, chain),
+        // No CA bundle could be located/parsed — can't judge trust, so degrade
+        // to `Unknown` rather than mislabelling every host `Untrusted`.
+        None => TrustStatus::Unknown,
+    }
+}
+
+/// Lazily builds (once) an `X509Store` from the OS CA bundle, shared across all
+/// checks (`X509Store` is `Send + Sync`; concurrent read-only verification is
+/// the intended OpenSSL usage). Returns `None` when no bundle can be located or
+/// parsed.
+///
+/// We load a bundle **file** explicitly rather than relying on
+/// `X509StoreBuilder::set_default_paths()`: `openssl` is vendored (its
+/// compiled-in defaults don't exist on macOS) and `openssl-probe` 0.2 has no
+/// macOS-specific paths — it points `SSL_CERT_DIR` at an empty `/etc/ssl/certs`,
+/// which `set_default_paths` accepts as a valid-but-empty store, turning every
+/// host into a false `Untrusted`. Loading a real bundle makes the store's
+/// emptiness observable (we only proceed if ≥1 cert parsed) and fixes macOS.
+fn system_trust_store() -> Option<&'static openssl::x509::store::X509Store> {
     use openssl::x509::store::X509StoreBuilder;
+    static STORE: std::sync::OnceLock<Option<openssl::x509::store::X509Store>> =
+        std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            // Configure SSL_CERT_FILE/DIR too, so reqwest's OpenSSL (used for
+            // OCSP/CRL/CT fetches) also finds the system roots.
+            // SAFETY: runs exactly once via `OnceLock`, at first trust check,
+            // before the store is built; it only sets the vars if unset.
+            unsafe {
+                openssl_probe::try_init_openssl_env_vars();
+            }
+            let mut builder = X509StoreBuilder::new().ok()?;
+            let mut added = false;
+            for path in trust_bundle_candidates() {
+                let Ok(pem) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(certs) = X509::stack_from_pem(&pem) else {
+                    continue;
+                };
+                for cert in certs {
+                    if builder.add_cert(cert).is_ok() {
+                        added = true;
+                    }
+                }
+                if added {
+                    break; // first usable bundle wins
+                }
+            }
+            added.then(|| builder.build())
+        })
+        .as_ref()
+}
 
-    // `openssl` is vendored, so its compiled-in default cert paths are wrong on
-    // macOS and vary on Linux. `openssl-probe` finds the OS bundle and exports
-    // SSL_CERT_FILE / SSL_CERT_DIR, which `set_default_paths` then honors.
-    //
-    // Crucially we also record *whether a trust source was found*: on a machine
-    // without any CA bundle, `set_default_paths` still succeeds with an empty
-    // store, and every host would then verify as "unable to get local issuer"
-    // — a false Untrusted. Gating on the probe result keeps that case `Unknown`.
-    // Cached once: the env vars and the filesystem layout don't change mid-run.
-    static TRUST_SOURCE_FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let found = *TRUST_SOURCE_FOUND.get_or_init(|| {
-        let probe = openssl_probe::probe();
-        // SAFETY: runs exactly once via `OnceLock`, before any store is built.
-        // It only sets SSL_CERT_FILE/SSL_CERT_DIR if unset; nothing else is
-        // reading those env vars at this point in startup.
-        unsafe { openssl_probe::init_openssl_env_vars() };
-        probe.cert_file.is_some() || probe.cert_dir.is_some()
-    });
-    if !found {
-        return TrustStatus::Unknown;
+/// Candidate CA-bundle file paths, most-specific first: an explicit
+/// `SSL_CERT_FILE`, whatever `openssl-probe` located, then the well-known
+/// bundles for macOS and the common Linux distros.
+fn trust_bundle_candidates() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(f) = std::env::var_os("SSL_CERT_FILE") {
+        paths.push(std::path::PathBuf::from(f));
     }
-
-    let mut builder = match X509StoreBuilder::new() {
-        Ok(b) => b,
-        Err(_) => return TrustStatus::Unknown,
-    };
-    if builder.set_default_paths().is_err() {
-        return TrustStatus::Unknown;
+    if let Some(f) = openssl_probe::probe().cert_file {
+        paths.push(f);
     }
-    let store = builder.build();
-
-    validate_trust_with_store(&store, leaf, chain)
+    for p in [
+        "/etc/ssl/cert.pem",                  // macOS, Alpine, OpenBSD
+        "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/Fedora
+        "/etc/pki/tls/cert.pem",              // RHEL variant
+    ] {
+        paths.push(std::path::PathBuf::from(p));
+    }
+    paths
 }
 
 /// Verifies `leaf` against an explicit trust `store`, using `chain` as the
