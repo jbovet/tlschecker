@@ -59,9 +59,9 @@ results when `--scan` was used. Scroll with `j`/`k` or `PgUp`/`PgDn`, and
 return with `Esc`.
 
 The classic text outputs are used automatically whenever stdout is piped or
-redirected, and can always be forced with `-o summary|json|text` — so
-scripts, CI pipelines, and `tlschecker -o json | jq` behave exactly as
-before.
+redirected, and can always be forced with `-o summary|json|text` or
+`--no-dashboard` (keeps the configured/`-o` format) — so scripts, CI
+pipelines, and `tlschecker -o json | jq` behave exactly as before.
 
 ## Examples
 

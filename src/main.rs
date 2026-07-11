@@ -23,8 +23,12 @@ use tracing::{error, warn};
 
 /// Experimental TLS/SSL certificate checker.
 ///
-/// Checks TLS certificates for multiple hosts, validates expiration dates,
-/// optionally checks revocation status, and outputs results in various formats.
+/// Checks TLS certificates for multiple hosts, validates expiration dates, and
+/// optionally checks revocation status.
+///
+/// On an interactive terminal it launches a live dashboard by default (j/k
+/// move, Enter inspect a host, q quit). Pipe the output, pass `-o <format>`, or
+/// use `--no-dashboard` for non-interactive JSON/text/summary output.
 #[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
@@ -43,6 +47,14 @@ struct Args {
     /// Output format for certificate results
     #[arg(short, value_enum)]
     output: Option<OutFormat>,
+
+    /// Disable the interactive dashboard and use the classic formatter.
+    ///
+    /// The dashboard is the default on an interactive terminal; this forces the
+    /// non-interactive output (summary by default, or whatever `-o`/config
+    /// selects) even when stdout is a TTY.
+    #[arg(long)]
+    no_dashboard: bool,
 
     /// Exit with this code when expired or revoked certificates are found.
     ///
@@ -86,8 +98,8 @@ struct Args {
     ///
     /// Actively probes the server with many short handshakes (one per
     /// version/cipher), so it is slower than a normal check. Results appear in
-    /// text and JSON output. Implies --grade, so the grade (and thus the scan)
-    /// is surfaced in the summary table.
+    /// the dashboard's detail explorer and in text/JSON output. Implies --grade,
+    /// so the grade (and thus the scan) is also surfaced in the summary table.
     #[arg(long)]
     scan: bool,
 
@@ -114,19 +126,23 @@ struct Args {
     /// Confirms whether the certificate has been logged in CT — a requirement
     /// modern browsers enforce for publicly-trusted certificates. Performs a
     /// network request to an external service, so it adds latency and is
-    /// opt-in. Results appear in text and JSON output. A certificate absent
-    /// from CT is reported as a security warning but does not affect the grade.
+    /// opt-in. Results appear in the dashboard's detail explorer and in
+    /// text/JSON output. A certificate absent from CT is reported as a security
+    /// warning but does not affect the grade.
     #[arg(long)]
     ct_check: bool,
 }
 
 /// Output format for certificate information.
 ///
-/// Determines how certificate data is presented to the user:
+/// Selects the non-interactive output. On a TTY the interactive dashboard is
+/// used by default instead; these formats apply when stdout is piped, when one
+/// is chosen explicitly via `-o`/config, or with `--no-dashboard`.
 ///
 /// - **Json**: Machine-readable JSON format for programmatic consumption
 /// - **Text**: Human-readable detailed text format showing all certificate fields
-/// - **Summary**: Colored table format with certificate health indicators (default)
+/// - **Summary**: Colored table format with certificate health indicators
+///   (default for non-interactive output)
 ///
 /// # Summary Format Columns
 ///
@@ -140,13 +156,17 @@ struct Args {
 /// - **Healthy** (Green): > 30 days until expiration
 /// - **Warning** (Yellow): 15-30 days until expiration
 /// - **Critical** (Red): ≤ 15 days until expiration or expired
+///
+/// The dashboard applies a broader verdict (self-signed certs or any security
+/// warning also count as Warning); see `tui::state::verdict`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum OutFormat {
     /// JSON format for programmatic parsing
     Json,
     /// Detailed text format showing all certificate fields
     Text,
-    /// Summary table format with color-coded status (default)
+    /// Summary table format with color-coded status (default for
+    /// non-interactive/piped output)
     Summary,
 }
 
@@ -851,11 +871,16 @@ fn tracing_writer() -> Box<dyn std::io::Write> {
 /// Whether to run the interactive dashboard instead of a text formatter.
 ///
 /// The dashboard is the default on an interactive terminal, but never when the
-/// user asked for a specific output format (CLI `-o` or config `output` key)
-/// or a PEM export — those must keep producing the classic stream, and any
-/// piped/redirected stdout does too.
-fn use_dashboard(stdout_is_tty: bool, output_explicit: bool, export_pem: bool) -> bool {
-    stdout_is_tty && !output_explicit && !export_pem
+/// user asked for a specific output format (CLI `-o` or config `output` key),
+/// passed `--no-dashboard`, or requested a PEM export — those must keep
+/// producing the classic stream, and any piped/redirected stdout does too.
+fn use_dashboard(
+    stdout_is_tty: bool,
+    output_explicit: bool,
+    export_pem: bool,
+    no_dashboard: bool,
+) -> bool {
+    stdout_is_tty && !output_explicit && !export_pem && !no_dashboard
 }
 
 fn main() -> Result<()> {
@@ -897,6 +922,7 @@ fn main() -> Result<()> {
         std::io::stdout().is_terminal(),
         final_config.output_explicit,
         cli.export_pem,
+        cli.no_dashboard,
     );
 
     // Parse hosts and ports. Invalid addresses stay in the job list so they
@@ -1963,6 +1989,20 @@ pub(crate) mod tests {
         assert!(should_grade(true, true));
         // neither: no grade.
         assert!(!should_grade(false, false));
+    }
+
+    #[test]
+    fn test_use_dashboard() {
+        // Default on an interactive terminal with no overrides.
+        assert!(use_dashboard(true, false, false, false));
+        // Non-TTY (piped/redirected) never uses the dashboard.
+        assert!(!use_dashboard(false, false, false, false));
+        // An explicit `-o`/config output opts out.
+        assert!(!use_dashboard(true, true, false, false));
+        // `--export-pem` opts out.
+        assert!(!use_dashboard(true, false, true, false));
+        // `--no-dashboard` opts out even on a bare TTY.
+        assert!(!use_dashboard(true, false, false, true));
     }
 
     // ── min_validity exit logic tests ──────────────────────────────
