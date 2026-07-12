@@ -20,6 +20,8 @@
 use openssl::x509::X509Ref;
 use serde::{Deserialize, Serialize};
 
+use crate::der::{find_extension_value, read_tlv};
+
 /// The value octets of OID `1.3.6.1.4.1.11129.2.4.2` (without the `06 0A` TLV
 /// header), i.e. the `extnID` of the embedded-SCT-list extension.
 const SCT_LIST_OID: [u8; 10] = [0x2b, 0x06, 0x01, 0x04, 0x01, 0xd6, 0x79, 0x02, 0x04, 0x02];
@@ -64,116 +66,6 @@ pub fn embedded_scts(cert: &X509Ref) -> Vec<Sct> {
         Some(extn_value) => parse_scts_from_extension(extn_value),
         None => Vec::new(),
     }
-}
-
-/// Reads one DER TLV from the front of `buf`.
-///
-/// Returns `(tag, content, rest)` where `content` is the value bytes and `rest`
-/// is whatever follows the element. Only definite-length encodings are
-/// supported (which is all DER permits). Returns `None` on a truncated or
-/// over-long length.
-fn read_tlv(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
-    if buf.len() < 2 {
-        return None;
-    }
-    let tag = buf[0];
-    let first = buf[1];
-    let (len, header) = if first < 0x80 {
-        (first as usize, 2)
-    } else {
-        let n = (first & 0x7f) as usize;
-        // Reject indefinite form (n == 0) and absurd lengths.
-        if n == 0 || n > 4 || buf.len() < 2 + n {
-            return None;
-        }
-        let mut l = 0usize;
-        for &b in &buf[2..2 + n] {
-            l = (l << 8) | b as usize;
-        }
-        (l, 2 + n)
-    };
-    let end = header.checked_add(len)?;
-    if buf.len() < end {
-        return None;
-    }
-    Some((tag, &buf[header..end], &buf[end..]))
-}
-
-/// Walks a certificate's DER to return the `extnValue` octets of the extension
-/// whose `extnID` matches `oid` (the OID value bytes, without TLV header).
-///
-/// Performs a real structural descent (Certificate → tbsCertificate → the `[3]`
-/// extensions wrapper → each Extension), rather than scanning for the OID
-/// pattern, so an OID-shaped byte run elsewhere in the certificate cannot be
-/// mistaken for the extension.
-fn find_extension_value<'a>(der: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
-    // Certificate ::= SEQUENCE { tbsCertificate, ... }
-    let (tag, cert_body, _) = read_tlv(der)?;
-    if tag != 0x30 {
-        return None;
-    }
-    // tbsCertificate is the first element, itself a SEQUENCE.
-    let (tag, tbs, _) = read_tlv(cert_body)?;
-    if tag != 0x30 {
-        return None;
-    }
-
-    // extensions are wrapped in EXPLICIT context tag [3] (0xA3). Scan the tbs
-    // children for it.
-    let mut rest = tbs;
-    let extensions_explicit = loop {
-        let (tag, content, next) = read_tlv(rest)?;
-        if tag == 0xA3 {
-            break content;
-        }
-        rest = next;
-        if rest.is_empty() {
-            return None;
-        }
-    };
-
-    // Inside [3] is the Extensions SEQUENCE.
-    let (tag, extensions, _) = read_tlv(extensions_explicit)?;
-    if tag != 0x30 {
-        return None;
-    }
-
-    // Iterate Extension ::= SEQUENCE { extnID OID, critical BOOL OPTIONAL,
-    // extnValue OCTET STRING }.
-    let mut rest = extensions;
-    while let Some((tag, ext, next)) = read_tlv(rest) {
-        rest = next;
-        if tag != 0x30 {
-            if rest.is_empty() {
-                break;
-            }
-            continue;
-        }
-        let (oid_tag, oid_val, after_oid) = match read_tlv(ext) {
-            Some(t) => t,
-            None => continue,
-        };
-        if oid_tag != 0x06 || oid_val != oid {
-            if rest.is_empty() {
-                break;
-            }
-            continue;
-        }
-        // Matched extnID. The extnValue OCTET STRING may be preceded by an
-        // optional `critical` BOOLEAN.
-        let (next_tag, next_val, after) = read_tlv(after_oid)?;
-        if next_tag == 0x04 {
-            return Some(next_val);
-        }
-        if next_tag == 0x01 {
-            let (octet_tag, octet_val, _) = read_tlv(after)?;
-            if octet_tag == 0x04 {
-                return Some(octet_val);
-            }
-        }
-        return None;
-    }
-    None
 }
 
 /// Parses the SCT list out of the extension's `extnValue`.
@@ -284,27 +176,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_read_tlv_short_and_long_form() {
-        // Short form: tag 0x04, len 3.
-        let (tag, content, rest) = read_tlv(&[0x04, 0x03, 1, 2, 3, 9]).unwrap();
-        assert_eq!(tag, 0x04);
-        assert_eq!(content, &[1, 2, 3]);
-        assert_eq!(rest, &[9]);
-        // Long form: len encoded in one following byte (0x81 0x02).
-        let (_, content, _) = read_tlv(&[0x30, 0x81, 0x02, 0xaa, 0xbb]).unwrap();
-        assert_eq!(content, &[0xaa, 0xbb]);
-        // Truncated.
-        assert!(read_tlv(&[0x04, 0x05, 1, 2]).is_none());
-    }
-
     /// Builds a TLS `SignedCertificateTimestampList` with two SCTs and verifies
     /// parsing (count, version, log id, timestamp).
     #[test]
     fn test_parse_sct_list() {
         fn one_sct(log_byte: u8, ts_ms: u64) -> Vec<u8> {
             let mut s = vec![0x00]; // version v1
-            s.extend(std::iter::repeat(log_byte).take(32)); // log id
+            s.extend(std::iter::repeat_n(log_byte, 32)); // log id
             s.extend_from_slice(&ts_ms.to_be_bytes()); // timestamp
             s.extend_from_slice(&[0x00, 0x00]); // empty extensions
             s.extend_from_slice(&[0x04, 0x03, 0x00, 0x01, 0xab]); // dummy signature
@@ -334,7 +212,7 @@ mod tests {
     fn test_parse_scts_from_extension_unwraps_octet_string() {
         // extnValue is a DER OCTET STRING wrapping the TLS list.
         let mut s = vec![0x00];
-        s.extend(std::iter::repeat(0x33).take(32));
+        s.extend(std::iter::repeat_n(0x33, 32));
         s.extend_from_slice(&1_234_567_890_000u64.to_be_bytes());
         s.extend_from_slice(&[0x00, 0x00, 0x04, 0x03, 0x00, 0x01, 0xab]);
 

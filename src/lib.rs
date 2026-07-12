@@ -25,13 +25,14 @@
 //! # Ok::<(), tlschecker::TLSError>(())
 //! ```
 
+pub mod certext;
 pub mod ct;
+mod der;
 pub mod grading;
 pub mod probe;
 pub mod sct;
 
 use std::fmt::Debug;
-use std::ops::Deref;
 use std::time::Duration;
 
 use openssl::asn1::{Asn1Time, Asn1TimeRef};
@@ -67,6 +68,31 @@ impl Default for RevocationStatus {
     }
 }
 
+/// Whether the presented certificate chain builds to a trusted system root.
+///
+/// This is the authoritative trust verdict computed *after* inspection (the
+/// handshake itself runs with verification disabled so broken certs can still
+/// be examined), mirroring the tri-state shape of [`RevocationStatus`].
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum TrustStatus {
+    /// The chain verified against the system trust store.
+    Trusted,
+    /// The chain did not verify; `reason` is OpenSSL's verification error
+    /// (e.g. "unable to get local issuer certificate", "certificate has expired").
+    Untrusted { reason: String },
+    /// Trust could not be determined — no system trust store was available or
+    /// the store could not be built. Never treated as a problem (no warning,
+    /// no grade cap), consistent with the degrade-rather-than-panic ethos.
+    Unknown,
+}
+
+impl Default for TrustStatus {
+    /// Returns `Unknown` as the default trust status.
+    fn default() -> Self {
+        TrustStatus::Unknown
+    }
+}
+
 /// Security warnings identified during certificate analysis.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum SecurityWarning {
@@ -89,6 +115,15 @@ pub enum SecurityWarning {
     /// The presented certificate was not found in any public Certificate
     /// Transparency log (discovered via `--ct-check`)
     NotInCertificateTransparency(String),
+    /// The certificate chain did not build to a trusted system root
+    Untrusted(String),
+    /// The certificate deviates from issuance best practice (e.g. CA:TRUE on a
+    /// leaf, missing serverAuth EKU, over-long validity). Informational — it
+    /// does not affect the grade.
+    CertificateMisissuance(String),
+    /// A link in the presented chain is not cryptographically signed by the
+    /// certificate that follows it. Informational — it does not affect the grade.
+    InvalidChainSignature(String),
 }
 
 /// Represents a certificate in the certificate chain.
@@ -141,6 +176,10 @@ pub struct Cipher {
     pub version: String,
     /// Cipher suite key length in bits
     pub bits: i32,
+    /// Application-layer protocol negotiated via ALPN (e.g. "h2", "http/1.1"),
+    /// or `None` if the server did not select one.
+    #[serde(default)]
+    pub alpn: Option<String>,
 }
 
 /// Comprehensive X.509 certificate information.
@@ -160,6 +199,14 @@ pub struct CertificateInfo {
     pub valid_from: String,
     /// Certificate expiration date (ISO 8601 format)
     pub valid_to: String,
+    /// Certificate validity start as a Unix timestamp (seconds; 0 if it could
+    /// not be computed)
+    #[serde(default)]
+    pub valid_from_unix: i64,
+    /// Certificate expiration as a Unix timestamp (seconds; 0 if it could not
+    /// be computed)
+    #[serde(default)]
+    pub valid_to_unix: i64,
     /// Number of days until certificate expires (negative if expired)
     pub validity_days: i32,
     /// Number of hours until certificate expires (negative if expired)
@@ -178,6 +225,10 @@ pub struct CertificateInfo {
     pub chain: Option<Vec<Chain>>,
     /// Certificate revocation status (if checked)
     pub revocation_status: RevocationStatus,
+    /// Whether the chain builds to a trusted system root (always computed;
+    /// `Unknown` when no trust store is available)
+    #[serde(default)]
+    pub trust: TrustStatus,
     /// Whether this is a self-signed certificate
     pub is_self_signed: bool,
     /// Security warnings identified during analysis
@@ -190,6 +241,28 @@ pub struct CertificateInfo {
     pub cert_sha256: String,
     /// SHA-1 fingerprint of the DER-encoded certificate (colon-separated hex)
     pub cert_sha1: String,
+    /// Subject Key Identifier (colon-hex), if the extension is present
+    #[serde(default)]
+    pub subject_key_id: Option<String>,
+    /// Authority Key Identifier (colon-hex), if the extension is present
+    #[serde(default)]
+    pub authority_key_id: Option<String>,
+    /// CA/Browser-Forum validation level ("EV"/"OV"/"DV"/"IV") from the
+    /// Certificate Policies extension, or `None` if no CABF policy OID is present
+    #[serde(default)]
+    pub validation_level: Option<String>,
+    /// Key Usage flag names present (e.g. `digitalSignature`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_usage: Vec<String>,
+    /// Extended Key Usage purpose names / OIDs (e.g. `serverAuth`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ext_key_usage: Vec<String>,
+    /// Whether Basic Constraints asserts `CA:TRUE`
+    #[serde(default)]
+    pub is_ca: bool,
+    /// Basic Constraints path-length constraint, if present
+    #[serde(default)]
+    pub path_len: Option<u32>,
     /// Signed Certificate Timestamps embedded in the leaf (offline proof the
     /// certificate was submitted to CT logs). Empty when none are present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -262,21 +335,30 @@ pub struct Subject {
 /// # }
 /// ```
 pub fn find_issuer_cert<'a>(cert: &X509Ref, chain: &'a [X509]) -> Option<&'a X509> {
-    let cert_issuer = cert.issuer_name();
-
-    for potential_issuer in chain {
-        // Get the subject name of the potential issuer
-        let potential_subject = potential_issuer.subject_name();
-
-        // Compare the issuer name of our certificate with the subject name of the potential issuer
-        if cert_issuer
-            .try_cmp(potential_subject)
-            .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
-        {
-            return Some(potential_issuer);
+    // Prefer the RFC 5280 key-identifier match: the cert's Authority Key
+    // Identifier should equal the issuer's Subject Key Identifier. This is
+    // unambiguous even when multiple certs share a subject name (e.g. a CA
+    // cross-signed by two roots). Only when AKI/SKI are absent or don't match
+    // do we fall back to the DN comparison below, so this can only add matches,
+    // never remove the ones the name check already found.
+    if let Some(akid) = cert.authority_key_id() {
+        let by_key_id = chain.iter().find(|c| {
+            c.subject_key_id()
+                .is_some_and(|skid| skid.as_slice() == akid.as_slice())
+        });
+        if by_key_id.is_some() {
+            return by_key_id;
         }
     }
-    None
+
+    // Fall back to matching the certificate's issuer DN against a candidate's
+    // subject DN.
+    let cert_issuer = cert.issuer_name();
+    chain.iter().find(|c| {
+        cert_issuer
+            .try_cmp(c.subject_name())
+            .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
+    })
 }
 
 /// Analyzes a certificate chain for security issues.
@@ -386,6 +468,44 @@ pub fn analyze_certificate_chain(cert: &X509, chain: &[X509]) -> Vec<SecurityWar
         }
     }
 
+    // Cryptographically verify that each certificate is actually signed by its
+    // issuer. The issuer is located by *identity* (`find_issuer_cert`), not by
+    // chain position, so a merely mis-ordered chain — already reported above —
+    // does not produce spurious signature failures. Self-signed roots are
+    // skipped (nothing to prove), and a certificate whose issuer isn't present
+    // is left to the incomplete-chain check rather than flagged here. Only a
+    // real forgery — the named issuer is present but the signature does not
+    // validate against its key — warns.
+    for chain_cert in chain.iter() {
+        if is_self_signed_certificate(chain_cert) {
+            continue;
+        }
+        let Some(issuer) = find_issuer_cert(chain_cert, chain) else {
+            continue;
+        };
+        let Ok(issuer_key) = issuer.public_key() else {
+            continue;
+        };
+        if matches!(chain_cert.verify(&issuer_key), Ok(false)) {
+            let subject = chain_cert
+                .subject_name()
+                .entries_by_nid(Nid::COMMONNAME)
+                .next()
+                .and_then(|e| e.data().to_string().ok())
+                .unwrap_or_else(|| "Unknown".to_string());
+            warnings.push(SecurityWarning::InvalidChainSignature(format!(
+                "Certificate '{}' is not validly signed by its issuer '{}'",
+                subject,
+                issuer
+                    .subject_name()
+                    .entries_by_nid(Nid::COMMONNAME)
+                    .next()
+                    .and_then(|e| e.data().to_string().ok())
+                    .unwrap_or_else(|| "Unknown".to_string())
+            )));
+        }
+    }
+
     warnings
 }
 
@@ -413,6 +533,137 @@ fn is_chain_well_ordered(chain: &[X509]) -> bool {
         }
     }
     true
+}
+
+/// Validates that `leaf` builds to a trusted root using the OS trust store.
+///
+/// This is the authoritative trust check a browser performs, computed *after*
+/// the inspecting handshake (which runs with verification disabled). `chain`
+/// supplies the presented intermediates used to build the path; the trust
+/// anchors come solely from the system store.
+///
+/// Returns [`TrustStatus::Unknown`] — never an error — when the system trust
+/// store cannot be located or built, so hosts on a machine without a CA bundle
+/// are not mislabelled untrusted.
+pub fn validate_trust(leaf: &X509, chain: &[X509]) -> TrustStatus {
+    match system_trust_store() {
+        Some(store) => validate_trust_with_store(store, leaf, chain),
+        // No CA bundle could be located/parsed — can't judge trust, so degrade
+        // to `Unknown` rather than mislabelling every host `Untrusted`.
+        None => TrustStatus::Unknown,
+    }
+}
+
+/// Lazily builds (once) an `X509Store` from the OS CA bundle, shared across all
+/// checks (`X509Store` is `Send + Sync`; concurrent read-only verification is
+/// the intended OpenSSL usage). Returns `None` when no bundle can be located or
+/// parsed.
+///
+/// We load a bundle **file** explicitly rather than relying on
+/// `X509StoreBuilder::set_default_paths()`: `openssl` is vendored (its
+/// compiled-in defaults don't exist on macOS) and `openssl-probe` 0.2 has no
+/// macOS-specific paths — it points `SSL_CERT_DIR` at an empty `/etc/ssl/certs`,
+/// which `set_default_paths` accepts as a valid-but-empty store, turning every
+/// host into a false `Untrusted`. Loading a real bundle makes the store's
+/// emptiness observable (we only proceed if ≥1 cert parsed) and fixes macOS.
+fn system_trust_store() -> Option<&'static openssl::x509::store::X509Store> {
+    use openssl::x509::store::X509StoreBuilder;
+    static STORE: std::sync::OnceLock<Option<openssl::x509::store::X509Store>> =
+        std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            // Configure SSL_CERT_FILE/DIR too, so reqwest's OpenSSL (used for
+            // OCSP/CRL/CT fetches) also finds the system roots.
+            // SAFETY: runs exactly once via `OnceLock`, at first trust check,
+            // before the store is built; it only sets the vars if unset.
+            unsafe {
+                openssl_probe::try_init_openssl_env_vars();
+            }
+            let mut builder = X509StoreBuilder::new().ok()?;
+            let mut added = false;
+            for path in trust_bundle_candidates() {
+                let Ok(pem) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(certs) = X509::stack_from_pem(&pem) else {
+                    continue;
+                };
+                for cert in certs {
+                    if builder.add_cert(cert).is_ok() {
+                        added = true;
+                    }
+                }
+                if added {
+                    break; // first usable bundle wins
+                }
+            }
+            added.then(|| builder.build())
+        })
+        .as_ref()
+}
+
+/// Candidate CA-bundle file paths, most-specific first: an explicit
+/// `SSL_CERT_FILE`, whatever `openssl-probe` located, then the well-known
+/// bundles for macOS and the common Linux distros.
+fn trust_bundle_candidates() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(f) = std::env::var_os("SSL_CERT_FILE") {
+        paths.push(std::path::PathBuf::from(f));
+    }
+    if let Some(f) = openssl_probe::probe().cert_file {
+        paths.push(f);
+    }
+    for p in [
+        "/etc/ssl/cert.pem",                  // macOS, Alpine, OpenBSD
+        "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/Fedora
+        "/etc/pki/tls/cert.pem",              // RHEL variant
+    ] {
+        paths.push(std::path::PathBuf::from(p));
+    }
+    paths
+}
+
+/// Verifies `leaf` against an explicit trust `store`, using `chain` as the
+/// untrusted intermediates for path building.
+///
+/// Split out from [`validate_trust`] so it can be unit-tested with a synthetic
+/// root instead of the OS trust store. A build/verify error that is *not* a
+/// certificate rejection degrades to [`TrustStatus::Unknown`].
+fn validate_trust_with_store(
+    store: &openssl::x509::store::X509Store,
+    leaf: &X509,
+    chain: &[X509],
+) -> TrustStatus {
+    use openssl::x509::X509StoreContext;
+
+    // Untrusted intermediates: everything the server presented except the leaf.
+    // Passing the leaf again is harmless, but skip it to keep the stack minimal.
+    let mut intermediates = match openssl::stack::Stack::<X509>::new() {
+        Ok(s) => s,
+        Err(_) => return TrustStatus::Unknown,
+    };
+    for cert in chain.iter().skip(1) {
+        let _ = intermediates.push(cert.to_owned());
+    }
+
+    let mut ctx = match X509StoreContext::new() {
+        Ok(c) => c,
+        Err(_) => return TrustStatus::Unknown,
+    };
+
+    // Read the verdict — and, on failure, the reason — inside the closure while
+    // the store context is live (`error()` reflects the last `verify_cert`).
+    let result = ctx.init(store, leaf, &intermediates, |c| match c.verify_cert() {
+        Ok(true) => Ok(TrustStatus::Trusted),
+        Ok(false) => Ok(TrustStatus::Untrusted {
+            reason: c.error().error_string().to_string(),
+        }),
+        Err(e) => Err(e),
+    });
+
+    // An internal error (not a verdict) degrades to Unknown — never Untrusted.
+    result.unwrap_or(TrustStatus::Unknown)
 }
 
 /// Determines whether `cert` is valid for `hostname`.
@@ -671,6 +922,7 @@ fn build_grading_input(
         accepts_weak_cipher: is_weak_cipher(&cipher.name)
             || scan.map(scan_accepts_weak_cipher).unwrap_or(false),
         is_revoked: matches!(certificate.revocation_status, RevocationStatus::Revoked(_)),
+        is_untrusted: matches!(certificate.trust, TrustStatus::Untrusted { .. }),
     }
 }
 
@@ -1051,6 +1303,11 @@ impl TLS {
 
         let mut context = SslContext::builder(SslMethod::tls())?;
         context.set_verify(SslVerifyMode::empty());
+        // Advertise HTTP/2 and HTTP/1.1 via ALPN so we can report what the
+        // server negotiates. Wire format: each protocol is a length-prefixed
+        // byte string. Best-effort — a server that ignores ALPN just yields
+        // `None`, and a failure to set it must not abort the diagnostic.
+        let _ = context.set_alpn_protos(b"\x02h2\x08http/1.1");
         let context_builder = context.build();
 
         let mut connector = Ssl::new(&context_builder)?;
@@ -1083,6 +1340,10 @@ impl TLS {
                 .map(|c| c.version().to_string())
                 .unwrap_or_else(|| "Unknown".to_string()),
             bits: ssl.current_cipher().map(|c| c.bits().secret).unwrap_or(0),
+            // The negotiated ALPN protocol, if any (e.g. "h2", "http/1.1").
+            alpn: ssl
+                .selected_alpn_protocol()
+                .map(|p| String::from_utf8_lossy(p).into_owned()),
         };
 
         // Get the peer certificate chain
@@ -1136,6 +1397,66 @@ impl TLS {
             )));
         }
 
+        // Authoritative trust: does the presented chain build to a system root?
+        // Offline and always computed. Only a definitive `Untrusted` adds a
+        // warning; `Unknown` (no trust store) is silent so it can't false-flag.
+        let trust = validate_trust(&x509_ref, &cert_chain);
+        if let TrustStatus::Untrusted { reason } = &trust {
+            security_warnings.push(SecurityWarning::Untrusted(format!(
+                "Certificate chain is not trusted: {}",
+                reason
+            )));
+        }
+
+        // Misissuance checks on the leaf (informational — no grade impact).
+        if data.is_ca {
+            security_warnings.push(SecurityWarning::CertificateMisissuance(
+                "Leaf certificate asserts CA:TRUE in Basic Constraints".to_string(),
+            ));
+        }
+        if !data.ext_key_usage.is_empty()
+            && !data
+                .ext_key_usage
+                .iter()
+                .any(|p| p == "serverAuth" || p == "anyExtendedKeyUsage")
+        {
+            security_warnings.push(SecurityWarning::CertificateMisissuance(
+                "Leaf Extended Key Usage does not include serverAuth".to_string(),
+            ));
+        }
+        if !data.key_usage.is_empty()
+            && !data
+                .key_usage
+                .iter()
+                .any(|k| k == "digitalSignature" || k == "keyEncipherment")
+        {
+            security_warnings.push(SecurityWarning::CertificateMisissuance(
+                "Leaf Key Usage lacks digitalSignature and keyEncipherment".to_string(),
+            ));
+        }
+
+        // CA/Browser-Forum baseline sanity (informational). Serial numbers must
+        // carry >= 64 bits of entropy; a low bit-count signals a predictable
+        // serial. Zero is a parse failure, not a real serial, so it's ignored.
+        if let Ok(bits) = x509_ref.serial_number().to_bn().map(|bn| bn.num_bits()) {
+            if bits > 0 && bits < 64 {
+                security_warnings.push(SecurityWarning::CertificateMisissuance(format!(
+                    "Serial number has only {} bits of entropy (CA/B Forum requires >= 64)",
+                    bits
+                )));
+            }
+        }
+        // Publicly-trusted leaf validity must not exceed 398 days.
+        if data.valid_from_unix != 0 && data.valid_to_unix != 0 {
+            let span_days = (data.valid_to_unix - data.valid_from_unix) / 86_400;
+            if span_days > 398 {
+                security_warnings.push(SecurityWarning::CertificateMisissuance(format!(
+                    "Validity period is {} days (CA/B Forum limits leaf certs to 398)",
+                    span_days
+                )));
+            }
+        }
+
         // Concatenate the presented chain (leaf first) as PEM for `--export-pem`.
         let pem = cert_chain
             .iter()
@@ -1164,6 +1485,8 @@ impl TLS {
             issued: data.issued,
             valid_from: data.valid_from,
             valid_to: data.valid_to,
+            valid_from_unix: data.valid_from_unix,
+            valid_to_unix: data.valid_to_unix,
             validity_days: data.validity_days,
             validity_hours: data.validity_hours,
             is_expired: data.is_expired,
@@ -1173,12 +1496,20 @@ impl TLS {
             sans: data.sans,
             chain: Some(chain_info),
             revocation_status: data.revocation_status,
+            trust,
             is_self_signed: data.is_self_signed,
             security_warnings,
             cert_key_bits,
             cert_key_algorithm,
             cert_sha256: data.cert_sha256,
             cert_sha1: data.cert_sha1,
+            subject_key_id: data.subject_key_id,
+            authority_key_id: data.authority_key_id,
+            validation_level: data.validation_level,
+            key_usage: data.key_usage,
+            ext_key_usage: data.ext_key_usage,
+            is_ca: data.is_ca,
+            path_len: data.path_len,
             scts: data.scts,
             pem,
         };
@@ -1351,12 +1682,15 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
             }
         }
     }
+    let usage = certext::usage(cert_ref);
     CertificateInfo {
         hostname: "None".to_string(),
         subject: get_subject(cert_ref),
         issued: get_issuer(cert_ref),
         valid_from: cert_ref.not_before().to_string(),
         valid_to: cert_ref.not_after().to_string(),
+        valid_from_unix: asn1_time_to_unix(cert_ref.not_before()),
+        valid_to_unix: asn1_time_to_unix(cert_ref.not_after()),
         validity_days: get_validity_days(cert_ref.not_after()),
         validity_hours: get_validity_in_hours(cert_ref.not_after()),
         is_expired: has_expired(cert_ref.not_after()),
@@ -1370,12 +1704,24 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         sans,
         chain: None,
         revocation_status: RevocationStatus::NotChecked,
+        trust: TrustStatus::Unknown,
         is_self_signed: is_self_signed_certificate(cert_ref),
         security_warnings: Vec::new(),
         cert_key_bits: 0,
         cert_key_algorithm: String::new(),
         cert_sha256: fingerprint(cert_ref, openssl::hash::MessageDigest::sha256()),
         cert_sha1: fingerprint(cert_ref, openssl::hash::MessageDigest::sha1()),
+        subject_key_id: cert_ref
+            .subject_key_id()
+            .map(|id| bytes_to_hex_colon(id.as_slice())),
+        authority_key_id: cert_ref
+            .authority_key_id()
+            .map(|id| bytes_to_hex_colon(id.as_slice())),
+        validation_level: certext::validation_level(cert_ref),
+        key_usage: usage.key_usage,
+        ext_key_usage: usage.ext_key_usage,
+        is_ca: usage.is_ca,
+        path_len: cert_ref.pathlen(),
         scts: sct::embedded_scts(cert_ref),
         pem: String::new(),
     }
@@ -1388,12 +1734,36 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
 /// string if the digest cannot be computed.
 fn fingerprint(cert_ref: &X509, digest: openssl::hash::MessageDigest) -> String {
     match cert_ref.digest(digest) {
-        Ok(bytes) => bytes
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(":"),
+        Ok(bytes) => bytes_to_hex_colon(&bytes),
         Err(_) => String::new(),
+    }
+}
+
+/// Formats bytes as colon-separated uppercase hex (e.g. `AB:CD:EF`), the
+/// conventional rendering for fingerprints and key identifiers.
+fn bytes_to_hex_colon(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Converts an ASN.1 time to a Unix timestamp (seconds since the epoch).
+///
+/// Returns 0 when the conversion cannot be performed, consistent with the
+/// degrade-rather-than-panic handling elsewhere in certificate parsing.
+fn asn1_time_to_unix(t: &Asn1TimeRef) -> i64 {
+    let epoch = match Asn1Time::from_unix(0) {
+        Ok(epoch) => epoch,
+        Err(_) => return 0,
+    };
+    match epoch.diff(t) {
+        Ok(diff) => i64::from(diff.days) * 86_400 + i64::from(diff.secs),
+        Err(_) => {
+            warn!("Failed to convert certificate timestamp");
+            0
+        }
     }
 }
 
@@ -1404,7 +1774,7 @@ fn fingerprint(cert_ref: &X509, digest: openssl::hash::MessageDigest) -> String 
 /// computed — callers degrade to zero rather than panicking.
 fn validity_diff(not_after: &Asn1TimeRef) -> Option<openssl::asn1::TimeDiff> {
     let now = Asn1Time::days_from_now(0).ok()?;
-    match now.deref().diff(not_after) {
+    match now.diff(not_after) {
         Ok(diff) => Some(diff),
         Err(_) => {
             warn!("Failed to compute certificate validity period");
@@ -1523,7 +1893,7 @@ mod tests {
     use crate::probe::ProtoVersion;
     use crate::{
         CertificateInfo, Chain, Cipher, Issuer, RevocationStatus, SecurityWarning, Subject,
-        TLSError, TLS,
+        TLSError, TrustStatus, TLS,
     };
 
     /// Creates a synthetic TLS struct for offline testing.
@@ -1534,6 +1904,7 @@ mod tests {
                 name: "TLS_AES_256_GCM_SHA384".to_string(),
                 version: "TLSv1.3".to_string(),
                 bits: 256,
+                alpn: Some("h2".to_string()),
             },
             certificate: CertificateInfo {
                 hostname: "test.example.com".to_string(),
@@ -1552,6 +1923,8 @@ mod tests {
                 },
                 valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
                 valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                valid_from_unix: 1_735_689_600,
+                valid_to_unix: 1_798_761_599,
                 validity_days: 365,
                 validity_hours: 8760,
                 is_expired: false,
@@ -1570,12 +1943,20 @@ mod tests {
                     signature_algorithm: "sha256WithRSAEncryption".to_string(),
                 }]),
                 revocation_status: RevocationStatus::NotChecked,
+                trust: TrustStatus::Unknown,
                 is_self_signed: false,
                 security_warnings: vec![],
                 cert_key_bits: 2048,
                 cert_key_algorithm: "RSA".to_string(),
                 cert_sha256: "AB:CD".to_string(),
                 cert_sha1: "12:34".to_string(),
+                subject_key_id: Some("AA:BB".to_string()),
+                authority_key_id: Some("CC:DD".to_string()),
+                validation_level: Some("DV".to_string()),
+                key_usage: vec!["digitalSignature".to_string()],
+                ext_key_usage: vec!["serverAuth".to_string()],
+                is_ca: false,
+                path_len: None,
                 scts: Vec::new(),
                 pem: String::new(),
             },
@@ -1602,6 +1983,7 @@ mod tests {
             supports_obsolete_protocol: false,
             accepts_weak_cipher: false,
             is_revoked: false,
+            is_untrusted: false,
         };
         tls.grade = Some(grading::calculate_grade(&input));
         tls
@@ -1626,31 +2008,63 @@ mod tests {
 
     #[test]
     #[ignore] // requires network: connects to google.com
+    fn test_alpn_negotiated_with_google() {
+        let tls_result = TLS::from("google.com", None, false, false).unwrap();
+        // google.com supports HTTP/2, so ALPN should select "h2". Tolerate
+        // "http/1.1" in case of an intermediary, but it must be populated.
+        let alpn = tls_result.cipher.alpn.expect("ALPN should be negotiated");
+        assert!(
+            alpn == "h2" || alpn == "http/1.1",
+            "unexpected ALPN protocol: {alpn}"
+        );
+    }
+
+    #[test]
+    #[ignore] // requires network + a system trust store: connects to google.com
+    fn test_trust_valid_host_is_trusted() {
+        let tls_result = TLS::from("google.com", None, false, false).unwrap();
+        // On a machine with a CA bundle this is Trusted; tolerate Unknown so the
+        // test doesn't fail in a bare container without system roots.
+        assert!(
+            matches!(
+                tls_result.certificate.trust,
+                TrustStatus::Trusted | TrustStatus::Unknown
+            ),
+            "expected Trusted/Unknown, got {:?}",
+            tls_result.certificate.trust
+        );
+    }
+
+    #[test]
+    #[ignore] // requires network: connects to untrusted-root.badssl.com
+    fn test_trust_untrusted_host_reports_untrusted() {
+        let tls_result = TLS::from("untrusted-root.badssl.com", None, false, false).unwrap();
+        // Tolerate Unknown (no system roots) but never claim Trusted.
+        assert!(
+            !matches!(tls_result.certificate.trust, TrustStatus::Trusted),
+            "an untrusted-root host must not be reported Trusted, got {:?}",
+            tls_result.certificate.trust
+        );
+    }
+
+    #[test]
+    #[ignore] // requires network: connects to google.com
     fn test_check_tls_with_revocation() {
         // This test depends on external services, so we'll just check that it runs
         // without error and returns a valid status (not specifically which status)
         let host = "google.com";
         let tls_result = TLS::from(host, None, true, false).unwrap();
 
-        match tls_result.certificate.revocation_status {
-            RevocationStatus::Good | RevocationStatus::Unknown => {
-                // Either is acceptable since external OCSP responders might be unreliable
-                assert!(true);
-            }
-            RevocationStatus::Revoked(_) => {
-                // This would be unexpected for google.com - log it but don't fail
-                // since it could theoretically happen
-                println!("Unexpected RevocationStatus::Revoked for google.com");
-                assert!(true);
-            }
-            RevocationStatus::NotChecked => {
-                // This should not happen since we requested checking
-                assert!(
-                    false,
-                    "Revocation status should not be NotChecked when enabled"
-                );
-            }
-        }
+        // Good/Unknown are both acceptable (external OCSP responders can be
+        // unreliable) and Revoked would be surprising but is tolerated; only
+        // NotChecked is wrong, since checking was requested.
+        assert!(
+            !matches!(
+                tls_result.certificate.revocation_status,
+                RevocationStatus::NotChecked
+            ),
+            "Revocation status should not be NotChecked when enabled"
+        );
     }
 
     #[test]
@@ -1931,6 +2345,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_find_issuer_cert_prefers_key_id_over_name() {
+        use openssl::x509::extension::{
+            AuthorityKeyIdentifier, BasicConstraints, SubjectKeyIdentifier,
+        };
+
+        // A real CA carrying a Subject Key Identifier.
+        let (ca_key, ca_cert) = {
+            let rsa = Rsa::generate(2048).unwrap();
+            let key = PKey::from_rsa(rsa).unwrap();
+            let mut name = X509NameBuilder::new().unwrap();
+            name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "Shared CA Name")
+                .unwrap();
+            let name = name.build();
+            let mut b = X509Builder::new().unwrap();
+            b.set_version(2).unwrap();
+            let mut serial = BigNum::new().unwrap();
+            serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+            b.set_serial_number(&serial.to_asn1_integer().unwrap())
+                .unwrap();
+            b.set_subject_name(&name).unwrap();
+            b.set_issuer_name(&name).unwrap();
+            b.set_pubkey(&key).unwrap();
+            b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+                .unwrap();
+            b.set_not_after(&Asn1Time::days_from_now(3650).unwrap())
+                .unwrap();
+            b.append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+                .unwrap();
+            let ctx = b.x509v3_context(None, None);
+            let skid = SubjectKeyIdentifier::new().build(&ctx).unwrap();
+            b.append_extension(skid).unwrap();
+            b.sign(&key, MessageDigest::sha256()).unwrap();
+            (key, b.build())
+        };
+
+        // A leaf whose Authority Key Identifier points at that CA's SKI.
+        let leaf = {
+            let rsa = Rsa::generate(2048).unwrap();
+            let key = PKey::from_rsa(rsa).unwrap();
+            let mut name = X509NameBuilder::new().unwrap();
+            name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "leaf.example.com")
+                .unwrap();
+            let name = name.build();
+            let mut b = X509Builder::new().unwrap();
+            b.set_version(2).unwrap();
+            let mut serial = BigNum::new().unwrap();
+            serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+            b.set_serial_number(&serial.to_asn1_integer().unwrap())
+                .unwrap();
+            b.set_subject_name(&name).unwrap();
+            b.set_issuer_name(ca_cert.subject_name()).unwrap();
+            b.set_pubkey(&key).unwrap();
+            b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+                .unwrap();
+            b.set_not_after(&Asn1Time::days_from_now(365).unwrap())
+                .unwrap();
+            let ctx = b.x509v3_context(Some(&ca_cert), None);
+            let akid = AuthorityKeyIdentifier::new()
+                .keyid(true)
+                .build(&ctx)
+                .unwrap();
+            b.append_extension(akid).unwrap();
+            b.sign(&ca_key, MessageDigest::sha256()).unwrap();
+            b.build()
+        };
+
+        // A decoy sharing the CA's subject *name* but a different key (hence a
+        // different/absent SKI). Placed first so a name-only match would pick it.
+        let (decoy, _) = make_test_x509("Shared CA Name");
+
+        let chain = [decoy.clone(), ca_cert.clone()];
+        let found = super::find_issuer_cert(&leaf, &chain).expect("issuer should be found");
+        // AKI→SKI must select the real CA, not the same-named decoy.
+        assert_eq!(
+            found.digest(MessageDigest::sha256()).unwrap().to_vec(),
+            ca_cert.digest(MessageDigest::sha256()).unwrap().to_vec(),
+            "find_issuer_cert should prefer the key-id match over the name match"
+        );
+    }
+
     // ── analyze_certificate_chain tests ──────────────────────────────
 
     #[test]
@@ -2180,6 +2675,25 @@ mod tests {
     }
 
     #[test]
+    fn test_unix_validity_timestamps() {
+        // make_test_x509 issues a cert valid from now for 365 days.
+        let (cert, _) = make_test_x509("unix.example.com");
+        let info = crate::get_certificate_info(&cert);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            (info.valid_from_unix - now).abs() < 300,
+            "valid_from_unix should be ~now, got {}",
+            info.valid_from_unix
+        );
+        let lifetime = info.valid_to_unix - info.valid_from_unix;
+        assert_eq!(lifetime, 365 * 86_400);
+    }
+
+    #[test]
     fn test_validity_hours_includes_subday_remainder() {
         // A certificate expiring in ~10 hours must report 0 days but ~10
         // hours (regression: hours used to be computed as days * 24).
@@ -2234,6 +2748,95 @@ mod tests {
         builder.sign(issuer_key, MessageDigest::sha256()).unwrap();
 
         builder.build()
+    }
+
+    /// Creates a self-signed CA root: like `make_test_x509` but with
+    /// `basicConstraints: CA:TRUE` + `keyCertSign`, which OpenSSL's
+    /// `verify_cert` requires of a trust anchor / signer.
+    fn make_test_ca(common_name: &str) -> (X509, PKey<Private>) {
+        use openssl::x509::extension::{BasicConstraints, KeyUsage};
+
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, common_name)
+            .unwrap();
+        let name = name.build();
+
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(3650).unwrap())
+            .unwrap();
+        builder
+            .append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+            .unwrap();
+        builder
+            .append_extension(
+                KeyUsage::new()
+                    .critical()
+                    .key_cert_sign()
+                    .crl_sign()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+
+        (builder.build(), pkey)
+    }
+
+    /// Builds an `X509Store` trusting exactly the given roots.
+    fn make_store(roots: &[&X509]) -> openssl::x509::store::X509Store {
+        let mut builder = openssl::x509::store::X509StoreBuilder::new().unwrap();
+        for root in roots {
+            builder.add_cert((*root).clone()).unwrap();
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn test_validate_trust_trusted_when_root_in_store() {
+        let (ca, ca_key) = make_test_ca("Test Trust Root");
+        let leaf = make_test_x509_signed_by("leaf.example.com", &ca, &ca_key);
+        let store = make_store(&[&ca]);
+
+        // The presented chain is [leaf, ca]; the store trusts the root.
+        let status = super::validate_trust_with_store(&store, &leaf, &[leaf.clone(), ca.clone()]);
+        assert_eq!(status, TrustStatus::Trusted);
+    }
+
+    #[test]
+    fn test_validate_trust_untrusted_when_root_absent() {
+        let (ca, ca_key) = make_test_ca("Test Trust Root");
+        let leaf = make_test_x509_signed_by("leaf.example.com", &ca, &ca_key);
+        // Store trusts an unrelated root, so the leaf cannot build a path.
+        let (other, _) = make_test_ca("Unrelated Root");
+        let store = make_store(&[&other]);
+
+        let status = super::validate_trust_with_store(&store, &leaf, &[leaf.clone()]);
+        match status {
+            TrustStatus::Untrusted { reason } => {
+                assert!(
+                    reason.contains("unable to get local issuer"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected Untrusted, got {other:?}"),
+        }
     }
 
     /// Creates a certificate signed with a weak algorithm (SHA1).
@@ -2328,6 +2931,60 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "Clean chain should have no warnings, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_analyze_chain_signature_verification() {
+        let (ca, ca_key) = make_test_x509("Real CA");
+        // An impostor CA sharing the *same subject name* but a different key.
+        let (_, impostor_key) = make_test_x509("Real CA");
+
+        // Correct chain: leaf genuinely signed by `ca` → no signature warning.
+        let good_leaf = make_test_x509_signed_by("leaf.example.com", &ca, &ca_key);
+        let good = super::analyze_certificate_chain(&good_leaf, &[good_leaf.clone(), ca.clone()]);
+        assert!(
+            !good
+                .iter()
+                .any(|w| matches!(w, SecurityWarning::InvalidChainSignature(_))),
+            "validly signed chain should not warn, got: {:?}",
+            good
+        );
+
+        // Forged chain: the leaf names `ca` as its issuer (so the issuer *is*
+        // found in the chain) but was signed by the impostor's key, so the
+        // signature does not validate against `ca`'s key.
+        let forged_leaf = make_test_x509_signed_by("leaf.example.com", &ca, &impostor_key);
+        let bad =
+            super::analyze_certificate_chain(&forged_leaf, &[forged_leaf.clone(), ca.clone()]);
+        assert!(
+            bad.iter()
+                .any(|w| matches!(w, SecurityWarning::InvalidChainSignature(_))),
+            "a cryptographically invalid signature should warn, got: {:?}",
+            bad
+        );
+    }
+
+    #[test]
+    fn test_analyze_chain_misordered_valid_signatures_no_false_positive() {
+        // A valid chain presented out of issuer order must NOT be reported as
+        // having invalid signatures — only as mis-ordered.
+        let (root, root_key) = make_test_x509("Root");
+        let intermediate = make_test_x509_signed_by("Intermediate", &root, &root_key);
+        // Note: our synthetic intermediate is signed by the root's key, and the
+        // leaf below is signed by the root too (make_test_x509_signed_by signs
+        // with the passed key); presenting them out of order still yields valid
+        // signatures against each cert's real issuer.
+        let leaf = make_test_x509_signed_by("leaf.example.com", &root, &root_key);
+        // Deliberately mis-ordered: [leaf, root, intermediate].
+        let chain = [leaf.clone(), root.clone(), intermediate.clone()];
+        let warnings = super::analyze_certificate_chain(&leaf, &chain);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, SecurityWarning::InvalidChainSignature(_))),
+            "mis-ordered but validly-signed chain must not warn about signatures, got: {:?}",
             warnings
         );
     }

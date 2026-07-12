@@ -8,9 +8,25 @@ Experimental TLS/SSL certificate command-line checker
 
 [DockerHub](https://hub.docker.com/repository/docker/josebovet/tlschecker)
 
+Build the image locally:
+
 ```sh
-docker run josebovet/tlschecker:1.1.1 jpbd.dev
+docker build -t tlschecker:local .
 ```
+
+Run the CLI from the container:
+
+```sh
+docker run --rm tlschecker:local example.com
+```
+
+For the interactive TUI, run the container with a pseudo-TTY and stdin attached:
+
+```sh
+docker run --rm -it tlschecker:local example.com
+```
+
+The TUI is only used when stdout is an interactive terminal. In non-interactive environments (pipelines, redirected output, CI), the container falls back to the classic text output.
 
 If you are utilizing M1 or higher, please add the option --platform linux/x86_64.
 
@@ -44,6 +60,28 @@ sudo install tlschecker /usr/local/bin/tlschecker
 ➜  tlschecker --help
 ```
 
+### Interactive dashboard
+
+When run in an interactive terminal, tlschecker opens a live dashboard by
+default: hosts stream in as they are checked, with a fleet list and verdict
+tally on the left and a detail pane (expiry lifetime gauge, TLS grade
+breakdown, security warnings) for the selected host on the right. Navigate
+with `j`/`k` (or arrow keys), jump with `g`/`G`, quit with `q`.
+
+Press `Enter` on a host to open the full certificate explorer: subject and
+issuer details, validity dates, serial number and fingerprints, SANs, the
+presented chain, embedded SCTs, the grade breakdown with reasons, and scan
+results when `--scan` was used. Scroll with `j`/`k` or `PgUp`/`PgDn`, and
+return with `Esc`.
+
+The TUI requires an attached terminal. In Docker, that means using `-it` so the
+container gets a pseudo-TTY and stdin. Without that, Docker will fall back to
+the classic text output. The classic text outputs are also used automatically
+whenever stdout is piped or redirected, and can always be forced with
+`-o summary|json|text` or `--no-dashboard` (keeps the configured/`-o`
+format) — so scripts, CI pipelines, and `tlschecker -o json | jq` behave
+exactly as before.
+
 ## Examples
 
 Basic usage:
@@ -61,6 +99,32 @@ You can specify the port in three ways:
 1. Using hostname:port format: `example.com:8443`
 2. Using a full URL: `https://example.com:8443`
 3. Using the default port (443) by just specifying the hostname: `example.com`
+
+### Trust Validation
+
+TLSChecker verifies that the presented certificate chain builds to a trusted root in your operating system's trust store — the same authoritative check a browser performs. This runs automatically for every host (it is offline and adds no latency) and is reported as a `Trust:` line and, in JSON, a `trust` field:
+
+- **Trusted**: the chain builds to a system root CA
+- **Untrusted (reason)**: the chain does not verify — the reason is the underlying error, e.g. `self-signed certificate`, `unable to get local issuer certificate`, or `certificate has expired`
+- **Unknown**: no system trust store was available, so trust could not be determined (never reported as a problem)
+
+An untrusted chain adds an `UNTRUSTED` security warning and caps the configuration grade at C. Because verification happens *after* inspection, expired and self-signed certificates are still fully reported rather than rejected at the handshake.
+
+### Certificate Metadata
+
+Every check also reports (offline, no extra flags) a set of certificate and
+connection details:
+
+- **ALPN** — the negotiated application protocol (`h2` / `http/1.1`).
+- **Subject / Authority Key ID** — the SKI/AKI identifiers.
+- **Validation Level** — `DV` / `OV` / `EV` / `IV`, derived from the CA/Browser-Forum policy OIDs.
+- **Key Usage / Extended Key Usage / Basic Constraints** — what the certificate is authorized for.
+
+It also raises **informational warnings** (which do *not* affect the grade, so
+legitimate private/internal certificates are never penalized) for issuance
+problems: a leaf asserting `CA:TRUE`, a missing `serverAuth` EKU, a low-entropy
+serial, an over-long (> 398-day) validity period, or a chain link whose
+signature does not cryptographically verify.
 
 ### Certificate Revocation Checking
 

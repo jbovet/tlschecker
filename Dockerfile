@@ -1,37 +1,29 @@
-FROM rust:bookworm as build
-LABEL maintainer="jose.bovet@gmail.com"
+# syntax=docker/dockerfile:1.7
+FROM rust:1.97-slim-bookworm AS build
+WORKDIR /src
 
-RUN cargo new --bin tlschecker
-WORKDIR /tlschecker
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential perl pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY ./Cargo.lock ./Cargo.lock
-COPY ./Cargo.toml ./Cargo.toml
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && printf 'fn main() {}\n' > src/main.rs
+RUN cargo build --release --locked
 
-# cache deps
-RUN cargo build --release
-RUN rm src/*.rs
+COPY src ./src
+RUN cargo build --release --locked && strip target/release/tlschecker
 
-COPY ./src ./src
+FROM debian:bookworm-slim AS runtime
 
-# build for release
-RUN rm ./target/release/deps/tlschecker*
-RUN cargo build --release
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# base
-FROM debian:bookworm-slim
+RUN groupadd --gid 42000 hoare && \
+    useradd --uid 42000 --gid hoare --create-home --shell /usr/sbin/nologin hoare
 
-# install libssl
-RUN apt update && apt upgrade -y && \
-    apt install pkg-config libssl-dev -y
+COPY --from=build /src/target/release/tlschecker /usr/local/bin/tlschecker
+RUN chown hoare:hoare /usr/local/bin/tlschecker && chmod 755 /usr/local/bin/tlschecker
 
-# copy the build artifact from the build stage
-COPY --from=build /tlschecker/target/release/tlschecker .
-
-# create and set non-root USER
-RUN addgroup --gid 42000 hoare && \
-    useradd --uid 42000 --gid hoare hoare
-RUN chown -R hoare:hoare tlschecker && \
-    chmod 755 tlschecker
 USER hoare
-
-ENTRYPOINT ["./tlschecker"]
+ENTRYPOINT ["/usr/local/bin/tlschecker"]
