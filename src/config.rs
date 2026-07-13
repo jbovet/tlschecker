@@ -82,8 +82,8 @@ impl Config {
     /// # Ok::<(), tlschecker::config::ConfigError>(())
     /// ```
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let content =
-            fs::read_to_string(path.as_ref()).map_err(|e| ConfigError::Io(e.to_string()))?;
+        let content = fs::read_to_string(path.as_ref())
+            .map_err(|e| ConfigError::Io(format!("{}: {}", path.as_ref().display(), e)))?;
 
         let config: Config =
             toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;

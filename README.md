@@ -39,7 +39,7 @@ docker run --platform linux/x86_64 josebovet/tlschecker:1.1.1 jpbd.dev
 Linux
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v1.1.1/tlschecker-linux.zip
+curl -LO https://github.com/jbovet/tlschecker/releases/latest/download/tlschecker-linux.zip
 unzip tlschecker-linux.zip
 chmod 755 tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
@@ -48,10 +48,17 @@ sudo install tlschecker /usr/local/bin/tlschecker
 Osx
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v1.1.1/tlschecker-macos.zip
+curl -LO https://github.com/jbovet/tlschecker/releases/latest/download/tlschecker-macos.zip
 unzip tlschecker-macos.zip
 chmod 755 tlschecker
 sudo install tlschecker /usr/local/bin/tlschecker
+```
+
+From source (requires a Rust toolchain, a C compiler, and perl — OpenSSL is
+vendored and built as part of the compile):
+
+```sh
+cargo install --git https://github.com/jbovet/tlschecker
 ```
 
 ## How to use
@@ -99,6 +106,60 @@ You can specify the port in three ways:
 1. Using hostname:port format: `example.com:8443`
 2. Using a full URL: `https://example.com:8443`
 3. Using the default port (443) by just specifying the hostname: `example.com`
+
+### Using in CI
+
+By default tlschecker always exits with code 0, even when a certificate is
+expired — it is a reporting tool first. For pipelines that should fail on
+certificate problems, opt in with `--exit-code`:
+
+```sh
+tlschecker \
+  --exit-code 1 \        # exit non-zero when a check fails
+  --min-validity 30 \    # fail if any cert expires within 30 days
+  --fail-on-error \      # fail if a host cannot be checked at all (DNS, refused, ...)
+  example.com api.example.com
+```
+
+`--exit-code <n>` is returned when a certificate is expired or revoked, or has
+fewer remaining days than `--min-validity`. Without `--fail-on-error`,
+unreachable hosts are only logged and do not affect the exit code.
+
+### JSON output
+
+`-o json` (or `--output json`) prints a JSON array with one object per host on
+stdout; diagnostics go to stderr, so piping to `jq` is safe. Abridged example:
+
+```sh
+➜ tlschecker -o json example.com | jq '.[0]'
+{
+  "cipher": {
+    "name": "TLS_AES_256_GCM_SHA384",
+    "version": "TLSv1.3",
+    "bits": 256,
+    "alpn": "h2"
+  },
+  "certificate": {
+    "hostname": "example.com",
+    "subject": { "common_name": "*.example.com", ... },
+    "issued": { "organization": "DigiCert Inc", "common_name": "DigiCert Global G3 ...", ... },
+    "valid_from": "May 15 00:00:00 2025 GMT",
+    "valid_to": "May 15 23:59:59 2026 GMT",
+    "validity_days": 306,
+    "is_expired": false,
+    "sans": ["*.example.com", "example.com"],
+    "chain": [ ... ],
+    "revocation_status": "NotChecked",
+    "trust": "Trusted",
+    "is_self_signed": false,
+    "security_warnings": [],
+    ...
+  }
+}
+```
+
+Optional sections appear only when their flag was used: `grade` (`--grade`),
+`scan` (`--scan`), and `ct` (`--ct-check`).
 
 ### Trust Validation
 

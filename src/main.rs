@@ -46,7 +46,7 @@ struct Args {
     generate_config: bool,
 
     /// Output format for certificate results
-    #[arg(short, value_enum)]
+    #[arg(short, long, value_enum)]
     output: Option<OutFormat>,
 
     /// Disable the interactive dashboard and use the classic formatter.
@@ -65,7 +65,10 @@ struct Args {
     exit_code: Option<i32>,
 
     /// Push certificate metrics to a Prometheus Push Gateway
-    #[arg(long)]
+    ///
+    /// Can be passed as a bare flag (`--prometheus`) or with an explicit
+    /// value (`--prometheus true|false`) to override a config-file setting.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     prometheus: Option<bool>,
 
     /// Prometheus Push Gateway URL [default: http://localhost:9091]
@@ -741,6 +744,14 @@ impl FinalConfig {
             ));
         }
 
+        if let Some(min_validity) = config.min_validity {
+            if min_validity < 0 {
+                return Err(ConfigError::Validation(format!(
+                    "min_validity must be zero or positive, got {min_validity}"
+                )));
+            }
+        }
+
         let output_str = config.output.unwrap_or_else(|| "summary".to_string());
         let output = output_str
             .parse::<OutFormat>()
@@ -959,7 +970,8 @@ fn main() -> Result<()> {
     // Load configuration
     let final_config = match load_config(&cli) {
         Ok(config) => config,
-        Err(_e) => {
+        Err(e) => {
+            error!("{}", e);
             error!("Try running with --help for usage information");
             error!("Or use --generate-config to create a sample configuration file");
             std::process::exit(1);
@@ -1477,6 +1489,25 @@ pub(crate) mod tests {
         };
         let result = FinalConfig::from_merged_config(config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_final_config_negative_min_validity_returns_error() {
+        let config = Config {
+            hosts: Some(vec!["example.com".to_string()]),
+            output: Some("summary".to_string()),
+            exit_code: Some(0),
+            check_revocation: Some(false),
+            prometheus: None,
+            grade: Some(false),
+            min_validity: Some(-5),
+        };
+        match FinalConfig::from_merged_config(config) {
+            Err(e) => assert!(e
+                .to_string()
+                .contains("min_validity must be zero or positive")),
+            Ok(_) => panic!("negative min_validity should be rejected"),
+        }
     }
 
     #[test]
