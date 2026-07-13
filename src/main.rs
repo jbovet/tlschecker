@@ -67,8 +67,10 @@ struct Args {
     /// Push certificate metrics to a Prometheus Push Gateway
     ///
     /// Can be passed as a bare flag (`--prometheus`) or with an explicit
-    /// value (`--prometheus true|false`) to override a config-file setting.
-    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    /// value (`--prometheus=true|false`) to override a config-file setting.
+    /// The value form requires `=` so a following host is never mistaken
+    /// for the flag's value.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     prometheus: Option<bool>,
 
     /// Prometheus Push Gateway URL [default: http://localhost:9091]
@@ -95,7 +97,7 @@ struct Args {
     /// Certificates with fewer remaining days are treated as failures
     /// for exit-code purposes. Set to 0 to disable (default).
     /// Example: --min-validity 30 fails if any cert expires within 30 days.
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true)]
     min_validity: Option<i32>,
 
     /// Enumerate all supported TLS protocol versions and cipher suites.
@@ -744,12 +746,10 @@ impl FinalConfig {
             ));
         }
 
-        if let Some(min_validity) = config.min_validity {
-            if min_validity < 0 {
-                return Err(ConfigError::Validation(format!(
-                    "min_validity must be zero or positive, got {min_validity}"
-                )));
-            }
+        if let Some(min_validity) = config.min_validity.filter(|v| *v < 0) {
+            return Err(ConfigError::Validation(format!(
+                "min_validity must be zero or positive, got {min_validity}"
+            )));
         }
 
         let output_str = config.output.unwrap_or_else(|| "summary".to_string());
@@ -1129,12 +1129,13 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
         let file_config = Config::from_file(config_path)?;
         output_explicit |= file_config.output.is_some();
         config = config.merge_with(file_config);
-    } else {
-        // Try to load from default tlschecker.toml if it exists
-        if let Ok(file_config) = Config::from_file("tlschecker.toml") {
-            output_explicit |= file_config.output.is_some();
-            config = config.merge_with(file_config);
-        }
+    } else if std::path::Path::new("tlschecker.toml").exists() {
+        // An implicit tlschecker.toml in the working directory is optional,
+        // but once it exists a read/parse failure must surface: silently
+        // running with the defaults would look like the config applied.
+        let file_config = Config::from_file("tlschecker.toml")?;
+        output_explicit |= file_config.output.is_some();
+        config = config.merge_with(file_config);
     }
 
     // Merge with CLI arguments (CLI takes precedence)

@@ -85,8 +85,8 @@ impl Config {
         let content = fs::read_to_string(path.as_ref())
             .map_err(|e| ConfigError::Io(format!("{}: {}", path.as_ref().display(), e)))?;
 
-        let config: Config =
-            toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let config: Config = toml::from_str(&content)
+            .map_err(|e| ConfigError::Parse(format!("{}: {}", path.as_ref().display(), e)))?;
 
         Ok(config)
     }

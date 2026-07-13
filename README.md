@@ -114,10 +114,13 @@ expired — it is a reporting tool first. For pipelines that should fail on
 certificate problems, opt in with `--exit-code`:
 
 ```sh
+# --exit-code 1     exit non-zero when a check fails
+# --min-validity 30 fail if any cert expires within 30 days
+# --fail-on-error   fail if a host cannot be checked at all (DNS, refused, ...)
 tlschecker \
-  --exit-code 1 \        # exit non-zero when a check fails
-  --min-validity 30 \    # fail if any cert expires within 30 days
-  --fail-on-error \      # fail if a host cannot be checked at all (DNS, refused, ...)
+  --exit-code 1 \
+  --min-validity 30 \
+  --fail-on-error \
   example.com api.example.com
 ```
 
