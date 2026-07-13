@@ -1129,7 +1129,7 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
         let file_config = Config::from_file(config_path)?;
         output_explicit |= file_config.output.is_some();
         config = config.merge_with(file_config);
-    } else if std::path::Path::new("tlschecker.toml").exists() {
+    } else if std::path::Path::new("tlschecker.toml").is_file() {
         // An implicit tlschecker.toml in the working directory is optional,
         // but once it exists a read/parse failure must surface: silently
         // running with the defaults would look like the config applied.

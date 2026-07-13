@@ -241,6 +241,11 @@ When using Prometheus integration, the revocation status is included in the metr
 tlschecker --prometheus --prometheus-address http://localhost:9091 --check-revocation example.com
 ```
 
+`--prometheus` works as a bare flag. To pass an explicit value (for example to
+override `enabled = true` from a config file), use the `=` form:
+`--prometheus=false`. The space form (`--prometheus false`) is not accepted —
+the word after the flag would be read as a hostname.
+
 A `tlschecker_revocation_status` metric is exported with the following values:
 
 - 0 = Not checked
