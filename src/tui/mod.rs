@@ -77,6 +77,40 @@ pub fn run(
                         view::detail_line_count(&app).saturating_sub(page.saturating_sub(3))
                     };
                     dirty = true;
+                    // If we are in export prompting mode, handle text input first.
+                    if app.export_prompt.is_some() {
+                        match key.code {
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                break;
+                            }
+                            KeyCode::Esc => {
+                                app.export_prompt = None;
+                            }
+                            KeyCode::Enter => {
+                                app.commit_export();
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(prompt) = &mut app.export_prompt {
+                                    prompt.pop();
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                if let Some(prompt) = &mut app.export_prompt {
+                                    prompt.push(c);
+                                }
+                            }
+                            _ => {}
+                        }
+                        dirty = true;
+                        continue;
+                    }
+
+                    // Clear any flash message on keypress.
+                    if app.flash_message.is_some() {
+                        app.clear_flash();
+                        dirty = true;
+                    }
+
                     match (app.screen, key.code) {
                         // Quit from anywhere; Esc only quits from the fleet view.
                         (_, KeyCode::Char('c'))
@@ -85,6 +119,12 @@ pub fn run(
                             break
                         }
                         (_, KeyCode::Char('q')) | (Screen::Fleet, KeyCode::Esc) => break,
+
+                        // Start export prompt from anywhere
+                        (_, KeyCode::Char('e')) => {
+                            app.begin_export();
+                            dirty = true;
+                        }
 
                         // Fleet: move selection, open the explorer.
                         (Screen::Fleet, KeyCode::Char('j') | KeyCode::Down) => app.select_next(),

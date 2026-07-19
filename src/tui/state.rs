@@ -59,6 +59,10 @@ pub struct App {
     pub screen: Screen,
     /// Scroll offset (in lines) of the full-screen detail explorer.
     pub detail_scroll: usize,
+    /// Optional state for the export prompt overlay. When `Some`, the user is typing a filename.
+    pub export_prompt: Option<String>,
+    /// Optional flash message to display success or error (e.g. "Exported to example.pem").
+    pub flash_message: Option<String>,
 }
 
 /// Tally of hosts per state, shown under the host list.
@@ -79,6 +83,8 @@ impl App {
             selected: 0,
             screen: Screen::Fleet,
             detail_scroll: 0,
+            export_prompt: None,
+            flash_message: None,
         }
     }
 
@@ -92,6 +98,28 @@ impl App {
     pub fn close_detail(&mut self) {
         self.screen = Screen::Fleet;
         self.detail_scroll = 0;
+    }
+
+    pub fn begin_export(&mut self) {
+        if let Some(Some(HostOutcome::Checked(_))) = self.slots.get(self.selected) {
+            let label = self.labels.get(self.selected).cloned().unwrap_or_default();
+            self.export_prompt = Some(format!("{}.pem", label));
+        }
+    }
+
+    pub fn commit_export(&mut self) {
+        if let Some(path) = self.export_prompt.take() {
+            if let Some(Some(HostOutcome::Checked(tls))) = self.slots.get(self.selected) {
+                match std::fs::write(&path, &tls.certificate.pem) {
+                    Ok(_) => self.flash_message = Some(format!("Exported to {}", path)),
+                    Err(e) => self.flash_message = Some(format!("Failed to export: {}", e)),
+                }
+            }
+        }
+    }
+
+    pub fn clear_flash(&mut self) {
+        self.flash_message = None;
     }
 
     /// Scrolls the explorer down, clamped to `max` (the last valid offset).

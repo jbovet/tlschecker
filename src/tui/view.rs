@@ -6,7 +6,9 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Gauge, LineGauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Clear, Gauge, LineGauge, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::Frame;
 
 use tlschecker::TLS;
@@ -38,6 +40,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Fleet => draw_fleet(frame, app),
         Screen::Detail => draw_explorer(frame, app),
     }
+
+    if let Some(prompt) = &app.export_prompt {
+        draw_export_prompt(frame, prompt);
+    }
 }
 
 /// Fleet overview: host list + compact detail pane.
@@ -56,8 +62,10 @@ fn draw_fleet(frame: &mut Frame, app: &App) {
     draw_host_list(frame, app, left);
     draw_detail(frame, app, right);
 
-    frame.render_widget(
-        Line::from(" j/k move · ⏎ explore · g/G first/last · q quit").style(DIM),
+    draw_footer(
+        frame,
+        app,
+        " j/k move · ⏎ explore · e export · g/G first/last · q quit",
         footer,
     );
 }
@@ -592,10 +600,62 @@ fn draw_explorer(frame: &mut Frame, app: &App) {
         main,
     );
 
-    frame.render_widget(
-        Line::from(" j/k scroll · g/G top/bottom · esc back · q quit").style(DIM),
+    draw_footer(
+        frame,
+        app,
+        " j/k scroll · g/G top/bottom · e export · esc back · q quit",
         footer,
     );
+}
+
+fn draw_footer(frame: &mut Frame, app: &App, base: &'static str, area: Rect) {
+    if let Some(msg) = &app.flash_message {
+        let color = if msg.starts_with("Failed") {
+            Color::Red
+        } else {
+            Color::Green
+        };
+        frame.render_widget(
+            Line::from(format!(" {} ", msg))
+                .style(Style::new().fg(color).add_modifier(Modifier::BOLD)),
+            area,
+        );
+    } else {
+        frame.render_widget(Line::from(base).style(DIM), area);
+    }
+}
+
+fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::vertical([
+        Constraint::Length(r.height.saturating_sub(height) / 2),
+        Constraint::Length(height),
+        Constraint::Min(0),
+    ])
+    .split(r);
+
+    Layout::horizontal([
+        Constraint::Length(r.width.saturating_sub(width) / 2),
+        Constraint::Length(width),
+        Constraint::Min(0),
+    ])
+    .split(popup_layout[1])[1]
+}
+
+fn draw_export_prompt(frame: &mut Frame, prompt: &str) {
+    let area = centered_rect(60, 3, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Export Certificate ")
+        .border_style(Style::new().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let text = Line::from(vec![
+        Span::raw(" Path: "),
+        Span::styled(prompt, Style::new().fg(Color::Yellow)),
+        Span::styled("█", Style::new().fg(Color::Cyan)),
+    ]);
+    frame.render_widget(Paragraph::new(text), inner);
 }
 
 fn score_color(score: u8) -> Color {
