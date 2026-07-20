@@ -168,7 +168,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "d",
+          "unit": "days",
+          "decimals": 0,
           "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "showPoints": "auto", "thresholdsStyle": { "mode": "dashed" } },
           "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 15 }, { "color": "green", "value": 30 } ] }
         }
