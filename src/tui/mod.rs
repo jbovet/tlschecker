@@ -25,6 +25,43 @@ use state::{App, Screen};
 /// How long to wait for input before checking the result channel again.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Whether a keypress handled by the export overlay should end the session.
+#[derive(Debug, PartialEq, Eq)]
+enum PromptKey {
+    Handled,
+    Quit,
+}
+
+/// Applies one keypress to the open export overlay.
+///
+/// Split out of the event loop so it is testable without a terminal: the
+/// modifier handling here is easy to get wrong and impossible to exercise
+/// through `run`.
+fn handle_export_key(app: &mut App, key: event::KeyEvent) -> PromptKey {
+    // Chords are matched before the catch-all `Char(c)` arm, which would
+    // otherwise insert their letter into the filename — `Ctrl+D` appending a
+    // literal `d`. SHIFT is deliberately not a chord modifier: it is how
+    // capitals arrive.
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let chord = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+
+    match key.code {
+        KeyCode::Char('c') if ctrl => return PromptKey::Quit,
+        KeyCode::Char('u') if ctrl => app.export_input_clear(),
+        KeyCode::Char('w') if ctrl => app.export_input_delete_word(),
+        KeyCode::Esc => app.cancel_export(),
+        // Only a successful write closes the overlay; a failure leaves the
+        // typed path in place to edit.
+        KeyCode::Enter => app.commit_export(),
+        KeyCode::Backspace => app.export_input_pop(),
+        KeyCode::Char(c) if !chord => app.export_input_push(c),
+        _ => {}
+    }
+    PromptKey::Handled
+}
+
 /// Runs the dashboard until the user quits, collecting outcomes as they
 /// stream in over `rx`.
 ///
@@ -77,19 +114,11 @@ pub fn run(
                         view::detail_line_count(&app).saturating_sub(page.saturating_sub(3))
                     };
                     dirty = true;
-                    // If we are in export prompting mode, handle text input first.
+                    // While the overlay is open it captures all input, so this
+                    // runs before the per-`Screen` dispatch below.
                     if app.export_prompt.is_some() {
-                        match key.code {
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                break;
-                            }
-                            KeyCode::Esc => app.cancel_export(),
-                            // Only a successful write closes the overlay; a
-                            // failure leaves the typed path in place to edit.
-                            KeyCode::Enter => app.commit_export(),
-                            KeyCode::Backspace => app.export_input_pop(),
-                            KeyCode::Char(c) => app.export_input_push(c),
-                            _ => {}
+                        if handle_export_key(&mut app, key) == PromptKey::Quit {
+                            break;
                         }
                         dirty = true;
                         continue;
@@ -156,4 +185,84 @@ pub fn run(
 
     ratatui::restore();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::make_test_tls;
+    use ratatui::crossterm::event::KeyEvent;
+
+    fn app_with_prompt() -> App {
+        let mut app = App::new(&["example.com".to_string()]);
+        app.record(0, HostOutcome::Checked(Box::new(make_test_tls())));
+        app.begin_export();
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> PromptKey {
+        handle_export_key(app, KeyEvent::new(code, modifiers))
+    }
+
+    fn path(app: &App) -> String {
+        app.export_prompt.as_ref().unwrap().path.clone()
+    }
+
+    #[test]
+    fn test_prompt_ignores_modifier_chords() {
+        let mut app = app_with_prompt();
+        let before = path(&app);
+
+        // Ctrl/Alt chords must not fall through to the text-insert arm.
+        for code in ['d', 'a', 'e', 'k', 'n'] {
+            press(&mut app, KeyCode::Char(code), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char(code), KeyModifiers::ALT);
+        }
+        assert_eq!(path(&app), before, "chords must not type into the path");
+        assert!(
+            app.export_prompt.is_some(),
+            "and must not close the overlay"
+        );
+    }
+
+    #[test]
+    fn test_prompt_accepts_plain_and_shifted_characters() {
+        let mut app = app_with_prompt();
+        app.export_input_clear();
+
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        // Capitals arrive with SHIFT set, which must still be typed.
+        press(&mut app, KeyCode::Char('B'), KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Char('.'), KeyModifiers::NONE);
+        assert_eq!(path(&app), "aB.");
+
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(path(&app), "aB");
+    }
+
+    #[test]
+    fn test_prompt_control_keys() {
+        let mut app = app_with_prompt();
+
+        // Ctrl+C quits from inside the overlay.
+        assert_eq!(
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            PromptKey::Quit
+        );
+
+        // Ctrl+U clears, Ctrl+W drops a segment.
+        let mut app = app_with_prompt();
+        app.export_input_clear();
+        for c in "out/a.pem".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(path(&app), "out/");
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(path(&app), "");
+
+        // Esc cancels without writing.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.export_prompt.is_none());
+    }
 }

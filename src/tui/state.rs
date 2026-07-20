@@ -229,6 +229,33 @@ impl App {
         }
     }
 
+    /// Clears the export path (readline `Ctrl+U`).
+    pub fn export_input_clear(&mut self) {
+        if let Some(prompt) = &mut self.export_prompt {
+            prompt.path.clear();
+            prompt.error = None;
+        }
+    }
+
+    /// Deletes the trailing path segment (readline `Ctrl+W`).
+    ///
+    /// Breaks on `/` as well as whitespace, so it removes one directory
+    /// component at a time rather than the whole path.
+    pub fn export_input_delete_word(&mut self) {
+        if let Some(prompt) = &mut self.export_prompt {
+            let is_boundary = |c: char| c == '/' || c.is_whitespace();
+            // Drop any trailing boundary first, so a path ending in `/` loses
+            // the segment before it rather than just the separator.
+            while prompt.path.ends_with(is_boundary) {
+                prompt.path.pop();
+            }
+            while !prompt.path.is_empty() && !prompt.path.ends_with(is_boundary) {
+                prompt.path.pop();
+            }
+            prompt.error = None;
+        }
+    }
+
     /// Closes the export prompt without writing anything.
     pub fn cancel_export(&mut self) {
         self.export_prompt = None;
@@ -460,6 +487,34 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_export_input_line_editing() {
+        let mut app = App::new(&["example.com".to_string()]);
+        app.record(0, HostOutcome::Checked(Box::new(make_test_tls())));
+
+        // Ctrl+W removes one path segment at a time, not the whole path.
+        app.export_prompt = Some(ExportPrompt::new("out/certs/example.com.pem".to_string()));
+        app.export_input_delete_word();
+        assert_eq!(app.export_prompt.as_ref().unwrap().path, "out/certs/");
+        app.export_input_delete_word();
+        assert_eq!(app.export_prompt.as_ref().unwrap().path, "out/");
+        app.export_input_delete_word();
+        assert_eq!(app.export_prompt.as_ref().unwrap().path, "");
+        // Emptied is a fixed point, not a panic.
+        app.export_input_delete_word();
+        assert_eq!(app.export_prompt.as_ref().unwrap().path, "");
+
+        // Ctrl+U clears outright, and both clear a stale error.
+        app.export_prompt = Some(ExportPrompt {
+            path: "a/b.pem".to_string(),
+            error: Some("file already exists".to_string()),
+        });
+        app.export_input_clear();
+        let prompt = app.export_prompt.as_ref().unwrap();
+        assert_eq!(prompt.path, "");
+        assert!(prompt.error.is_none());
     }
 
     #[test]
