@@ -6,12 +6,14 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Gauge, LineGauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Clear, Gauge, LineGauge, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::Frame;
 
 use tlschecker::TLS;
 
-use super::state::{verdict, App, Screen, Verdict};
+use super::state::{verdict, App, ExportPrompt, FlashKind, Screen, Verdict};
 use crate::{warning_label, HostOutcome};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
@@ -38,6 +40,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Fleet => draw_fleet(frame, app),
         Screen::Detail => draw_explorer(frame, app),
     }
+
+    if let Some(prompt) = &app.export_prompt {
+        draw_export_prompt(frame, prompt);
+    }
 }
 
 /// Fleet overview: host list + compact detail pane.
@@ -56,8 +62,10 @@ fn draw_fleet(frame: &mut Frame, app: &App) {
     draw_host_list(frame, app, left);
     draw_detail(frame, app, right);
 
-    frame.render_widget(
-        Line::from(" j/k move · ⏎ explore · g/G first/last · q quit").style(DIM),
+    draw_footer(
+        frame,
+        app,
+        " j/k move · ⏎ explore · e export · g/G first/last · q quit",
         footer,
     );
 }
@@ -608,10 +616,75 @@ fn draw_explorer(frame: &mut Frame, app: &App) {
         main,
     );
 
-    frame.render_widget(
-        Line::from(" j/k scroll · g/G top/bottom · esc back · q quit").style(DIM),
+    draw_footer(
+        frame,
+        app,
+        " j/k scroll · g/G top/bottom · e export · esc back · q quit",
         footer,
     );
+}
+
+fn draw_footer(frame: &mut Frame, app: &App, base: &'static str, area: Rect) {
+    if let Some(flash) = &app.flash {
+        let color = match flash.kind {
+            FlashKind::Success => Color::Green,
+            FlashKind::Error => Color::Red,
+        };
+        frame.render_widget(
+            Line::from(format!(" {} ", flash.text))
+                .style(Style::new().fg(color).add_modifier(Modifier::BOLD)),
+            area,
+        );
+    } else {
+        frame.render_widget(Line::from(base).style(DIM), area);
+    }
+}
+
+fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::vertical([
+        Constraint::Length(r.height.saturating_sub(height) / 2),
+        Constraint::Length(height),
+        Constraint::Min(0),
+    ])
+    .split(r);
+
+    Layout::horizontal([
+        Constraint::Length(r.width.saturating_sub(width) / 2),
+        Constraint::Length(width),
+        Constraint::Min(0),
+    ])
+    .split(popup_layout[1])[1]
+}
+
+fn draw_export_prompt(frame: &mut Frame, prompt: &ExportPrompt) {
+    // Grow by a line for the error, so the failure is attached to the input it
+    // refers to instead of sitting in the footer rows away.
+    let height = if prompt.error.is_some() { 4 } else { 3 };
+    let area = centered_rect(60, height, frame.area());
+    frame.render_widget(Clear, area);
+    let border = if prompt.error.is_some() {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
+    let block = Block::bordered()
+        .title(" Export Certificate ")
+        .border_style(Style::new().fg(border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![Line::from(vec![
+        Span::raw(" Path: "),
+        Span::styled(prompt.path.as_str(), Style::new().fg(Color::Yellow)),
+        Span::styled("█", Style::new().fg(Color::Cyan)),
+    ])];
+    if let Some(error) = &prompt.error {
+        lines.push(Line::from(Span::styled(
+            format!(" {} — edit and retry, Esc cancels", error),
+            Style::new().fg(Color::Red),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn score_color(score: u8) -> Color {
@@ -626,6 +699,7 @@ fn score_color(score: u8) -> Color {
 mod tests {
     use super::*;
     use crate::tests::make_test_tls;
+    use crate::tui::state::Flash;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -642,6 +716,20 @@ mod tests {
     /// Renders the app at the default test size.
     fn render(app: &App) -> String {
         render_sized(app, 110, 32)
+    }
+
+    /// Foreground color of the footer (the frame's last row), which is what
+    /// distinguishes a success flash from an error one.
+    fn footer_fg(app: &App) -> Color {
+        let backend = TestBackend::new(110, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..110)
+            .filter_map(|x| buffer.cell((x, 31)))
+            .find(|cell| cell.symbol() != " ")
+            .expect("footer row should have content")
+            .fg
     }
 
     fn app_with(outcomes: Vec<(usize, HostOutcome)>, labels: &[&str]) -> App {
@@ -825,5 +913,98 @@ mod tests {
         let content = render(&app);
         assert!(content.contains("HOSTNAME MISMATCH"));
         assert!(content.contains("1 warning"));
+    }
+
+    #[test]
+    fn test_export_prompt_renders_path_and_error() {
+        let mut app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(make_test_tls())))],
+            &["example.com"],
+        );
+
+        app.begin_export();
+        let clean = render(&app);
+        assert!(clean.contains("Export Certificate"));
+        assert!(clean.contains("example.com.pem"));
+        assert!(!clean.contains("edit and retry"));
+
+        // A failed attempt shows the reason inside the popup, next to the path
+        // it refers to — not in the footer.
+        app.export_prompt.as_mut().unwrap().error = Some("file already exists".to_string());
+        let failed = render(&app);
+        assert!(failed.contains("file already exists"));
+        assert!(failed.contains("edit and retry"));
+        // The path the user typed is still there to edit.
+        assert!(failed.contains("example.com.pem"));
+    }
+
+    #[test]
+    fn test_footer_shows_key_hints_without_a_flash() {
+        let app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(make_test_tls())))],
+            &["example.com"],
+        );
+        assert!(render(&app).contains("e export"));
+    }
+
+    #[test]
+    fn test_footer_flash_replaces_hints_on_both_screens() {
+        // Drive the real path: `e` on a failed host reports why instead of
+        // doing nothing. The state test covers `App.flash`; this covers the
+        // message actually reaching the footer.
+        let mut app = app_with(
+            vec![(
+                0,
+                HostOutcome::Failed {
+                    kind: "DNS",
+                    detail: "no such host".to_string(),
+                },
+            )],
+            &["broken.example"],
+        );
+
+        app.begin_export();
+        let fleet = render(&app);
+        assert!(fleet.contains("Nothing to export"));
+        assert!(!fleet.contains("e export"), "flash must replace the hints");
+
+        // The explorer has its own footer, so it needs its own assertion.
+        app.open_detail();
+        app.begin_export();
+        let detail = render(&app);
+        assert!(detail.contains("Nothing to export"));
+        assert!(!detail.contains("e export"));
+    }
+
+    #[test]
+    fn test_footer_flash_renders_success_and_error() {
+        let mut app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(make_test_tls())))],
+            &["example.com"],
+        );
+
+        app.flash = Some(Flash {
+            text: "Exported to example.com.pem".to_string(),
+            kind: FlashKind::Success,
+        });
+        assert!(render(&app).contains("Exported to example.com.pem"));
+        assert_eq!(footer_fg(&app), Color::Green);
+
+        // The color must follow `kind`, not the wording — this is the whole
+        // reason the kind is carried explicitly rather than sniffed from the
+        // text, so assert it rather than just the message.
+        app.flash = Some(Flash {
+            text: "Failed to export: denied".to_string(),
+            kind: FlashKind::Error,
+        });
+        assert!(render(&app).contains("Failed to export: denied"));
+        assert_eq!(footer_fg(&app), Color::Red);
+
+        // Same text, opposite kind: only the color may change.
+        app.flash = Some(Flash {
+            text: "Failed to export: denied".to_string(),
+            kind: FlashKind::Success,
+        });
+        assert_eq!(footer_fg(&app), Color::Green);
     }
 }
