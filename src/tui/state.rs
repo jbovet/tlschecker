@@ -272,7 +272,10 @@ mod tests {
     fn test_default_export_filename_sanitizes_unsafe_chars() {
         // IPv6 colons and wildcards would be illegal or awkward in a filename.
         assert_eq!(default_export_filename("[::1]:443"), "__1.pem");
-        assert_eq!(default_export_filename("*.example.com"), "_.example.com.pem");
+        assert_eq!(
+            default_export_filename("*.example.com"),
+            "_.example.com.pem"
+        );
         assert_eq!(default_export_filename(""), "certificate.pem");
     }
 
@@ -294,7 +297,11 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "-----BEGIN CERTIFICATE-----\n"
         );
-        assert!(app.flash_message.as_ref().unwrap().starts_with("Exported to"));
+        assert!(app
+            .flash_message
+            .as_ref()
+            .unwrap()
+            .starts_with("Exported to"));
 
         // A second export to the same path must report, not clobber.
         app.export_prompt = Some(path.to_string_lossy().into_owned());
