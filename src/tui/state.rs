@@ -1,6 +1,8 @@
 //! Dashboard application state: the host list, selection, and the verdict
 //! logic that colors it.
 
+use std::io::{ErrorKind, Write};
+
 use tlschecker::{RevocationStatus, TLS};
 
 use crate::HostOutcome;
@@ -38,6 +40,44 @@ pub fn verdict(tls: &TLS) -> Verdict {
     }
 }
 
+/// Builds the filename the export prompt is prefilled with.
+///
+/// Host labels are whatever the user typed on the command line, which
+/// `parse_host_port` accepts in three shapes — `host`, `host:port`, and
+/// `https://host:port` — so the label is parsed down to the bare hostname
+/// first. Using it raw would produce `https://example.com.pem` (a path under a
+/// nonexistent `https:` directory) or `example.com:443.pem` (illegal on
+/// Windows). Whatever survives parsing is then reduced to characters that are
+/// safe in a filename, which also flattens IPv6 colons and wildcard SAN names.
+fn default_export_filename(label: &str) -> String {
+    let host = crate::parse_host_port(label)
+        .map(|hp| hp.host)
+        .unwrap_or_else(|_| label.to_string());
+
+    // `parse_host_port` keeps the brackets on an IPv6 literal when it resolves
+    // through `Url::parse` (it only strips them on its fallback path).
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+
+    let stem: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    // A stem of only separators (or nothing at all) would yield a dotfile or a
+    // bare ".pem"; fall back to a neutral name instead.
+    if stem.chars().all(|c| matches!(c, '.' | '-' | '_')) {
+        "certificate.pem".to_string()
+    } else {
+        format!("{}.pem", stem)
+    }
+}
+
 /// Which screen the dashboard is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -59,6 +99,61 @@ pub struct App {
     pub screen: Screen,
     /// Scroll offset (in lines) of the full-screen detail explorer.
     pub detail_scroll: usize,
+    /// Export overlay state. When `Some`, the user is typing a filename and the
+    /// overlay captures all input.
+    pub export_prompt: Option<ExportPrompt>,
+    /// Transient footer message reporting the last export attempt, replacing
+    /// the key hints until the next keypress.
+    pub flash: Option<Flash>,
+}
+
+/// The export overlay: the path being typed, plus why the last attempt failed.
+///
+/// The error lives here rather than in [`Flash`] so it renders inside the
+/// popup the user is looking at, and so editing the path can clear it — a
+/// footer message naming a path the input box no longer holds is worse than
+/// no message.
+pub struct ExportPrompt {
+    pub path: String,
+    pub error: Option<String>,
+}
+
+impl ExportPrompt {
+    fn new(path: String) -> Self {
+        ExportPrompt { path, error: None }
+    }
+}
+
+/// Whether a [`Flash`] reports success or failure, which drives its color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashKind {
+    Success,
+    Error,
+}
+
+/// A transient footer message (e.g. "Exported to example.com.pem").
+///
+/// The kind is carried explicitly rather than inferred from the text, so
+/// rewording a message cannot silently flip an error from red to green.
+pub struct Flash {
+    pub text: String,
+    pub kind: FlashKind,
+}
+
+impl Flash {
+    fn success(text: impl Into<String>) -> Self {
+        Flash {
+            text: text.into(),
+            kind: FlashKind::Success,
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Flash {
+            text: text.into(),
+            kind: FlashKind::Error,
+        }
+    }
 }
 
 /// Tally of hosts per state, shown under the host list.
@@ -79,6 +174,8 @@ impl App {
             selected: 0,
             screen: Screen::Fleet,
             detail_scroll: 0,
+            export_prompt: None,
+            flash: None,
         }
     }
 
@@ -92,6 +189,128 @@ impl App {
     pub fn close_detail(&mut self) {
         self.screen = Screen::Fleet;
         self.detail_scroll = 0;
+    }
+
+    /// Opens the export prompt for the selected host, prefilled with a
+    /// filename derived from its address.
+    ///
+    /// Only a completed check has a chain to write, so a pending or failed
+    /// host reports why in the flash line rather than leaving `e` looking like
+    /// a dead key.
+    pub fn begin_export(&mut self) {
+        match self.slots.get(self.selected) {
+            Some(Some(HostOutcome::Checked(_))) => {
+                let label = self.labels.get(self.selected).cloned().unwrap_or_default();
+                self.export_prompt = Some(ExportPrompt::new(default_export_filename(&label)));
+            }
+            Some(Some(HostOutcome::Failed { .. })) => {
+                self.flash = Some(Flash::error("Nothing to export: host check failed"));
+            }
+            _ => {
+                self.flash = Some(Flash::error("Nothing to export: check still running"));
+            }
+        }
+    }
+
+    /// Appends a typed character to the export path.
+    pub fn export_input_push(&mut self, c: char) {
+        if let Some(prompt) = &mut self.export_prompt {
+            prompt.path.push(c);
+            // The error described the path as it was; editing invalidates it.
+            prompt.error = None;
+        }
+    }
+
+    /// Deletes the last character of the export path.
+    pub fn export_input_pop(&mut self) {
+        if let Some(prompt) = &mut self.export_prompt {
+            prompt.path.pop();
+            prompt.error = None;
+        }
+    }
+
+    /// Clears the export path (readline `Ctrl+U`).
+    pub fn export_input_clear(&mut self) {
+        if let Some(prompt) = &mut self.export_prompt {
+            prompt.path.clear();
+            prompt.error = None;
+        }
+    }
+
+    /// Deletes the trailing path segment (readline `Ctrl+W`).
+    ///
+    /// Breaks on `/` as well as whitespace, so it removes one directory
+    /// component at a time rather than the whole path.
+    pub fn export_input_delete_word(&mut self) {
+        if let Some(prompt) = &mut self.export_prompt {
+            let is_boundary = |c: char| c == '/' || c.is_whitespace();
+            // Drop any trailing boundary first, so a path ending in `/` loses
+            // the segment before it rather than just the separator.
+            while prompt.path.ends_with(is_boundary) {
+                prompt.path.pop();
+            }
+            while !prompt.path.is_empty() && !prompt.path.ends_with(is_boundary) {
+                prompt.path.pop();
+            }
+            prompt.error = None;
+        }
+    }
+
+    /// Closes the export prompt without writing anything.
+    pub fn cancel_export(&mut self) {
+        self.export_prompt = None;
+    }
+
+    /// Writes the selected host's PEM chain to the typed path.
+    ///
+    /// The file is created with `create_new`, so an existing file is reported
+    /// rather than overwritten: the prompt is prefilled, which makes `e`⏎ two
+    /// keystrokes away from clobbering whatever is already there.
+    ///
+    /// A write failure is recoverable — most often the name is simply taken —
+    /// so the prompt stays open with the reason attached and the typed path
+    /// intact, and only a successful write closes it. `Esc` still cancels.
+    pub fn commit_export(&mut self) {
+        let Some(prompt) = &self.export_prompt else {
+            return;
+        };
+        let path = prompt.path.clone();
+
+        let Some(Some(HostOutcome::Checked(tls))) = self.slots.get(self.selected) else {
+            // Unreachable while `begin_export` guards on `Checked`, but closing
+            // the overlay with no explanation would repeat the silent no-op
+            // this screen already had once.
+            self.export_prompt = None;
+            self.flash = Some(Flash::error("Nothing to export: no certificate"));
+            return;
+        };
+
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(tls.certificate.pem.as_bytes()));
+
+        match written {
+            Ok(()) => {
+                self.export_prompt = None;
+                self.flash = Some(Flash::success(format!("Exported to {}", path)));
+            }
+            Err(e) => {
+                let reason = if e.kind() == ErrorKind::AlreadyExists {
+                    "file already exists".to_string()
+                } else {
+                    e.to_string()
+                };
+                if let Some(prompt) = &mut self.export_prompt {
+                    prompt.error = Some(reason);
+                }
+            }
+        }
+    }
+
+    pub fn clear_flash(&mut self) {
+        self.flash = None;
     }
 
     /// Scrolls the explorer down, clamped to `max` (the last valid offset).
@@ -164,6 +383,189 @@ impl App {
 mod tests {
     use super::*;
     use crate::tests::make_test_tls;
+
+    #[test]
+    fn test_default_export_filename_strips_scheme_and_port() {
+        // All three address shapes `parse_host_port` accepts must collapse to
+        // the same plain, writable filename.
+        assert_eq!(default_export_filename("example.com"), "example.com.pem");
+        assert_eq!(
+            default_export_filename("example.com:443"),
+            "example.com.pem"
+        );
+        assert_eq!(
+            default_export_filename("https://example.com:8443"),
+            "example.com.pem"
+        );
+    }
+
+    #[test]
+    fn test_default_export_filename_sanitizes_unsafe_chars() {
+        // IPv6 colons and wildcards would be illegal or awkward in a filename.
+        assert_eq!(default_export_filename("[::1]:443"), "__1.pem");
+        assert_eq!(
+            default_export_filename("*.example.com"),
+            "_.example.com.pem"
+        );
+        assert_eq!(default_export_filename(""), "certificate.pem");
+    }
+
+    #[test]
+    fn test_commit_export_writes_pem_and_refuses_overwrite() {
+        let dir = std::env::temp_dir().join("tlschecker_export_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.pem");
+
+        let mut tls = make_test_tls();
+        tls.certificate.pem = "-----BEGIN CERTIFICATE-----\n".to_string();
+        let mut app = App::new(&["example.com".to_string()]);
+        app.record(0, HostOutcome::Checked(Box::new(tls)));
+
+        app.export_prompt = Some(ExportPrompt::new(path.to_string_lossy().into_owned()));
+        app.commit_export();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "-----BEGIN CERTIFICATE-----\n"
+        );
+        // Success closes the overlay and reports in the footer.
+        assert!(app.export_prompt.is_none());
+        let flash = app.flash.as_ref().unwrap();
+        assert_eq!(flash.kind, FlashKind::Success);
+        assert!(flash.text.starts_with("Exported to"));
+
+        // A second export to the same path must report, not clobber.
+        app.export_prompt = Some(ExportPrompt::new(path.to_string_lossy().into_owned()));
+        app.commit_export();
+        let prompt = app.export_prompt.as_ref().expect("stays open to retry");
+        assert_eq!(prompt.error.as_deref(), Some("file already exists"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_failed_export_keeps_prompt_open_for_retry() {
+        let dir = std::env::temp_dir().join("tlschecker_export_retry_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let taken = dir.join("taken.pem");
+        std::fs::write(&taken, "occupied").unwrap();
+
+        let mut tls = make_test_tls();
+        tls.certificate.pem = "PEM".to_string();
+        let mut app = App::new(&["example.com".to_string()]);
+        app.record(0, HostOutcome::Checked(Box::new(tls)));
+
+        // Collide with the existing file.
+        app.export_prompt = Some(ExportPrompt::new(taken.to_string_lossy().into_owned()));
+        app.commit_export();
+        let prompt = app.export_prompt.as_ref().expect("prompt survives failure");
+        assert_eq!(prompt.error.as_deref(), Some("file already exists"));
+        // The typed path is preserved, not discarded.
+        assert_eq!(prompt.path, taken.to_string_lossy());
+        assert!(
+            app.flash.is_none(),
+            "error belongs to the prompt, not the footer"
+        );
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "occupied");
+
+        // Editing the path clears the now-stale error.
+        app.export_input_push('2');
+        assert!(app.export_prompt.as_ref().unwrap().error.is_none());
+        app.export_input_pop();
+        assert!(app.export_prompt.as_ref().unwrap().error.is_none());
+
+        // Retrying with a free name succeeds and closes the overlay.
+        app.export_input_pop(); // "…taken.pe"
+        app.export_input_push('x'); // "…taken.pex"
+        app.commit_export();
+        assert!(app.export_prompt.is_none());
+        assert_eq!(app.flash.as_ref().unwrap().kind, FlashKind::Success);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("taken.pex")).unwrap(),
+            "PEM"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_export_input_line_editing() {
+        let mut app = App::new(&["example.com".to_string()]);
+        app.record(0, HostOutcome::Checked(Box::new(make_test_tls())));
+
+        // Ctrl+W removes one path segment at a time, not the whole path.
+        app.export_prompt = Some(ExportPrompt::new("out/certs/example.com.pem".to_string()));
+        app.export_input_delete_word();
+        assert_eq!(app.export_prompt.as_ref().unwrap().path, "out/certs/");
+        app.export_input_delete_word();
+        assert_eq!(app.export_prompt.as_ref().unwrap().path, "out/");
+        app.export_input_delete_word();
+        assert_eq!(app.export_prompt.as_ref().unwrap().path, "");
+        // Emptied is a fixed point, not a panic.
+        app.export_input_delete_word();
+        assert_eq!(app.export_prompt.as_ref().unwrap().path, "");
+
+        // Ctrl+U clears outright, and both clear a stale error.
+        app.export_prompt = Some(ExportPrompt {
+            path: "a/b.pem".to_string(),
+            error: Some("file already exists".to_string()),
+        });
+        app.export_input_clear();
+        let prompt = app.export_prompt.as_ref().unwrap();
+        assert_eq!(prompt.path, "");
+        assert!(prompt.error.is_none());
+    }
+
+    #[test]
+    fn test_cancel_export_discards_the_prompt() {
+        let mut app = App::new(&["example.com".to_string()]);
+        app.record(0, HostOutcome::Checked(Box::new(make_test_tls())));
+        app.begin_export();
+        assert!(app.export_prompt.is_some());
+        app.cancel_export();
+        assert!(app.export_prompt.is_none());
+        assert!(app.flash.is_none());
+    }
+
+    #[test]
+    fn test_begin_export_reports_unexportable_hosts() {
+        let labels = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut app = App::new(&labels);
+        app.record(0, HostOutcome::Checked(Box::new(make_test_tls())));
+        app.record(
+            1,
+            HostOutcome::Failed {
+                kind: "DNS",
+                detail: "no such host".to_string(),
+            },
+        );
+        // Slot 2 is left pending.
+
+        // A checked host opens the prompt and says nothing.
+        app.selected = 0;
+        app.begin_export();
+        assert_eq!(
+            app.export_prompt.as_ref().map(|p| p.path.as_str()),
+            Some("a.pem")
+        );
+        assert!(app.flash.is_none());
+
+        // A failed host explains itself instead of doing nothing.
+        app.export_prompt = None;
+        app.selected = 1;
+        app.begin_export();
+        assert!(app.export_prompt.is_none());
+        let flash = app.flash.as_ref().unwrap();
+        assert_eq!(flash.kind, FlashKind::Error);
+        assert!(flash.text.contains("check failed"));
+
+        // So does a host that has not finished yet.
+        app.selected = 2;
+        app.begin_export();
+        assert!(app.export_prompt.is_none());
+        assert!(app.flash.as_ref().unwrap().text.contains("still running"));
+    }
 
     #[test]
     fn test_verdict_healthy() {

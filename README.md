@@ -74,6 +74,15 @@ presented chain, embedded SCTs, the grade breakdown with reasons, and scan
 results when `--scan` was used. Scroll with `j`/`k` or `PgUp`/`PgDn`, and
 return with `Esc`.
 
+Press `e` on either screen to export the selected host's certificate chain as
+PEM. The prompt is prefilled with a filename derived from the host (so
+`https://example.com:8443` becomes `example.com.pem`); edit it as you like and
+press `Enter` to write, or `Esc` to cancel (`Ctrl+U` clears the field, `Ctrl+W`
+drops a path segment). An existing file is never
+overwritten: the prompt stays open with the reason shown beneath the path, so
+you can adjust the name and retry without retyping it. This is the interactive
+equivalent of `--export-pem`.
+
 The TUI requires an attached terminal. In Docker, that means using `-it` so the
 container gets a pseudo-TTY and stdin. Without that, Docker will fall back to
 the classic text output. The classic text outputs are also used automatically
