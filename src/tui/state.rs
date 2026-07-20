@@ -101,8 +101,41 @@ pub struct App {
     pub detail_scroll: usize,
     /// Optional state for the export prompt overlay. When `Some`, the user is typing a filename.
     pub export_prompt: Option<String>,
-    /// Optional flash message to display success or error (e.g. "Exported to example.pem").
-    pub flash_message: Option<String>,
+    /// Transient footer message reporting the last export attempt, replacing
+    /// the key hints until the next keypress.
+    pub flash: Option<Flash>,
+}
+
+/// Whether a [`Flash`] reports success or failure, which drives its color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashKind {
+    Success,
+    Error,
+}
+
+/// A transient footer message (e.g. "Exported to example.com.pem").
+///
+/// The kind is carried explicitly rather than inferred from the text, so
+/// rewording a message cannot silently flip an error from red to green.
+pub struct Flash {
+    pub text: String,
+    pub kind: FlashKind,
+}
+
+impl Flash {
+    fn success(text: impl Into<String>) -> Self {
+        Flash {
+            text: text.into(),
+            kind: FlashKind::Success,
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Flash {
+            text: text.into(),
+            kind: FlashKind::Error,
+        }
+    }
 }
 
 /// Tally of hosts per state, shown under the host list.
@@ -124,7 +157,7 @@ impl App {
             screen: Screen::Fleet,
             detail_scroll: 0,
             export_prompt: None,
-            flash_message: None,
+            flash: None,
         }
     }
 
@@ -142,10 +175,22 @@ impl App {
 
     /// Opens the export prompt for the selected host, prefilled with a
     /// filename derived from its address.
+    ///
+    /// Only a completed check has a chain to write, so a pending or failed
+    /// host reports why in the flash line rather than leaving `e` looking like
+    /// a dead key.
     pub fn begin_export(&mut self) {
-        if let Some(Some(HostOutcome::Checked(_))) = self.slots.get(self.selected) {
-            let label = self.labels.get(self.selected).cloned().unwrap_or_default();
-            self.export_prompt = Some(default_export_filename(&label));
+        match self.slots.get(self.selected) {
+            Some(Some(HostOutcome::Checked(_))) => {
+                let label = self.labels.get(self.selected).cloned().unwrap_or_default();
+                self.export_prompt = Some(default_export_filename(&label));
+            }
+            Some(Some(HostOutcome::Failed { .. })) => {
+                self.flash = Some(Flash::error("Nothing to export: host check failed"));
+            }
+            _ => {
+                self.flash = Some(Flash::error("Nothing to export: check still running"));
+            }
         }
     }
 
@@ -169,17 +214,17 @@ impl App {
             .open(&path)
             .and_then(|mut file| file.write_all(tls.certificate.pem.as_bytes()));
 
-        self.flash_message = Some(match written {
-            Ok(()) => format!("Exported to {}", path),
+        self.flash = Some(match written {
+            Ok(()) => Flash::success(format!("Exported to {}", path)),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                format!("Failed to export: {} already exists", path)
+                Flash::error(format!("Failed to export: {} already exists", path))
             }
-            Err(e) => format!("Failed to export: {}", e),
+            Err(e) => Flash::error(format!("Failed to export: {}", e)),
         });
     }
 
     pub fn clear_flash(&mut self) {
-        self.flash_message = None;
+        self.flash = None;
     }
 
     /// Scrolls the explorer down, clamped to `max` (the last valid offset).
@@ -297,18 +342,54 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "-----BEGIN CERTIFICATE-----\n"
         );
-        assert!(app
-            .flash_message
-            .as_ref()
-            .unwrap()
-            .starts_with("Exported to"));
+        let flash = app.flash.as_ref().unwrap();
+        assert_eq!(flash.kind, FlashKind::Success);
+        assert!(flash.text.starts_with("Exported to"));
 
         // A second export to the same path must report, not clobber.
         app.export_prompt = Some(path.to_string_lossy().into_owned());
         app.commit_export();
-        assert!(app.flash_message.unwrap().contains("already exists"));
+        let flash = app.flash.as_ref().unwrap();
+        assert_eq!(flash.kind, FlashKind::Error);
+        assert!(flash.text.contains("already exists"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_begin_export_reports_unexportable_hosts() {
+        let labels = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut app = App::new(&labels);
+        app.record(0, HostOutcome::Checked(Box::new(make_test_tls())));
+        app.record(
+            1,
+            HostOutcome::Failed {
+                kind: "DNS",
+                detail: "no such host".to_string(),
+            },
+        );
+        // Slot 2 is left pending.
+
+        // A checked host opens the prompt and says nothing.
+        app.selected = 0;
+        app.begin_export();
+        assert_eq!(app.export_prompt.as_deref(), Some("a.pem"));
+        assert!(app.flash.is_none());
+
+        // A failed host explains itself instead of doing nothing.
+        app.export_prompt = None;
+        app.selected = 1;
+        app.begin_export();
+        assert!(app.export_prompt.is_none());
+        let flash = app.flash.as_ref().unwrap();
+        assert_eq!(flash.kind, FlashKind::Error);
+        assert!(flash.text.contains("check failed"));
+
+        // So does a host that has not finished yet.
+        app.selected = 2;
+        app.begin_export();
+        assert!(app.export_prompt.is_none());
+        assert!(app.flash.as_ref().unwrap().text.contains("still running"));
     }
 
     #[test]

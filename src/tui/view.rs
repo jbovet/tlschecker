@@ -13,7 +13,7 @@ use ratatui::Frame;
 
 use tlschecker::TLS;
 
-use super::state::{verdict, App, Screen, Verdict};
+use super::state::{verdict, App, FlashKind, Screen, Verdict};
 use crate::{warning_label, HostOutcome};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
@@ -609,14 +609,13 @@ fn draw_explorer(frame: &mut Frame, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, base: &'static str, area: Rect) {
-    if let Some(msg) = &app.flash_message {
-        let color = if msg.starts_with("Failed") {
-            Color::Red
-        } else {
-            Color::Green
+    if let Some(flash) = &app.flash {
+        let color = match flash.kind {
+            FlashKind::Success => Color::Green,
+            FlashKind::Error => Color::Red,
         };
         frame.render_widget(
-            Line::from(format!(" {} ", msg))
+            Line::from(format!(" {} ", flash.text))
                 .style(Style::new().fg(color).add_modifier(Modifier::BOLD)),
             area,
         );

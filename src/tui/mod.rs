@@ -109,7 +109,7 @@ pub fn run(
                     // the fallthrough arm below cancels the redraw for unhandled
                     // keys, which would otherwise leave the cleared message on
                     // screen until the next key that does redraw.
-                    let had_flash = app.flash_message.is_some();
+                    let had_flash = app.flash.is_some();
                     if had_flash {
                         app.clear_flash();
                     }
