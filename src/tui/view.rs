@@ -669,6 +669,7 @@ fn score_color(score: u8) -> Color {
 mod tests {
     use super::*;
     use crate::tests::make_test_tls;
+    use crate::tui::state::Flash;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -685,6 +686,20 @@ mod tests {
     /// Renders the app at the default test size.
     fn render(app: &App) -> String {
         render_sized(app, 110, 32)
+    }
+
+    /// Foreground color of the footer (the frame's last row), which is what
+    /// distinguishes a success flash from an error one.
+    fn footer_fg(app: &App) -> Color {
+        let backend = TestBackend::new(110, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..110)
+            .filter_map(|x| buffer.cell((x, 31)))
+            .find(|cell| cell.symbol() != " ")
+            .expect("footer row should have content")
+            .fg
     }
 
     fn app_with(outcomes: Vec<(usize, HostOutcome)>, labels: &[&str]) -> App {
@@ -864,5 +879,75 @@ mod tests {
         let content = render(&app);
         assert!(content.contains("HOSTNAME MISMATCH"));
         assert!(content.contains("1 warning"));
+    }
+
+    #[test]
+    fn test_footer_shows_key_hints_without_a_flash() {
+        let app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(make_test_tls())))],
+            &["example.com"],
+        );
+        assert!(render(&app).contains("e export"));
+    }
+
+    #[test]
+    fn test_footer_flash_replaces_hints_on_both_screens() {
+        // Drive the real path: `e` on a failed host reports why instead of
+        // doing nothing. The state test covers `App.flash`; this covers the
+        // message actually reaching the footer.
+        let mut app = app_with(
+            vec![(
+                0,
+                HostOutcome::Failed {
+                    kind: "DNS",
+                    detail: "no such host".to_string(),
+                },
+            )],
+            &["broken.example"],
+        );
+
+        app.begin_export();
+        let fleet = render(&app);
+        assert!(fleet.contains("Nothing to export"));
+        assert!(!fleet.contains("e export"), "flash must replace the hints");
+
+        // The explorer has its own footer, so it needs its own assertion.
+        app.open_detail();
+        app.begin_export();
+        let detail = render(&app);
+        assert!(detail.contains("Nothing to export"));
+        assert!(!detail.contains("e export"));
+    }
+
+    #[test]
+    fn test_footer_flash_renders_success_and_error() {
+        let mut app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(make_test_tls())))],
+            &["example.com"],
+        );
+
+        app.flash = Some(Flash {
+            text: "Exported to example.com.pem".to_string(),
+            kind: FlashKind::Success,
+        });
+        assert!(render(&app).contains("Exported to example.com.pem"));
+        assert_eq!(footer_fg(&app), Color::Green);
+
+        // The color must follow `kind`, not the wording — this is the whole
+        // reason the kind is carried explicitly rather than sniffed from the
+        // text, so assert it rather than just the message.
+        app.flash = Some(Flash {
+            text: "Failed to export: denied".to_string(),
+            kind: FlashKind::Error,
+        });
+        assert!(render(&app).contains("Failed to export: denied"));
+        assert_eq!(footer_fg(&app), Color::Red);
+
+        // Same text, opposite kind: only the color may change.
+        app.flash = Some(Flash {
+            text: "Failed to export: denied".to_string(),
+            kind: FlashKind::Success,
+        });
+        assert_eq!(footer_fg(&app), Color::Green);
     }
 }
