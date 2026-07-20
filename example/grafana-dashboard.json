@@ -54,7 +54,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "expr": "count(tlschecker_below_min_validity{job=\"tlschecker\"} == 1) or vector(0)", "instant": true }
+        { "refId": "A", "expr": "count((tlschecker_below_min_validity{job=\"tlschecker\"} == 1) and on(instance) tlschecker_certificate_info{job=\"tlschecker\", issuer=~\"$issuer\"}) or vector(0)", "instant": true }
       ],
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 } ] } } }
@@ -66,7 +66,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "expr": "count(tlschecker_days_before_expired{job=\"tlschecker\"} <= 15 and tlschecker_days_before_expired{job=\"tlschecker\"} > 0) or vector(0)", "instant": true }
+        { "refId": "A", "expr": "count((tlschecker_days_before_expired{job=\"tlschecker\"} <= 15 and tlschecker_days_before_expired{job=\"tlschecker\"} > 0) and on(instance) tlschecker_certificate_info{job=\"tlschecker\", issuer=~\"$issuer\"}) or vector(0)", "instant": true }
       ],
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } } }
@@ -78,7 +78,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "expr": "count(tlschecker_days_before_expired{job=\"tlschecker\"} <= 0) or vector(0)", "instant": true }
+        { "refId": "A", "expr": "count((tlschecker_days_before_expired{job=\"tlschecker\"} <= 0) and on(instance) tlschecker_certificate_info{job=\"tlschecker\", issuer=~\"$issuer\"}) or vector(0)", "instant": true }
       ],
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } }
@@ -90,7 +90,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "expr": "count(tlschecker_revocation_status{job=\"tlschecker\"} == 3) or vector(0)", "instant": true }
+        { "refId": "A", "expr": "count((tlschecker_revocation_status{job=\"tlschecker\"} == 3) and on(instance) tlschecker_certificate_info{job=\"tlschecker\", issuer=~\"$issuer\"}) or vector(0)", "instant": true }
       ],
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } }
@@ -99,7 +99,7 @@
       "id": 6,
       "type": "stat",
       "title": "Stale checks",
-      "description": "Hosts whose last successful push to the Pushgateway is older than 36h (tune to ~2x your CronJob interval). A non-zero value means the checker itself may be broken — the other tiles could be showing stale data. Uses the Pushgateway's push_time_seconds, which only advances on a real push.",
+      "description": "Hosts whose last successful push to the Pushgateway is older than 36h (tune to ~2x your CronJob interval). A non-zero value means the checker itself may be broken — the other tiles could be showing stale data. Uses the Pushgateway's push_time_seconds, which only advances on a real push. Intentionally NOT filtered by the Issuer variable: a stale or never-reporting host may have no tlschecker_certificate_info series to match, so scoping it by issuer could hide the very failure this tile exists to catch.",
       "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
