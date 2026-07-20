@@ -1,0 +1,110 @@
+# Prometheus alerting rules for tlschecker metrics (pushed via a Pushgateway).
+#
+# Delivered as a Prometheus Operator PrometheusRule CR. For a plain Prometheus,
+# lift the `spec.groups:` block into a rule_files file instead.
+#
+# IMPORTANT — rule selection:
+#   The kube-prometheus-stack Prometheus only picks up PrometheusRules that match
+#   its ruleSelector. Either (a) label this CR to match — commonly
+#   `release: <your-helm-release>` (e.g. release: kps) — or (b) install the stack
+#   with `prometheus.prometheusSpec.ruleSelectorNilUsesHelmValues=false` so it
+#   selects all rules regardless of label (what the demo values use).
+#
+# Thresholds assume a DAILY CronJob. Retune `for:` windows and the staleness
+# bound (36h below) to ~2x your actual check interval.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: tlschecker-rules
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: tlschecker
+    # release: kps   # uncomment/adjust to match your Prometheus ruleSelector
+spec:
+  groups:
+    # ── Certificate health ────────────────────────────────────────────────
+    - name: tlschecker.certificates
+      rules:
+        - alert: TLSCertExpired
+          expr: tlschecker_days_before_expired{job="tlschecker"} <= 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "TLS certificate for {{ $labels.instance }} has EXPIRED"
+            description: "{{ $labels.instance }} (issuer {{ $labels.issuer }}) presented an expired certificate ({{ $value }} days past expiry)."
+
+        - alert: TLSCertExpiringSoon
+          expr: tlschecker_days_before_expired{job="tlschecker"} > 0 and tlschecker_days_before_expired{job="tlschecker"} <= 15
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "TLS certificate for {{ $labels.instance }} expires in {{ $value }} days"
+            description: "{{ $labels.instance }} certificate expires within 15 days. Renew before it lapses."
+
+        - alert: TLSCertBelowMinValidity
+          expr: tlschecker_below_min_validity{job="tlschecker"} == 1
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "TLS certificate for {{ $labels.instance }} is below the configured min-validity SLO"
+            description: "{{ $labels.instance }} is under the operator-configured --min-validity threshold."
+
+        - alert: TLSCertRevoked
+          expr: tlschecker_revocation_status{job="tlschecker"} == 3
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "TLS certificate for {{ $labels.instance }} is REVOKED"
+            description: "{{ $labels.instance }} (issuer {{ $labels.issuer }}) reported revoked via OCSP/CRL."
+
+        - alert: TLSGradeLow
+          expr: tlschecker_grade_score{job="tlschecker"} < 50
+          for: 6h
+          labels:
+            severity: warning
+          annotations:
+            summary: "TLS configuration for {{ $labels.instance }} graded poorly ({{ $value }}/100)"
+            description: "{{ $labels.instance }} scored below 50 (grade D/F). Review protocol/cipher/chain config."
+
+    # ── Monitoring self-health (the checker must not fail silently) ────────
+    - name: tlschecker.monitoring
+      rules:
+        # push_time_seconds only advances on a real push, so this detects a
+        # CronJob that stopped running while the Pushgateway keeps serving the
+        # last (now stale) values. timestamp() of the metric would NOT work —
+        # it advances on every scrape of the unchanged value.
+        - alert: TLSCheckerStale
+          expr: time() - max by (instance) (push_time_seconds{job="tlschecker"}) > 129600
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "tlschecker has not reported {{ $labels.instance }} in over 36h"
+            description: "No fresh push for {{ $labels.instance }}. The certificate dashboards may be showing stale data; check the CronJob."
+
+        # push_failure_time_seconds > push_time_seconds means the most recent
+        # Pushgateway interaction for this group was a failure.
+        - alert: TLSCheckerPushFailing
+          expr: push_failure_time_seconds{job="tlschecker"} > push_time_seconds{job="tlschecker"}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Most recent push for {{ $labels.instance }} failed"
+            description: "The Pushgateway recorded a push failure more recent than the last success for {{ $labels.instance }}."
+
+        # Catches total data loss (Pushgateway restarted/wiped, or the checker
+        # never ran) — the staleness rule above can't fire when the series is
+        # absent entirely.
+        - alert: TLSCheckerNoData
+          expr: absent(tlschecker_days_before_expired{job="tlschecker"})
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: "No tlschecker metrics present at all"
+            description: "tlschecker_days_before_expired is absent — the Pushgateway may have been wiped or the checker has never run. Certificate monitoring is effectively down."

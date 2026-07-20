@@ -66,7 +66,7 @@ struct Args {
 
     /// Push certificate metrics to a Prometheus Push Gateway
     #[arg(long)]
-    prometheus: Option<bool>,
+    prometheus: bool,
 
     /// Prometheus Push Gateway URL [default: http://localhost:9091]
     #[arg(long)]
@@ -1153,7 +1153,7 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
         cli_addresses,
         cli.output.as_ref().map(|o| o.to_string()),
         cli.exit_code,
-        cli.prometheus,
+        cli.prometheus.then_some(true),
         cli.prometheus_address.clone(),
         cli.check_revocation.then_some(true),
         cli.grade.then_some(true),

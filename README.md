@@ -193,7 +193,15 @@ A `tlschecker_revocation_status` metric is exported with the following values:
 - 2 = Unknown
 - 3 = Revoked
 
-Additionally, a `revoked` label is added to all metrics with a boolean value indicating whether the certificate is revoked.
+##### Metric labels and the push grouping key
+
+Every pushed series carries only stable identity labels in the push **grouping key**: `job="tlschecker"` and `instance="<host>"`. This is deliberate — a `push_metrics` `PUT` replaces the series under its exact grouping key, so putting volatile values (grade, cipher, expired, …) in the key would leave the previous run's series orphaned in the gateway whenever one of those values changed.
+
+Descriptive, changeable metadata therefore lives on a dedicated info metric, `tlschecker_certificate_info` (constant value `1`), with labels `cipher`, `cipher_protocol_version`, `issuer`, and `grade` (`N/A` when grading did not run). Join it to the numeric metrics on `instance` in your queries, e.g.:
+
+```promql
+tlschecker_days_before_expired * on(instance) group_left(grade, issuer) tlschecker_certificate_info
+```
 
 ### Certificate Fingerprints
 

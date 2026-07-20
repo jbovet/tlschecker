@@ -11,16 +11,21 @@
 //! - `tlschecker_grade_score` - TLS configuration grade score, only when grading ran (gauge)
 //! - `tlschecker_below_min_validity` - Whether certificate is below minimum validity threshold (gauge)
 //!
+//! - `tlschecker_certificate_info` - Descriptive info metric (constant `1`), carrying
+//!   the cipher/issuer/grade labels (the standard Prometheus "info metric" pattern)
+//!
 //! # Metric Labels
 //!
-//! Each metric includes the following labels:
-//! - `instance`, `job` - Standard Prometheus identifiers
-//! - `host` - Target hostname
+//! Every metric carries the push **grouping key** — `job` and `instance` (the target
+//! host) — and nothing else. Only these stable identity labels belong in the grouping
+//! key: a `PUT` to the push gateway replaces series under the exact grouping key, so
+//! putting volatile labels (grade, expired, cipher, …) there would orphan the previous
+//! run's series every time one of those values changed. Descriptive, changeable labels
+//! live on `tlschecker_certificate_info` instead:
 //! - `cipher` - TLS cipher suite name
 //! - `cipher_protocol_version` - TLS protocol version
 //! - `issuer` - Certificate issuer organization
-//! - `expired` - Boolean expiration status
-//! - `revoked` - Boolean revocation status
+//! - `grade` - TLS configuration grade letter (`N/A` when grading did not run)
 //!
 //! # Revocation Status Values
 //!
@@ -31,10 +36,20 @@
 //! - `3.0` - Revoked
 
 use prometheus::proto::MetricFamily;
-use prometheus::{labels, Gauge, Registry};
+use prometheus::{labels, Gauge, Opts, Registry};
+use tracing::warn;
 
 use tlschecker::RevocationStatus;
 use tlschecker::TLS;
+
+/// Returns whether a host's certificate is below the configured minimum validity.
+///
+/// `min_validity <= 0` disables the check; expired certificates are excluded (they are
+/// already reported via the expiry metrics), so this specifically flags "valid but
+/// running out".
+fn is_below_min_validity(tls: &TLS, min_validity: i32) -> bool {
+    min_validity > 0 && !tls.certificate.is_expired && tls.certificate.validity_days < min_validity
+}
 
 /// Builds the metric families for a single host's check result.
 ///
@@ -45,17 +60,20 @@ use tlschecker::TLS;
 fn host_metric_families(tls: &TLS, min_validity: i32) -> Vec<MetricFamily> {
     let registry = Registry::new();
 
-    let register_gauge = |name: &str, help: &str, value: f64| {
-        match Gauge::new(name, help) {
+    let register = |opts: Opts, value: f64| {
+        let name = opts.name.clone();
+        match Gauge::with_opts(opts) {
             Ok(gauge) => {
                 gauge.set(value);
                 if let Err(e) = registry.register(Box::new(gauge)) {
-                    eprintln!("Failed to register metric {}: {}", name, e);
+                    warn!("Failed to register metric {}: {}", name, e);
                 }
             }
-            Err(e) => eprintln!("Failed to create metric {}: {}", name, e),
+            Err(e) => warn!("Failed to create metric {}: {}", name, e),
         };
     };
+    let register_gauge =
+        |name: &str, help: &str, value: f64| register(Opts::new(name, help), value);
 
     register_gauge(
         "tlschecker_days_before_expired",
@@ -90,14 +108,31 @@ fn host_metric_families(tls: &TLS, min_validity: i32) -> Vec<MetricFamily> {
         );
     }
 
-    let below_min_validity = min_validity > 0
-        && !tls.certificate.is_expired
-        && tls.certificate.validity_days < min_validity;
     register_gauge(
         "tlschecker_below_min_validity",
         "1 if certificate validity is below the configured minimum threshold, 0 otherwise",
-        if below_min_validity { 1.0 } else { 0.0 },
+        if is_below_min_validity(tls, min_validity) {
+            1.0
+        } else {
+            0.0
+        },
     );
+
+    // Info metric (constant 1) carrying the descriptive, changeable labels. Keeping
+    // these off the push grouping key is what prevents stale series from piling up in
+    // the gateway when a cipher/issuer/grade changes between runs.
+    let info = Opts::new(
+        "tlschecker_certificate_info",
+        "TLS certificate metadata (constant 1); labels carry cipher/issuer/grade",
+    )
+    .const_label("cipher", &tls.cipher.name)
+    .const_label("cipher_protocol_version", &tls.cipher.version)
+    .const_label("issuer", &tls.certificate.issued.organization)
+    .const_label(
+        "grade",
+        tls.grade.as_ref().map_or("N/A", |g| g.grade.as_str()),
+    );
+    register(info, 1.0);
 
     registry.gather()
 }
@@ -115,54 +150,58 @@ fn host_metric_families(tls: &TLS, min_validity: i32) -> Vec<MetricFamily> {
 ///
 /// # Metrics Exported
 ///
-/// For each certificate:
+/// For each certificate (one push per host, keyed by `instance=<host>`):
 /// - Days and hours until expiration
 /// - Revocation status (0-3, see module documentation)
 /// - Grade score (only when grading was performed)
-/// - Associated labels (host, cipher, issuer, etc.)
+/// - `below_min_validity` (0/1)
+/// - `tlschecker_certificate_info` = 1, carrying the `cipher`/`issuer`/`grade` labels
 ///
 /// # Error Handling
 ///
-/// If pushing metrics fails (network error, gateway unavailable, etc.),
-/// an error message is printed to stderr but the function doesn't panic.
+/// A failed push (network error, gateway unavailable, etc.) is logged via
+/// `tracing::warn!` (stderr) per host and skipped; one unreachable host never
+/// aborts the others, and the function never panics.
 ///
 /// # Example
 ///
 /// ```no_run
-/// # use tlschecker::TLS;
-/// # use tlschecker::metrics::prom::prometheus_metrics;
-/// # fn example(results: Vec<TLS>) {
+/// use tlschecker::TLS;
+/// use tlschecker::metrics::prom::prometheus_metrics;
+///
+/// # fn run(results: Vec<TLS>) {
+/// // `address` is the push gateway root — `/metrics/job/tlschecker/instance/<host>`
+/// // is appended internally. `min_validity` (days, 0 = off) drives the
+/// // `tlschecker_below_min_validity` gauge.
 /// prometheus_metrics(results, "http://localhost:9091".to_string(), 30);
 /// # }
 /// ```
 pub fn prometheus_metrics(results: Vec<TLS>, prometheus_address: String, min_validity: i32) {
     for tls in results.iter() {
         let metric_families = host_metric_families(tls, min_validity);
-        let below_min_validity = min_validity > 0
-            && !tls.certificate.is_expired
-            && tls.certificate.validity_days < min_validity;
 
+        // Grouping key = stable identity only. A push_metrics PUT replaces the series
+        // under this exact key, so `instance` = host is what lets each host own (and
+        // overwrite) its own series without orphaning previous runs. Volatile labels
+        // (grade, cipher, expired, …) are metric values or live on the info metric.
         let prometheus_client = prometheus::push_metrics(
             "tlschecker",
             labels! {
-                "instance".to_owned() => "tlschecker".to_owned(),
-                "job".to_owned() => "tlschecker".to_owned(),
-                "host".to_owned() =>  tls.certificate.hostname.to_owned(),
-                "cipher".to_owned() => tls.cipher.name.to_owned(),
-                "cipher_protocol_version".to_owned() => tls.cipher.version.to_owned(),
-                "issuer".to_owned() => tls.certificate.issued.organization.to_owned(),
-                "expired".to_owned() => tls.certificate.is_expired.to_string(),
-                "revoked".to_owned() => (matches!(tls.certificate.revocation_status, RevocationStatus::Revoked(_))).to_string(),
-                "grade".to_owned() => tls.grade.as_ref().map_or("N/A".to_string(), |g| g.grade.clone()),
-                "below_min_validity".to_owned() => below_min_validity.to_string(),
+                "instance".to_owned() => tls.certificate.hostname.to_owned(),
             },
-            &format!("{}/metrics/job", prometheus_address),
+            // Base URL only: push_metrics appends `/metrics/job/<job>/<label>/<value>…`
+            // itself. Passing `<addr>/metrics/job` here doubled the path so the gateway
+            // parsed "metrics" as the job name (job label came out as "metrics").
+            &prometheus_address,
             metric_families,
             None,
         );
 
         if let Err(e) = prometheus_client {
-            eprintln!("\nFailed to push metrics to prometheus: {}", e);
+            warn!(
+                "Failed to push metrics to prometheus for {}: {}",
+                tls.certificate.hostname, e
+            );
         }
     }
 }
@@ -268,6 +307,50 @@ mod tests {
             .unwrap();
         let value = grade_family.get_metric()[0].get_gauge().value();
         assert_eq!(value, 90.0);
+    }
+
+    #[test]
+    fn test_certificate_info_metric_carries_descriptive_labels() {
+        // Descriptive labels (cipher/issuer/grade) must live on the info metric, not
+        // the push grouping key, so changing values don't orphan series in the gateway.
+        let mut tls = make_test_tls();
+        tls.grade = Some(tlschecker::grading::TLSGrade {
+            grade: "A".to_string(),
+            score: 90,
+            categories: vec![],
+        });
+        let families = host_metric_families(&tls, 0);
+        let info = families
+            .iter()
+            .find(|f| f.name() == "tlschecker_certificate_info")
+            .expect("info metric present");
+        let metric = &info.get_metric()[0];
+        assert_eq!(metric.get_gauge().value(), 1.0);
+        let labels: std::collections::HashMap<_, _> = metric
+            .get_label()
+            .iter()
+            .map(|l| (l.name(), l.value()))
+            .collect();
+        assert_eq!(labels.get("cipher"), Some(&"TLS_AES_256_GCM_SHA384"));
+        assert_eq!(labels.get("cipher_protocol_version"), Some(&"TLSv1.3"));
+        assert_eq!(labels.get("issuer"), Some(&"Test CA"));
+        assert_eq!(labels.get("grade"), Some(&"A"));
+    }
+
+    #[test]
+    fn test_certificate_info_grade_defaults_to_na() {
+        let tls = make_test_tls(); // no grade
+        let families = host_metric_families(&tls, 0);
+        let info = families
+            .iter()
+            .find(|f| f.name() == "tlschecker_certificate_info")
+            .expect("info metric present");
+        let grade = info.get_metric()[0]
+            .get_label()
+            .iter()
+            .find(|l| l.name() == "grade")
+            .map(|l| l.value().to_string());
+        assert_eq!(grade, Some("N/A".to_string()));
     }
 
     #[test]
