@@ -1,6 +1,8 @@
 //! Dashboard application state: the host list, selection, and the verdict
 //! logic that colors it.
 
+use std::io::{ErrorKind, Write};
+
 use tlschecker::{RevocationStatus, TLS};
 
 use crate::HostOutcome;
@@ -35,6 +37,44 @@ pub fn verdict(tls: &TLS) -> Verdict {
         Verdict::Warning
     } else {
         Verdict::Healthy
+    }
+}
+
+/// Builds the filename the export prompt is prefilled with.
+///
+/// Host labels are whatever the user typed on the command line, which
+/// `parse_host_port` accepts in three shapes — `host`, `host:port`, and
+/// `https://host:port` — so the label is parsed down to the bare hostname
+/// first. Using it raw would produce `https://example.com.pem` (a path under a
+/// nonexistent `https:` directory) or `example.com:443.pem` (illegal on
+/// Windows). Whatever survives parsing is then reduced to characters that are
+/// safe in a filename, which also flattens IPv6 colons and wildcard SAN names.
+fn default_export_filename(label: &str) -> String {
+    let host = crate::parse_host_port(label)
+        .map(|hp| hp.host)
+        .unwrap_or_else(|_| label.to_string());
+
+    // `parse_host_port` keeps the brackets on an IPv6 literal when it resolves
+    // through `Url::parse` (it only strips them on its fallback path).
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+
+    let stem: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    // A stem of only separators (or nothing at all) would yield a dotfile or a
+    // bare ".pem"; fall back to a neutral name instead.
+    if stem.chars().all(|c| matches!(c, '.' | '-' | '_')) {
+        "certificate.pem".to_string()
+    } else {
+        format!("{}.pem", stem)
     }
 }
 
@@ -100,22 +140,42 @@ impl App {
         self.detail_scroll = 0;
     }
 
+    /// Opens the export prompt for the selected host, prefilled with a
+    /// filename derived from its address.
     pub fn begin_export(&mut self) {
         if let Some(Some(HostOutcome::Checked(_))) = self.slots.get(self.selected) {
             let label = self.labels.get(self.selected).cloned().unwrap_or_default();
-            self.export_prompt = Some(format!("{}.pem", label));
+            self.export_prompt = Some(default_export_filename(&label));
         }
     }
 
+    /// Writes the selected host's PEM chain to the typed path and reports the
+    /// result in the flash line.
+    ///
+    /// The file is created with `create_new`, so an existing file is reported
+    /// rather than overwritten: the prompt is prefilled, which makes `e`⏎ two
+    /// keystrokes away from clobbering whatever is already there.
     pub fn commit_export(&mut self) {
-        if let Some(path) = self.export_prompt.take() {
-            if let Some(Some(HostOutcome::Checked(tls))) = self.slots.get(self.selected) {
-                match std::fs::write(&path, &tls.certificate.pem) {
-                    Ok(_) => self.flash_message = Some(format!("Exported to {}", path)),
-                    Err(e) => self.flash_message = Some(format!("Failed to export: {}", e)),
-                }
+        let Some(path) = self.export_prompt.take() else {
+            return;
+        };
+        let Some(Some(HostOutcome::Checked(tls))) = self.slots.get(self.selected) else {
+            return;
+        };
+
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(tls.certificate.pem.as_bytes()));
+
+        self.flash_message = Some(match written {
+            Ok(()) => format!("Exported to {}", path),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                format!("Failed to export: {} already exists", path)
             }
-        }
+            Err(e) => format!("Failed to export: {}", e),
+        });
     }
 
     pub fn clear_flash(&mut self) {
@@ -192,6 +252,57 @@ impl App {
 mod tests {
     use super::*;
     use crate::tests::make_test_tls;
+
+    #[test]
+    fn test_default_export_filename_strips_scheme_and_port() {
+        // All three address shapes `parse_host_port` accepts must collapse to
+        // the same plain, writable filename.
+        assert_eq!(default_export_filename("example.com"), "example.com.pem");
+        assert_eq!(
+            default_export_filename("example.com:443"),
+            "example.com.pem"
+        );
+        assert_eq!(
+            default_export_filename("https://example.com:8443"),
+            "example.com.pem"
+        );
+    }
+
+    #[test]
+    fn test_default_export_filename_sanitizes_unsafe_chars() {
+        // IPv6 colons and wildcards would be illegal or awkward in a filename.
+        assert_eq!(default_export_filename("[::1]:443"), "__1.pem");
+        assert_eq!(default_export_filename("*.example.com"), "_.example.com.pem");
+        assert_eq!(default_export_filename(""), "certificate.pem");
+    }
+
+    #[test]
+    fn test_commit_export_writes_pem_and_refuses_overwrite() {
+        let dir = std::env::temp_dir().join("tlschecker_export_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.pem");
+
+        let mut tls = make_test_tls();
+        tls.certificate.pem = "-----BEGIN CERTIFICATE-----\n".to_string();
+        let mut app = App::new(&["example.com".to_string()]);
+        app.record(0, HostOutcome::Checked(Box::new(tls)));
+
+        app.export_prompt = Some(path.to_string_lossy().into_owned());
+        app.commit_export();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "-----BEGIN CERTIFICATE-----\n"
+        );
+        assert!(app.flash_message.as_ref().unwrap().starts_with("Exported to"));
+
+        // A second export to the same path must report, not clobber.
+        app.export_prompt = Some(path.to_string_lossy().into_owned());
+        app.commit_export();
+        assert!(app.flash_message.unwrap().contains("already exists"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_verdict_healthy() {

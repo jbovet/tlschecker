@@ -105,10 +105,13 @@ pub fn run(
                         continue;
                     }
 
-                    // Clear any flash message on keypress.
-                    if app.flash_message.is_some() {
+                    // Clear any flash message on keypress. Remember that we did:
+                    // the fallthrough arm below cancels the redraw for unhandled
+                    // keys, which would otherwise leave the cleared message on
+                    // screen until the next key that does redraw.
+                    let had_flash = app.flash_message.is_some();
+                    if had_flash {
                         app.clear_flash();
-                        dirty = true;
                     }
 
                     match (app.screen, key.code) {
@@ -151,7 +154,7 @@ pub fn run(
                         (Screen::Detail, KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace) => {
                             app.close_detail()
                         }
-                        _ => dirty = false,
+                        _ => dirty = had_flash,
                     }
                 }
                 Event::Resize(_, _) => dirty = true,
