@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-07-20
+
+A maintenance release focused on Prometheus/observability robustness and the
+example deployment assets. No library or CLI behavior changes beyond the
+Prometheus push path.
+
+### Fixed
+
+- **Prometheus push grouping key is now stable identity only** (`job` +
+  `instance`). Volatile metadata (grade, cipher, protocol version, issuer) moved
+  onto a dedicated `tlschecker_certificate_info` info metric so changing values
+  no longer orphan a previous run's series in the push gateway.
+- `--prometheus` is now a plain boolean flag rather than taking an optional
+  value.
+
+### Added
+
+- **Grafana dashboard** and **Prometheus alert rules** examples, hardened for
+  SRE use, plus a **Kubernetes CronJob** example manifest.
+
+### Changed
+
+- Grafana dashboard: "Days until expiration" is shown in days (not auto-scaled
+  units) and the cert-health stat tiles are scoped to the `Issuer` variable.
+- CI: bumped `actions/checkout` to v7.
+
 ## [2.0.0] - 2026-07-20
 
 A large feature release that turns `tlschecker` from a batch certificate checker
@@ -66,5 +92,6 @@ scanning, and Certificate Transparency support.
 
 See the Git history for changes in 1.1.1 and earlier.
 
+[2.0.1]: https://github.com/jbovet/tlschecker/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/jbovet/tlschecker/compare/v1.1.1...v2.0.0
 [1.1.1]: https://github.com/jbovet/tlschecker/releases/tag/v1.1.1
