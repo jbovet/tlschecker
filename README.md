@@ -78,8 +78,9 @@ Press `e` on either screen to export the selected host's certificate chain as
 PEM. The prompt is prefilled with a filename derived from the host (so
 `https://example.com:8443` becomes `example.com.pem`); edit it as you like and
 press `Enter` to write, or `Esc` to cancel. An existing file is never
-overwritten — the footer reports it instead, in red, along with any write
-error. This is the interactive equivalent of `--export-pem`.
+overwritten: the prompt stays open with the reason shown beneath the path, so
+you can adjust the name and retry without retyping it. This is the interactive
+equivalent of `--export-pem`.
 
 The TUI requires an attached terminal. In Docker, that means using `-it` so the
 container gets a pseudo-TTY and stdin. Without that, Docker will fall back to

@@ -83,22 +83,12 @@ pub fn run(
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 break;
                             }
-                            KeyCode::Esc => {
-                                app.export_prompt = None;
-                            }
-                            KeyCode::Enter => {
-                                app.commit_export();
-                            }
-                            KeyCode::Backspace => {
-                                if let Some(prompt) = &mut app.export_prompt {
-                                    prompt.pop();
-                                }
-                            }
-                            KeyCode::Char(c) => {
-                                if let Some(prompt) = &mut app.export_prompt {
-                                    prompt.push(c);
-                                }
-                            }
+                            KeyCode::Esc => app.cancel_export(),
+                            // Only a successful write closes the overlay; a
+                            // failure leaves the typed path in place to edit.
+                            KeyCode::Enter => app.commit_export(),
+                            KeyCode::Backspace => app.export_input_pop(),
+                            KeyCode::Char(c) => app.export_input_push(c),
                             _ => {}
                         }
                         dirty = true;

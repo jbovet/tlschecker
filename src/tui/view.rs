@@ -13,7 +13,7 @@ use ratatui::Frame;
 
 use tlschecker::TLS;
 
-use super::state::{verdict, App, FlashKind, Screen, Verdict};
+use super::state::{verdict, App, ExportPrompt, FlashKind, Screen, Verdict};
 use crate::{warning_label, HostOutcome};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
@@ -640,21 +640,35 @@ fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
     .split(popup_layout[1])[1]
 }
 
-fn draw_export_prompt(frame: &mut Frame, prompt: &str) {
-    let area = centered_rect(60, 3, frame.area());
+fn draw_export_prompt(frame: &mut Frame, prompt: &ExportPrompt) {
+    // Grow by a line for the error, so the failure is attached to the input it
+    // refers to instead of sitting in the footer rows away.
+    let height = if prompt.error.is_some() { 4 } else { 3 };
+    let area = centered_rect(60, height, frame.area());
     frame.render_widget(Clear, area);
+    let border = if prompt.error.is_some() {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
     let block = Block::bordered()
         .title(" Export Certificate ")
-        .border_style(Style::new().fg(Color::Cyan));
+        .border_style(Style::new().fg(border));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let text = Line::from(vec![
+    let mut lines = vec![Line::from(vec![
         Span::raw(" Path: "),
-        Span::styled(prompt, Style::new().fg(Color::Yellow)),
+        Span::styled(prompt.path.as_str(), Style::new().fg(Color::Yellow)),
         Span::styled("█", Style::new().fg(Color::Cyan)),
-    ]);
-    frame.render_widget(Paragraph::new(text), inner);
+    ])];
+    if let Some(error) = &prompt.error {
+        lines.push(Line::from(Span::styled(
+            format!(" {} — edit and retry, Esc cancels", error),
+            Style::new().fg(Color::Red),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn score_color(score: u8) -> Color {
@@ -879,6 +893,29 @@ mod tests {
         let content = render(&app);
         assert!(content.contains("HOSTNAME MISMATCH"));
         assert!(content.contains("1 warning"));
+    }
+
+    #[test]
+    fn test_export_prompt_renders_path_and_error() {
+        let mut app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(make_test_tls())))],
+            &["example.com"],
+        );
+
+        app.begin_export();
+        let clean = render(&app);
+        assert!(clean.contains("Export Certificate"));
+        assert!(clean.contains("example.com.pem"));
+        assert!(!clean.contains("edit and retry"));
+
+        // A failed attempt shows the reason inside the popup, next to the path
+        // it refers to — not in the footer.
+        app.export_prompt.as_mut().unwrap().error = Some("file already exists".to_string());
+        let failed = render(&app);
+        assert!(failed.contains("file already exists"));
+        assert!(failed.contains("edit and retry"));
+        // The path the user typed is still there to edit.
+        assert!(failed.contains("example.com.pem"));
     }
 
     #[test]
