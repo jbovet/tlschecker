@@ -136,7 +136,9 @@ pub(crate) fn validation_level(cert: &X509Ref) -> Option<String> {
 /// Access extension — where the issuing CA publishes its own certificate.
 ///
 /// Empty when the extension is absent, carries no caIssuers access description,
-/// or the location is not a URI-form `GeneralName`.
+/// or the location is not a URI-form `GeneralName`. Duplicate URIs are
+/// collapsed; the list is tiny, so the linear `contains` scan is cheaper than a
+/// set.
 pub(crate) fn ca_issuer_urls(cert: &X509Ref) -> Vec<String> {
     let mut urls = Vec::new();
     let Ok(der) = cert.to_der() else {
@@ -164,7 +166,10 @@ pub(crate) fn ca_issuer_urls(cert: &X509Ref) -> Vec<String> {
                     if let Some((name_tag, location, _)) = read_tlv(after_oid) {
                         if name_tag == GENERAL_NAME_URI {
                             if let Ok(url) = std::str::from_utf8(location) {
-                                urls.push(url.to_string());
+                                let url = url.to_string();
+                                if !urls.contains(&url) {
+                                    urls.push(url);
+                                }
                             }
                         }
                     }
@@ -359,6 +364,19 @@ mod tests {
                 "http://a.example/ca.crt".to_string(),
                 "http://b.example/ca.crt".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn test_ca_issuer_urls_deduplicates_repeated_uris() {
+        let der = aia_der(&[
+            (&AD_CA_ISSUERS, "http://a.example/ca.crt"),
+            (&AD_CA_ISSUERS, "http://a.example/ca.crt"),
+        ]);
+        let cert = cert_with_extension("1.3.6.1.5.5.7.1.1", &der);
+        assert_eq!(
+            ca_issuer_urls(&cert),
+            vec!["http://a.example/ca.crt".to_string()]
         );
     }
 

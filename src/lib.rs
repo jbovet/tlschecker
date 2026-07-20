@@ -1747,7 +1747,10 @@ fn fingerprint(cert_ref: &X509, digest: openssl::hash::MessageDigest) -> String 
 /// Serial numbers are conventionally displayed in hex (`F4:4A:01:...`) rather
 /// than as the decimal value of the ASN.1 INTEGER, so this matches what a CA
 /// portal, a browser's certificate viewer, or `openssl x509 -text` will show.
-/// A serial of zero renders as `00`.
+/// A serial of zero renders as `00`. Negative serials — malformed per RFC 5280
+/// §4.1.2.2, but this is a diagnostic tool that surfaces non-conformant certs
+/// rather than normalizing them — are prefixed with `-`, since `BigNum::to_vec`
+/// returns only the magnitude bytes.
 fn serial_hex(cert_ref: &X509) -> String {
     match cert_ref.serial_number().to_bn() {
         Ok(bn) => {
@@ -1755,7 +1758,12 @@ fn serial_hex(cert_ref: &X509) -> String {
             if bytes.is_empty() {
                 "00".to_string()
             } else {
-                bytes_to_hex_colon(&bytes)
+                let hex = bytes_to_hex_colon(&bytes);
+                if bn.is_negative() {
+                    format!("-{}", hex)
+                } else {
+                    hex
+                }
             }
         }
         Err(_) => "Unknown".to_string(),
@@ -1767,7 +1775,9 @@ fn serial_hex(cert_ref: &X509) -> String {
 ///
 /// Returns an empty vector when the extension is absent or carries no URI-form
 /// names — consistent with the best-effort handling used elsewhere in
-/// certificate parsing.
+/// certificate parsing. Duplicate URIs are collapsed so revocation checks don't
+/// fetch the same CRL twice; the list is tiny, so the linear `contains` scan is
+/// cheaper than a set.
 fn crl_urls(cert_ref: &X509) -> Vec<String> {
     let mut urls = Vec::new();
     let Some(dps) = cert_ref.crl_distribution_points() else {
@@ -1779,7 +1789,10 @@ fn crl_urls(cert_ref: &X509) -> Vec<String> {
         };
         for name in fullname.iter() {
             if let Some(uri) = name.uri() {
-                urls.push(uri.to_string());
+                let uri = uri.to_string();
+                if !urls.contains(&uri) {
+                    urls.push(uri);
+                }
             }
         }
     }
@@ -2763,6 +2776,14 @@ mod tests {
     }
 
     #[test]
+    fn test_serial_hex_negative_serial_keeps_sign() {
+        // Non-conformant per RFC 5280, but the tool inspects rather than
+        // normalizes: the magnitude must not read as a positive serial.
+        let cert = make_test_x509_with_serial("-1A2B");
+        assert_eq!(super::serial_hex(&cert), "-1A:2B");
+    }
+
+    #[test]
     fn test_crl_urls_collects_every_distribution_point() {
         let cert = make_test_x509_with_crl_dps(&[
             "http://c.pki.example/we1/a.crl",
@@ -2780,6 +2801,18 @@ mod tests {
     #[test]
     fn test_crl_urls_absent_extension() {
         assert!(super::crl_urls(&make_test_x509_with_crl_dps(&[])).is_empty());
+    }
+
+    #[test]
+    fn test_crl_urls_deduplicates_repeated_uris() {
+        let cert = make_test_x509_with_crl_dps(&[
+            "http://c.pki.example/we1/a.crl",
+            "http://c.pki.example/we1/a.crl",
+        ]);
+        assert_eq!(
+            super::crl_urls(&cert),
+            vec!["http://c.pki.example/we1/a.crl".to_string()]
+        );
     }
 
     #[test]
