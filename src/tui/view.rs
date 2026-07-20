@@ -470,6 +470,22 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                 },
             ));
 
+            if !cert.ocsp_urls.is_empty()
+                || !cert.ca_issuer_urls.is_empty()
+                || !cert.crl_urls.is_empty()
+            {
+                lines.push(section("Issuer & Revocation URLs"));
+                for url in &cert.ocsp_urls {
+                    lines.push(kv("OCSP", url.clone()));
+                }
+                for url in &cert.ca_issuer_urls {
+                    lines.push(kv("CA Issuers", url.clone()));
+                }
+                for url in &cert.crl_urls {
+                    lines.push(kv("CRL", url.clone()));
+                }
+            }
+
             lines.push(section("Connection"));
             lines.push(kv("Protocol", tls.cipher.version.clone()));
             lines.push(kv(
@@ -742,6 +758,7 @@ mod tests {
             "Validity",
             "Certificate",
             "Connection",
+            "Issuer & Revocation URLs",
             "Subject Alternative Names (2)",
             "Certificate Chain (1)",
             "Protocol & Cipher Scan",
@@ -751,6 +768,9 @@ mod tests {
         // Facts from make_test_tls
         assert!(content.contains("San Francisco")); // subject locality
         assert!(content.contains("1234567890")); // serial number
+        assert!(content.contains("http://ocsp.example.com")); // AIA OCSP responder
+        assert!(content.contains("http://i.example.com/ca.crt")); // AIA CA Issuers
+        assert!(content.contains("http://c.example.com/ca.crl")); // CRL distribution point
         assert!(content.contains("www.example.com")); // SAN entry
         assert!(content.contains("Test CA Root")); // chain issuer
         assert!(content.contains("esc back")); // explorer footer

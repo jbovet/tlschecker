@@ -19,6 +19,18 @@ const KEY_USAGE_OID: [u8; 3] = [0x55, 0x1d, 0x0f];
 const EXT_KEY_USAGE_OID: [u8; 3] = [0x55, 0x1d, 0x25];
 /// Basic Constraints — `2.5.29.19`.
 const BASIC_CONSTRAINTS_OID: [u8; 3] = [0x55, 0x1d, 0x13];
+/// Authority Information Access — `1.3.6.1.5.5.7.1.1`.
+const AIA_OID: [u8; 8] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
+
+/// `1.3.6.1.5.5.7.48.2` — id-ad-caIssuers, the AIA access method whose
+/// location points at the issuer's certificate. (The sibling id-ad-ocsp is not
+/// parsed here: `openssl` exposes `ocsp_responders()` for it, and reading the
+/// OCSP URLs from the same accessor the revocation check uses keeps the
+/// displayed responders and the queried ones from drifting apart.)
+const AD_CA_ISSUERS: [u8; 8] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02];
+
+/// GeneralName `uniformResourceIdentifier [6] IMPLICIT IA5String`.
+const GENERAL_NAME_URI: u8 = 0x86;
 
 /// X.509 Key Usage bit names, MSB-first (bit 0 = `digitalSignature`).
 const KEY_USAGE_NAMES: [&str; 9] = [
@@ -118,6 +130,52 @@ pub(crate) fn validation_level(cert: &X509Ref) -> Option<String> {
         }
     }
     None
+}
+
+/// Returns the CA Issuers URLs from the certificate's Authority Information
+/// Access extension — where the issuing CA publishes its own certificate.
+///
+/// Empty when the extension is absent, carries no caIssuers access description,
+/// or the location is not a URI-form `GeneralName`.
+pub(crate) fn ca_issuer_urls(cert: &X509Ref) -> Vec<String> {
+    let mut urls = Vec::new();
+    let Ok(der) = cert.to_der() else {
+        return urls;
+    };
+    let Some(aia) = find_extension_value(&der, &AIA_OID) else {
+        return urls;
+    };
+
+    // AuthorityInfoAccessSyntax ::= SEQUENCE OF AccessDescription
+    let Some((tag, seq, _)) = read_tlv(aia) else {
+        return urls;
+    };
+    if tag != 0x30 {
+        return urls;
+    }
+
+    // AccessDescription ::= SEQUENCE { accessMethod OID, accessLocation GeneralName }
+    let mut rest = seq;
+    while let Some((tag, desc, next)) = read_tlv(rest) {
+        rest = next;
+        if tag == 0x30 {
+            if let Some((oid_tag, oid, after_oid)) = read_tlv(desc) {
+                if oid_tag == 0x06 && oid == AD_CA_ISSUERS {
+                    if let Some((name_tag, location, _)) = read_tlv(after_oid) {
+                        if name_tag == GENERAL_NAME_URI {
+                            if let Ok(url) = std::str::from_utf8(location) {
+                                urls.push(url.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if rest.is_empty() {
+            break;
+        }
+    }
+    urls
 }
 
 /// Basic-Constraints and Key-Usage / Extended-Key-Usage facts read from a
@@ -224,6 +282,94 @@ mod tests {
     use openssl::pkey::PKey;
     use openssl::rsa::Rsa;
     use openssl::x509::{X509Builder, X509Extension, X509NameBuilder};
+
+    /// Wraps `(accessMethod OID, URI)` pairs into a DER `AuthorityInfoAccess`
+    /// value: `SEQUENCE OF AccessDescription { OID, [6] IA5String }`.
+    /// Only short (<128 byte) elements are emitted, which every test URL is.
+    fn aia_der(entries: &[(&[u8], &str)]) -> Vec<u8> {
+        let mut descriptions = Vec::new();
+        for (oid, uri) in entries {
+            let oid_tlv = [&[0x06, oid.len() as u8], *oid].concat();
+            let uri_tlv = [&[GENERAL_NAME_URI, uri.len() as u8], uri.as_bytes()].concat();
+            let body = [oid_tlv, uri_tlv].concat();
+            descriptions.extend([0x30, body.len() as u8]);
+            descriptions.extend(body);
+        }
+        [&[0x30, descriptions.len() as u8], descriptions.as_slice()].concat()
+    }
+
+    /// Builds a self-signed cert carrying the given DER extension value under
+    /// `oid_str`, or none when `der` is empty.
+    fn cert_with_extension(oid_str: &str, der: &[u8]) -> openssl::x509::X509 {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "aia.example.com")
+            .unwrap();
+        let name = name.build();
+        let mut b = X509Builder::new().unwrap();
+        b.set_version(2).unwrap();
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+        b.set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        b.set_subject_name(&name).unwrap();
+        b.set_issuer_name(&name).unwrap();
+        b.set_pubkey(&key).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        b.set_not_after(&Asn1Time::days_from_now(365).unwrap())
+            .unwrap();
+        if !der.is_empty() {
+            let obj = Asn1Object::from_str(oid_str).unwrap();
+            let value = Asn1OctetString::new_from_bytes(der).unwrap();
+            b.append_extension(X509Extension::new_from_der(&obj, false, &value).unwrap())
+                .unwrap();
+        }
+        b.sign(&key, MessageDigest::sha256()).unwrap();
+        b.build()
+    }
+
+    /// `1.3.6.1.5.5.7.48.1` — id-ad-ocsp, used to prove the caIssuers reader
+    /// filters on access method rather than returning every AIA location.
+    const AD_OCSP: [u8; 8] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01];
+
+    #[test]
+    fn test_ca_issuer_urls_reads_ca_issuers_only() {
+        let der = aia_der(&[
+            (&AD_OCSP, "http://o.pki.example/we1"),
+            (&AD_CA_ISSUERS, "http://i.pki.example/we1.crt"),
+        ]);
+        let cert = cert_with_extension("1.3.6.1.5.5.7.1.1", &der);
+        assert_eq!(
+            ca_issuer_urls(&cert),
+            vec!["http://i.pki.example/we1.crt".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_ca_issuer_urls_multiple_entries() {
+        let der = aia_der(&[
+            (&AD_CA_ISSUERS, "http://a.example/ca.crt"),
+            (&AD_CA_ISSUERS, "http://b.example/ca.crt"),
+        ]);
+        let cert = cert_with_extension("1.3.6.1.5.5.7.1.1", &der);
+        assert_eq!(
+            ca_issuer_urls(&cert),
+            vec![
+                "http://a.example/ca.crt".to_string(),
+                "http://b.example/ca.crt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ca_issuer_urls_absent_or_ocsp_only() {
+        // No AIA extension at all.
+        assert!(ca_issuer_urls(&cert_with_extension("1.3.6.1.5.5.7.1.1", &[])).is_empty());
+        // AIA present, but carrying only an OCSP responder.
+        let der = aia_der(&[(&AD_OCSP, "http://o.pki.example/we1")]);
+        assert!(ca_issuer_urls(&cert_with_extension("1.3.6.1.5.5.7.1.1", &der)).is_empty());
+    }
 
     /// Wraps one policy OID (value bytes) into a DER `certificatePolicies`
     /// value: `SEQUENCE OF PolicyInformation { SEQUENCE { policyIdentifier } }`.
