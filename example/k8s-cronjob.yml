@@ -1,0 +1,110 @@
+# tlschecker on Kubernetes — reference manifests.
+#
+# Two patterns are shown:
+#   1. CronJob (below, active)        — scheduled checks; alert on Job failure.
+#   2. One-shot Job (commented)       — run once, e.g. in CI or ad hoc.
+#   3. CronJob + Prometheus (comment) — push metrics to a Pushgateway instead of
+#                                       relying on the exit code.
+#
+# Image tags follow the published scheme (semver, no `v` prefix): 2.0.0, 2.0, 2, latest.
+# Pin a specific version in production rather than tracking `latest`.
+#
+# ---------------------------------------------------------------------------
+# Pattern 1: scheduled check. `--exit-code 1` makes the container exit non-zero
+# when a cert is expired / revoked / below --min-validity. Because that non-zero
+# exit is the *signal we want* (not a transient error), the Job must not retry it:
+#   restartPolicy: Never + backoffLimit: 0  ->  one run == one Job result.
+# Alert on the resulting failed Job (e.g. kube_job_status_failed).
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tlschecker
+  labels:
+    app.kubernetes.io/name: tlschecker
+spec:
+  schedule: "0 0 * * *"            # daily at midnight (UTC)
+  concurrencyPolicy: Forbid       # never overlap runs
+  startingDeadlineSeconds: 120     # skip (don't backfill) if a run is >2m late
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0              # do not retry: an expired cert is not a flake
+      activeDeadlineSeconds: 300    # bound a hung TLS connection
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: tlschecker
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534         # nobody
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: tlschecker
+            image: josebovet/tlschecker:2.0.0
+            imagePullPolicy: IfNotPresent
+            args: ["expired.badssl.com", "-o", "json", "--exit-code", "1"]
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop: ["ALL"]
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "32Mi"
+              limits:
+                cpu: "250m"
+                memory: "128Mi"
+
+# ---------------------------------------------------------------------------
+# Pattern 2: one-shot Job (uncomment to use). Same hardening; runs a single check.
+# ---------------------------------------------------------------------------
+# apiVersion: batch/v1
+# kind: Job
+# metadata:
+#   name: tlschecker
+#   labels:
+#     app.kubernetes.io/name: tlschecker
+# spec:
+#   backoffLimit: 0
+#   activeDeadlineSeconds: 300
+#   template:
+#     spec:
+#       restartPolicy: Never
+#       securityContext:
+#         runAsNonRoot: true
+#         runAsUser: 65534
+#         seccompProfile:
+#           type: RuntimeDefault
+#       containers:
+#         - name: tlschecker
+#           image: josebovet/tlschecker:2.0.0
+#           imagePullPolicy: IfNotPresent
+#           args: ["expired.badssl.com", "-o", "json", "--exit-code", "1"]
+#           securityContext:
+#             allowPrivilegeEscalation: false
+#             readOnlyRootFilesystem: true
+#             capabilities:
+#               drop: ["ALL"]
+
+# ---------------------------------------------------------------------------
+# Pattern 3: scheduled check that PUSHES metrics to a Prometheus Pushgateway
+# instead of signalling via exit code. Alert in Prometheus on the pushed gauges
+# (e.g. tlschecker_days_before_expired < 15). Each host is pushed under
+# instance="<host>" and joined to labels via tlschecker_certificate_info.
+# Drop --exit-code so a soon-to-expire cert doesn't fail the Job — the metric
+# carries the signal. Replace the gateway address with your own.
+# ---------------------------------------------------------------------------
+#           args:
+#             - "example.com"
+#             - "expired.badssl.com"
+#             - "--grade"
+#             - "--check-revocation"
+#             - "--prometheus"
+#             - "--prometheus-address"
+#             - "http://prometheus-pushgateway.monitoring.svc:9091"

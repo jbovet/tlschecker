@@ -1,0 +1,182 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "title": "TLSChecker — Certificate Overview",
+  "uid": "tlschecker-overview",
+  "tags": ["tlschecker", "tls", "certificates"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "1m",
+  "templating": {
+    "list": [
+      {
+        "name": "issuer",
+        "label": "Issuer",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(tlschecker_certificate_info, issuer)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Certificates monitored",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "count(tlschecker_certificate_info{issuer=~\"$issuer\"}) or vector(0)", "instant": true }
+      ],
+      "options": { "colorMode": "value", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "text" }, "unit": "none" } }
+    },
+    {
+      "type": "stat",
+      "title": "Expiring ≤ 30 days",
+      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "count(tlschecker_days_before_expired{instance=~\".+\"} <= 30 and tlschecker_days_before_expired > 15) or vector(0)", "instant": true }
+      ],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 } ] } } }
+    },
+    {
+      "type": "stat",
+      "title": "Critical ≤ 15 days",
+      "gridPos": { "h": 4, "w": 5, "x": 9, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "count(tlschecker_days_before_expired <= 15 and tlschecker_days_before_expired > 0) or vector(0)", "instant": true }
+      ],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } } }
+    },
+    {
+      "type": "stat",
+      "title": "Expired",
+      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "count(tlschecker_days_before_expired <= 0) or vector(0)", "instant": true }
+      ],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } }
+    },
+    {
+      "type": "stat",
+      "title": "Revoked",
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "count(tlschecker_revocation_status == 3) or vector(0)", "instant": true }
+      ],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } }
+    },
+    {
+      "type": "table",
+      "title": "Certificate inventory",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "instant": true, "format": "table", "expr": "tlschecker_grade_score * on(instance) group_left(issuer, grade, cipher, cipher_protocol_version) tlschecker_certificate_info{issuer=~\"$issuer\"}" },
+        { "refId": "B", "instant": true, "format": "table", "expr": "tlschecker_days_before_expired" },
+        { "refId": "C", "instant": true, "format": "table", "expr": "tlschecker_revocation_status" }
+      ],
+      "transformations": [
+        { "id": "joinByField", "options": { "byField": "instance", "mode": "outer" } },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time 1": true, "Time 2": true, "Time 3": true, "job 1": true, "job 2": true, "job 3": true, "__name__ 1": true, "__name__ 2": true, "__name__ 3": true },
+            "indexByName": { "instance": 0, "issuer": 1, "grade": 2, "Value #A": 3, "Value #B": 4, "Value #C": 5, "cipher": 6, "cipher_protocol_version": 7 },
+            "renameByName": { "instance": "Host", "issuer": "Issuer", "grade": "Grade", "Value #A": "Grade score", "Value #B": "Days left", "Value #C": "Revocation", "cipher": "Cipher", "cipher_protocol_version": "Protocol" }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Days left" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 15 }, { "color": "yellow", "value": 30 }, { "color": "green", "value": 60 } ] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Grade score" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 50 }, { "color": "yellow", "value": 70 }, { "color": "green", "value": 80 } ] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Revocation" },
+            "properties": [
+              { "id": "mappings", "value": [ { "type": "value", "options": { "0": { "text": "Not checked", "color": "text" }, "1": { "text": "Good", "color": "green" }, "2": { "text": "Unknown", "color": "yellow" }, "3": { "text": "Revoked", "color": "red" } } } ] },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Days until expiration",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "tlschecker_days_before_expired * on(instance) group_left() tlschecker_certificate_info{issuer=~\"$issuer\"}", "legendFormat": "{{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "d",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "showPoints": "auto", "thresholdsStyle": { "mode": "dashed" } },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 15 }, { "color": "green", "value": 30 } ] }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "min"] }, "tooltip": { "mode": "multi", "sort": "asc" } }
+    },
+    {
+      "type": "bargauge",
+      "title": "TLS grade score by host",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "instant": true, "expr": "tlschecker_grade_score * on(instance) group_left() tlschecker_certificate_info{issuer=~\"$issuer\"}", "legendFormat": "{{instance}}" }
+      ],
+      "options": { "orientation": "horizontal", "displayMode": "gradient", "showUnfilled": true, "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none", "min": 0, "max": 100,
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 50 }, { "color": "yellow", "value": 70 }, { "color": "green", "value": 80 } ] }
+        }
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Revocation status over time",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "tlschecker_revocation_status * on(instance) group_left() tlschecker_certificate_info{issuer=~\"$issuer\"}", "legendFormat": "{{instance}}" }
+      ],
+      "options": { "showValue": "auto", "mergeValues": true, "legend": { "displayMode": "list", "placement": "bottom" } },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 80, "lineWidth": 0 },
+          "mappings": [ { "type": "value", "options": { "0": { "text": "Not checked", "color": "super-light-blue" }, "1": { "text": "Good", "color": "green" }, "2": { "text": "Unknown", "color": "yellow" }, "3": { "text": "Revoked", "color": "red" } } } ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null } ] }
+        }
+      }
+    }
+  ]
+}
