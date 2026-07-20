@@ -1,6 +1,6 @@
 [package]
 name = "tlschecker"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 rust-version = "1.88.0"                                                    # MSRV (required by ratatui 0.30)
 description = "Experimental TLS/SSL certificate checker from command line"
