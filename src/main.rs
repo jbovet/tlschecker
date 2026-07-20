@@ -338,6 +338,20 @@ impl Formatter for TextFormat {
                 cert.cert_key_algorithm, cert.cert_key_bits
             )
             .unwrap();
+            if !cert.ocsp_urls.is_empty() {
+                writeln!(output, "OCSP responders: {}", cert.ocsp_urls.join(", ")).unwrap();
+            }
+            if !cert.ca_issuer_urls.is_empty() {
+                writeln!(output, "CA Issuers: {}", cert.ca_issuer_urls.join(", ")).unwrap();
+            }
+            if !cert.crl_urls.is_empty() {
+                writeln!(
+                    output,
+                    "CRL distribution points: {}",
+                    cert.crl_urls.join(", ")
+                )
+                .unwrap();
+            }
             writeln!(
                 output,
                 "Cipher suite: {} ({}-bit)",
@@ -1658,6 +1672,9 @@ pub(crate) mod tests {
                 ext_key_usage: vec!["serverAuth".to_string()],
                 is_ca: false,
                 path_len: None,
+                ocsp_urls: vec!["http://ocsp.example.com".to_string()],
+                ca_issuer_urls: vec!["http://i.example.com/ca.crt".to_string()],
+                crl_urls: vec!["http://c.example.com/ca.crl".to_string()],
                 scts: Vec::new(),
                 pem: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n".to_string(),
             },
@@ -1778,6 +1795,26 @@ pub(crate) mod tests {
         let output = TextFormat.format(&[make_test_tls()]);
         assert!(output.contains("SHA-256 Fingerprint: AB:CD:EF"));
         assert!(output.contains("SHA-1 Fingerprint: 12:34:56"));
+    }
+
+    #[test]
+    fn test_text_format_includes_issuer_and_revocation_urls() {
+        let output = TextFormat.format(&[make_test_tls()]);
+        assert!(output.contains("OCSP responders: http://ocsp.example.com"));
+        assert!(output.contains("CA Issuers: http://i.example.com/ca.crt"));
+        assert!(output.contains("CRL distribution points: http://c.example.com/ca.crl"));
+    }
+
+    #[test]
+    fn test_text_format_omits_url_lines_when_absent() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.ocsp_urls.clear();
+        tls_entry.certificate.ca_issuer_urls.clear();
+        tls_entry.certificate.crl_urls.clear();
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(!output.contains("OCSP responders:"));
+        assert!(!output.contains("CA Issuers:"));
+        assert!(!output.contains("CRL distribution points:"));
     }
 
     #[test]

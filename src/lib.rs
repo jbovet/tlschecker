@@ -213,7 +213,8 @@ pub struct CertificateInfo {
     pub validity_hours: i32,
     /// Whether the certificate has expired
     pub is_expired: bool,
-    /// Certificate serial number
+    /// Certificate serial number as colon-separated uppercase hex (the form
+    /// CAs, browsers, and `openssl x509 -text` all use)
     pub cert_sn: String,
     /// Certificate version (typically "2" for v3 certificates)
     pub cert_ver: String,
@@ -263,6 +264,16 @@ pub struct CertificateInfo {
     /// Basic Constraints path-length constraint, if present
     #[serde(default)]
     pub path_len: Option<u32>,
+    /// OCSP responder URLs from the Authority Information Access extension
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ocsp_urls: Vec<String>,
+    /// CA Issuers URLs (where the issuer certificate can be fetched) from the
+    /// Authority Information Access extension
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ca_issuer_urls: Vec<String>,
+    /// CRL distribution point URLs from the CRL Distribution Points extension
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crl_urls: Vec<String>,
     /// Signed Certificate Timestamps embedded in the leaf (offline proof the
     /// certificate was submitted to CT logs). Empty when none are present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1124,11 +1135,12 @@ pub fn check_crl_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus,
         None => return Ok(RevocationStatus::Unknown), // Can't verify without issuer
     };
 
-    // Get CRL distribution points from the certificate
-    let crl_dps = match cert.crl_distribution_points() {
-        Some(dps) if !dps.is_empty() => dps,
-        _ => return Ok(RevocationStatus::Unknown), // No CRL distribution points found
-    };
+    // Get CRL distribution point URLs from the certificate. Same helper the
+    // reported `crl_urls` come from, so what we display is what we fetch.
+    let crl_dp_urls = crl_urls(cert);
+    if crl_dp_urls.is_empty() {
+        return Ok(RevocationStatus::Unknown); // No CRL distribution points found
+    }
 
     // Create a store for verification
     let mut store_builder = match X509StoreBuilder::new() {
@@ -1142,27 +1154,7 @@ pub fn check_crl_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus,
     }
 
     // Try each CRL distribution point
-    for dp in crl_dps.iter() {
-        // Extract the CRL URL
-        let uri = match dp.distpoint().and_then(|dp_nm| dp_nm.fullname()) {
-            Some(fullname) => {
-                let mut uri = None;
-                for name in fullname.iter() {
-                    if let Some(url) = name.uri() {
-                        uri = Some(url);
-                        break;
-                    }
-                }
-                uri
-            }
-            None => None,
-        };
-
-        let crl_url = match uri {
-            Some(url) => url,
-            None => continue, // No URI found, try next DP
-        };
-
+    for crl_url in &crl_dp_urls {
         // Download the CRL
         let client = match reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -1510,6 +1502,9 @@ impl TLS {
             ext_key_usage: data.ext_key_usage,
             is_ca: data.is_ca,
             path_len: data.path_len,
+            ocsp_urls: data.ocsp_urls,
+            ca_issuer_urls: data.ca_issuer_urls,
+            crl_urls: data.crl_urls,
             scts: data.scts,
             pem,
         };
@@ -1694,11 +1689,7 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         validity_days: get_validity_days(cert_ref.not_after()),
         validity_hours: get_validity_in_hours(cert_ref.not_after()),
         is_expired: has_expired(cert_ref.not_after()),
-        cert_sn: cert_ref
-            .serial_number()
-            .to_bn()
-            .map(|bn| bn.to_string())
-            .unwrap_or_else(|_| "Unknown".to_string()),
+        cert_sn: serial_hex(cert_ref),
         cert_ver: cert_ref.version().to_string(),
         cert_alg: cert_ref.signature_algorithm().object().to_string(),
         sans,
@@ -1722,6 +1713,18 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         ext_key_usage: usage.ext_key_usage,
         is_ca: usage.is_ca,
         path_len: cert_ref.pathlen(),
+        ocsp_urls: cert_ref
+            .ocsp_responders()
+            .map(|responders| {
+                responders
+                    .iter()
+                    .filter_map(|r| std::str::from_utf8(r.as_ref()).ok())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ca_issuer_urls: certext::ca_issuer_urls(cert_ref),
+        crl_urls: crl_urls(cert_ref),
         scts: sct::embedded_scts(cert_ref),
         pem: String::new(),
     }
@@ -1737,6 +1740,63 @@ fn fingerprint(cert_ref: &X509, digest: openssl::hash::MessageDigest) -> String 
         Ok(bytes) => bytes_to_hex_colon(&bytes),
         Err(_) => String::new(),
     }
+}
+
+/// Formats a certificate's serial number as colon-separated uppercase hex.
+///
+/// Serial numbers are conventionally displayed in hex (`F4:4A:01:...`) rather
+/// than as the decimal value of the ASN.1 INTEGER, so this matches what a CA
+/// portal, a browser's certificate viewer, or `openssl x509 -text` will show.
+/// A serial of zero renders as `00`. Negative serials — malformed per RFC 5280
+/// §4.1.2.2, but this is a diagnostic tool that surfaces non-conformant certs
+/// rather than normalizing them — are prefixed with `-`, since `BigNum::to_vec`
+/// returns only the magnitude bytes.
+fn serial_hex(cert_ref: &X509) -> String {
+    match cert_ref.serial_number().to_bn() {
+        Ok(bn) => {
+            let bytes = bn.to_vec();
+            if bytes.is_empty() {
+                "00".to_string()
+            } else {
+                let hex = bytes_to_hex_colon(&bytes);
+                if bn.is_negative() {
+                    format!("-{}", hex)
+                } else {
+                    hex
+                }
+            }
+        }
+        Err(_) => "Unknown".to_string(),
+    }
+}
+
+/// Collects every URI carried in the certificate's CRL Distribution Points
+/// extension, across all distribution points.
+///
+/// Returns an empty vector when the extension is absent or carries no URI-form
+/// names — consistent with the best-effort handling used elsewhere in
+/// certificate parsing. Duplicate URIs are collapsed so revocation checks don't
+/// fetch the same CRL twice; the list is tiny, so the linear `contains` scan is
+/// cheaper than a set.
+fn crl_urls(cert_ref: &X509) -> Vec<String> {
+    let mut urls = Vec::new();
+    let Some(dps) = cert_ref.crl_distribution_points() else {
+        return urls;
+    };
+    for dp in dps.iter() {
+        let Some(fullname) = dp.distpoint().and_then(|dp_nm| dp_nm.fullname()) else {
+            continue;
+        };
+        for name in fullname.iter() {
+            if let Some(uri) = name.uri() {
+                let uri = uri.to_string();
+                if !urls.contains(&uri) {
+                    urls.push(uri);
+                }
+            }
+        }
+    }
+    urls
 }
 
 /// Formats bytes as colon-separated uppercase hex (e.g. `AB:CD:EF`), the
@@ -1957,6 +2017,9 @@ mod tests {
                 ext_key_usage: vec!["serverAuth".to_string()],
                 is_ca: false,
                 path_len: None,
+                ocsp_urls: vec![],
+                ca_issuer_urls: vec![],
+                crl_urls: vec![],
                 scts: Vec::new(),
                 pem: String::new(),
             },
@@ -2611,6 +2674,155 @@ mod tests {
         builder.sign(&pkey, MessageDigest::sha256()).unwrap();
 
         (builder.build(), pkey)
+    }
+
+    /// Builds a self-signed cert with a caller-chosen serial number, so serial
+    /// formatting can be asserted against a known value.
+    fn make_test_x509_with_serial(serial_hex_str: &str) -> X509 {
+        let pkey = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "serial.example.com")
+            .unwrap();
+        let name = name.build();
+
+        let serial = BigNum::from_hex_str(serial_hex_str).unwrap();
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+            .unwrap();
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+        builder.build()
+    }
+
+    /// Wraps URIs into a DER `CRLDistributionPoints` value:
+    /// `SEQUENCE OF DistributionPoint { [0] { [0] { [6] IA5String } } }`.
+    /// Only short (<128 byte) elements are emitted, which every test URL is.
+    fn crl_dp_der(urls: &[&str]) -> Vec<u8> {
+        let mut dps = Vec::new();
+        for url in urls {
+            let name = [&[0x86, url.len() as u8], url.as_bytes()].concat();
+            let full_name = [&[0xA0, name.len() as u8], name.as_slice()].concat();
+            let dpn = [&[0xA0, full_name.len() as u8], full_name.as_slice()].concat();
+            dps.extend([0x30, dpn.len() as u8]);
+            dps.extend(dpn);
+        }
+        [&[0x30, dps.len() as u8], dps.as_slice()].concat()
+    }
+
+    /// Builds a self-signed cert carrying a CRL Distribution Points extension
+    /// for the given URLs (none when `urls` is empty).
+    fn make_test_x509_with_crl_dps(urls: &[&str]) -> X509 {
+        use openssl::asn1::{Asn1Object, Asn1OctetString};
+        use openssl::x509::X509Extension;
+
+        let pkey = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "crl.example.com")
+            .unwrap();
+        let name = name.build();
+
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+            .unwrap();
+        if !urls.is_empty() {
+            let obj = Asn1Object::from_str("2.5.29.31").unwrap(); // cRLDistributionPoints
+            let value = Asn1OctetString::new_from_bytes(&crl_dp_der(urls)).unwrap();
+            builder
+                .append_extension(X509Extension::new_from_der(&obj, false, &value).unwrap())
+                .unwrap();
+        }
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+        builder.build()
+    }
+
+    #[test]
+    fn test_serial_hex_uses_colon_separated_uppercase_hex() {
+        // The serial carried by the *.tools.walmartdigital.cl leaf.
+        let cert = make_test_x509_with_serial("F44A01829C08CF4D13D188A939D27103");
+        assert_eq!(
+            super::serial_hex(&cert),
+            "F4:4A:01:82:9C:08:CF:4D:13:D1:88:A9:39:D2:71:03"
+        );
+    }
+
+    #[test]
+    fn test_serial_hex_short_and_zero_serials() {
+        assert_eq!(super::serial_hex(&make_test_x509_with_serial("01")), "01");
+        // A zero serial has no magnitude bytes; it must still render as a byte.
+        assert_eq!(super::serial_hex(&make_test_x509_with_serial("00")), "00");
+    }
+
+    #[test]
+    fn test_serial_hex_negative_serial_keeps_sign() {
+        // Non-conformant per RFC 5280, but the tool inspects rather than
+        // normalizes: the magnitude must not read as a positive serial.
+        let cert = make_test_x509_with_serial("-1A2B");
+        assert_eq!(super::serial_hex(&cert), "-1A:2B");
+    }
+
+    #[test]
+    fn test_crl_urls_collects_every_distribution_point() {
+        let cert = make_test_x509_with_crl_dps(&[
+            "http://c.pki.example/we1/a.crl",
+            "http://c.pki.example/we1/b.crl",
+        ]);
+        assert_eq!(
+            super::crl_urls(&cert),
+            vec![
+                "http://c.pki.example/we1/a.crl".to_string(),
+                "http://c.pki.example/we1/b.crl".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_crl_urls_absent_extension() {
+        assert!(super::crl_urls(&make_test_x509_with_crl_dps(&[])).is_empty());
+    }
+
+    #[test]
+    fn test_crl_urls_deduplicates_repeated_uris() {
+        let cert = make_test_x509_with_crl_dps(&[
+            "http://c.pki.example/we1/a.crl",
+            "http://c.pki.example/we1/a.crl",
+        ]);
+        assert_eq!(
+            super::crl_urls(&cert),
+            vec!["http://c.pki.example/we1/a.crl".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_certificate_info_carries_revocation_urls() {
+        let cert = make_test_x509_with_crl_dps(&["http://c.pki.example/we1/a.crl"]);
+        let info = super::get_certificate_info(&cert);
+        assert_eq!(info.crl_urls, vec!["http://c.pki.example/we1/a.crl"]);
+        // No AIA on this synthetic cert, so both AIA-derived lists stay empty.
+        assert!(info.ocsp_urls.is_empty());
+        assert!(info.ca_issuer_urls.is_empty());
     }
 
     /// Builds a signed CRL whose `nextUpdate` is `next_update_offset_secs`
