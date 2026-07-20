@@ -5,19 +5,28 @@
   "title": "TLSChecker — Certificate Overview",
   "uid": "tlschecker-overview",
   "tags": ["tlschecker", "tls", "certificates"],
-  "timezone": "browser",
+  "timezone": "utc",
   "schemaVersion": 39,
-  "time": { "from": "now-6h", "to": "now" },
-  "refresh": "1m",
+  "time": { "from": "now-90d", "to": "now" },
+  "refresh": "15m",
   "templating": {
     "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      },
       {
         "name": "issuer",
         "label": "Issuer",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "query": "label_values(tlschecker_certificate_info, issuer)",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(tlschecker_certificate_info{job=\"tlschecker\"}, issuer)",
         "includeAll": true,
+        "allValue": ".*",
         "multi": true,
         "current": { "text": "All", "value": "$__all" },
         "refresh": 2
@@ -26,69 +35,89 @@
   },
   "panels": [
     {
+      "id": 1,
       "type": "stat",
       "title": "Certificates monitored",
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "expr": "count(tlschecker_certificate_info{issuer=~\"$issuer\"}) or vector(0)", "instant": true }
+        { "refId": "A", "expr": "count(tlschecker_certificate_info{job=\"tlschecker\", issuer=~\"$issuer\"}) or vector(0)", "instant": true }
       ],
       "options": { "colorMode": "value", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "text" }, "unit": "none" } }
     },
     {
+      "id": 2,
       "type": "stat",
-      "title": "Expiring ≤ 30 days",
-      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "title": "Below min-validity SLO",
+      "description": "Certificates under the operator-configured --min-validity threshold (tlschecker_below_min_validity == 1). Reflects your own SLO, not a fixed day count. Always 0 if --min-validity is disabled.",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "expr": "count(tlschecker_days_before_expired{instance=~\".+\"} <= 30 and tlschecker_days_before_expired > 15) or vector(0)", "instant": true }
+        { "refId": "A", "expr": "count(tlschecker_below_min_validity{job=\"tlschecker\"} == 1) or vector(0)", "instant": true }
       ],
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 } ] } } }
     },
     {
+      "id": 3,
       "type": "stat",
       "title": "Critical ≤ 15 days",
-      "gridPos": { "h": 4, "w": 5, "x": 9, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "expr": "count(tlschecker_days_before_expired <= 15 and tlschecker_days_before_expired > 0) or vector(0)", "instant": true }
+        { "refId": "A", "expr": "count(tlschecker_days_before_expired{job=\"tlschecker\"} <= 15 and tlschecker_days_before_expired{job=\"tlschecker\"} > 0) or vector(0)", "instant": true }
       ],
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } } }
     },
     {
+      "id": 4,
       "type": "stat",
       "title": "Expired",
-      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "expr": "count(tlschecker_days_before_expired <= 0) or vector(0)", "instant": true }
+        { "refId": "A", "expr": "count(tlschecker_days_before_expired{job=\"tlschecker\"} <= 0) or vector(0)", "instant": true }
       ],
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } }
     },
     {
+      "id": 5,
       "type": "stat",
       "title": "Revoked",
-      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "expr": "count(tlschecker_revocation_status == 3) or vector(0)", "instant": true }
+        { "refId": "A", "expr": "count(tlschecker_revocation_status{job=\"tlschecker\"} == 3) or vector(0)", "instant": true }
       ],
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } }
     },
     {
+      "id": 6,
+      "type": "stat",
+      "title": "Stale checks",
+      "description": "Hosts whose last successful push to the Pushgateway is older than 36h (tune to ~2x your CronJob interval). A non-zero value means the checker itself may be broken — the other tiles could be showing stale data. Uses the Pushgateway's push_time_seconds, which only advances on a real push.",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "count((time() - max by (instance) (push_time_seconds{job=\"tlschecker\"})) > 129600) or vector(0)", "instant": true }
+      ],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } }
+    },
+    {
+      "id": 7,
       "type": "table",
       "title": "Certificate inventory",
       "gridPos": { "h": 9, "w": 24, "x": 0, "y": 4 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "instant": true, "format": "table", "expr": "tlschecker_grade_score * on(instance) group_left(issuer, grade, cipher, cipher_protocol_version) tlschecker_certificate_info{issuer=~\"$issuer\"}" },
-        { "refId": "B", "instant": true, "format": "table", "expr": "tlschecker_days_before_expired" },
-        { "refId": "C", "instant": true, "format": "table", "expr": "tlschecker_revocation_status" }
+        { "refId": "A", "instant": true, "format": "table", "expr": "tlschecker_grade_score{job=\"tlschecker\"} * on(instance) group_left(issuer, grade, cipher, cipher_protocol_version) tlschecker_certificate_info{job=\"tlschecker\", issuer=~\"$issuer\"}" },
+        { "refId": "B", "instant": true, "format": "table", "expr": "tlschecker_days_before_expired{job=\"tlschecker\"}" },
+        { "refId": "C", "instant": true, "format": "table", "expr": "tlschecker_revocation_status{job=\"tlschecker\"}" }
       ],
       "transformations": [
         { "id": "joinByField", "options": { "byField": "instance", "mode": "outer" } },
@@ -129,12 +158,13 @@
       }
     },
     {
+      "id": 8,
       "type": "timeseries",
       "title": "Days until expiration",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "expr": "tlschecker_days_before_expired * on(instance) group_left() tlschecker_certificate_info{issuer=~\"$issuer\"}", "legendFormat": "{{instance}}" }
+        { "refId": "A", "expr": "tlschecker_days_before_expired{job=\"tlschecker\"} * on(instance) group_left() tlschecker_certificate_info{job=\"tlschecker\", issuer=~\"$issuer\"}", "legendFormat": "{{instance}}" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -146,12 +176,13 @@
       "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "min"] }, "tooltip": { "mode": "multi", "sort": "asc" } }
     },
     {
+      "id": 9,
       "type": "bargauge",
       "title": "TLS grade score by host",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "instant": true, "expr": "tlschecker_grade_score * on(instance) group_left() tlschecker_certificate_info{issuer=~\"$issuer\"}", "legendFormat": "{{instance}}" }
+        { "refId": "A", "instant": true, "expr": "tlschecker_grade_score{job=\"tlschecker\"} * on(instance) group_left() tlschecker_certificate_info{job=\"tlschecker\", issuer=~\"$issuer\"}", "legendFormat": "{{instance}}" }
       ],
       "options": { "orientation": "horizontal", "displayMode": "gradient", "showUnfilled": true, "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": {
@@ -162,12 +193,13 @@
       }
     },
     {
+      "id": 10,
       "type": "state-timeline",
       "title": "Revocation status over time",
       "gridPos": { "h": 7, "w": 24, "x": 0, "y": 21 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
-        { "refId": "A", "expr": "tlschecker_revocation_status * on(instance) group_left() tlschecker_certificate_info{issuer=~\"$issuer\"}", "legendFormat": "{{instance}}" }
+        { "refId": "A", "expr": "tlschecker_revocation_status{job=\"tlschecker\"} * on(instance) group_left() tlschecker_certificate_info{job=\"tlschecker\", issuer=~\"$issuer\"}", "legendFormat": "{{instance}}" }
       ],
       "options": { "showValue": "auto", "mergeValues": true, "legend": { "displayMode": "list", "placement": "bottom" } },
       "fieldConfig": {
@@ -176,6 +208,40 @@
           "mappings": [ { "type": "value", "options": { "0": { "text": "Not checked", "color": "super-light-blue" }, "1": { "text": "Good", "color": "green" }, "2": { "text": "Unknown", "color": "yellow" }, "3": { "text": "Revoked", "color": "red" } } } ],
           "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null } ] }
         }
+      }
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Freshness — time since last successful check",
+      "description": "Per-host age of the last push to the Pushgateway (time() - push_time_seconds). Red past 36h means the checker has likely stopped running and every other panel may be showing stale data.",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "instant": true, "format": "table", "expr": "time() - max by (instance) (push_time_seconds{job=\"tlschecker\"})" }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true },
+            "indexByName": { "instance": 0, "Value": 1 },
+            "renameByName": { "instance": "Host", "Value": "Last check age" }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Last check age" },
+            "properties": [
+              { "id": "unit", "value": "s" },
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 90000 }, { "color": "red", "value": 129600 } ] } }
+            ]
+          }
+        ]
       }
     }
   ]
