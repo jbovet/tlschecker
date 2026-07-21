@@ -15,8 +15,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
+    - name: rustfmt
+      run: cargo fmt --all -- --check
     - name: clippy
-      run: cargo clippy --verbose
+      run: cargo clippy --all-targets --verbose -- -D warnings
     - name: Build
       run: cargo build --verbose
     - name: Run tests
