@@ -42,7 +42,7 @@ jobs:
       - name: Coverage summary
         run: cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
       - name: Upload lcov report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-lcov
           path: lcov.info
