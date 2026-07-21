@@ -1,0 +1,49 @@
+name: Integration & Coverage
+
+# Network integration tests hit real external hosts (google.com, *.badssl.com,
+# digicert.com), so they are kept OFF the pull-request path — a flaky responder
+# must never block a merge. They run on a weekly schedule and on demand.
+# Coverage measures the offline suite (deterministic) on push/PR.
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The 21 `#[ignore]` tests that connect to live TLS/OCSP/CRL/CT endpoints.
+  # Only runs on the schedule or a manual dispatch, never on PRs.
+  network-tests:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run ignored (network) tests
+        run: cargo test --verbose -- --ignored
+
+  # Line coverage of the offline test suite, uploaded as an artifact and
+  # summarized in the job log. No external coverage service required.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate coverage (offline tests)
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Coverage summary
+        run: cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload lcov report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error

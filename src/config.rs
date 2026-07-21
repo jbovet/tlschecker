@@ -623,4 +623,62 @@ mod tests {
         let parsed: Config = toml::from_str(&example).unwrap();
         assert_eq!(parsed.min_validity, Some(30));
     }
+
+    /// Collect every leaf key-path (e.g. `prometheus.address`) from a TOML
+    /// document, so two schemas can be compared by the options they expose.
+    fn toml_key_paths(doc: &str) -> std::collections::BTreeSet<String> {
+        fn walk(value: &toml::Value, prefix: &str, out: &mut std::collections::BTreeSet<String>) {
+            if let toml::Value::Table(table) = value {
+                for (key, child) in table {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    out.insert(path.clone());
+                    walk(child, &path, out);
+                }
+            }
+        }
+
+        let mut out = std::collections::BTreeSet::new();
+        let value: toml::Value = toml::from_str(doc).expect("valid TOML");
+        walk(&value, "", &mut out);
+        out
+    }
+
+    /// Guards the "keep the canonical example in sync with the schema" contract
+    /// noted in CLAUDE.md. `example_toml()` builds a full `Config` struct literal,
+    /// so the compiler already forces every field to be *listed* — but a future
+    /// `Option` field set to `None` would compile fine yet silently drop out of
+    /// the generated TOML (and thus out of `--generate-config`). This asserts the
+    /// example demonstrates every option the schema can express.
+    #[test]
+    fn test_example_toml_documents_every_config_field() {
+        // A fully-populated Config. Adding a field to `Config`/`PrometheusConfig`
+        // forces a value here (struct literals require every field), so this
+        // reference can't silently fall behind the schema.
+        let fully_populated = Config {
+            hosts: Some(vec!["example.com".to_string()]),
+            output: Some("summary".to_string()),
+            exit_code: Some(1),
+            check_revocation: Some(true),
+            prometheus: Some(PrometheusConfig {
+                enabled: Some(true),
+                address: Some("http://localhost:9091".to_string()),
+            }),
+            grade: Some(true),
+            min_validity: Some(30),
+        };
+
+        let expected = toml_key_paths(&toml::to_string(&fully_populated).unwrap());
+        let example = toml_key_paths(&Config::example_toml());
+
+        let missing: Vec<&String> = expected.difference(&example).collect();
+        assert!(
+            missing.is_empty(),
+            "Config::example_toml() omits config keys {missing:?}; every option must \
+             appear so `--generate-config` never ships an incomplete template."
+        );
+    }
 }
