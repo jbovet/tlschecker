@@ -49,4 +49,6 @@ doc = true
 required-features = ["tui"]
 
 [dev-dependencies]
-openssl = "0.10.81"
+# Keep `vendored` in sync with the main dependency so tests build against the
+# same compiled-in OpenSSL rather than an inconsistent system library.
+openssl = { version = "0.10.81", features = ["vendored"] }

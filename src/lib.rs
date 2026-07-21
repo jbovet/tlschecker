@@ -2156,17 +2156,14 @@ mod tests {
                 match tls_result.certificate.revocation_status {
                     RevocationStatus::Revoked(_) => {
                         // This is the expected result
-                        assert!(true);
                     }
                     RevocationStatus::Unknown => {
                         // This is acceptable if the OCSP responder is unavailable
                         println!("Warning: revoked.badssl.com showed as Unknown, not Revoked. OCSP responder may be unavailable.");
-                        assert!(true);
                     }
                     status => {
                         // Any other status would be unexpected
-                        assert!(
-                            false,
+                        panic!(
                             "Expected Revoked or Unknown status for revoked.badssl.com, got {:?}",
                             status
                         );
@@ -2212,26 +2209,20 @@ mod tests {
                 match tls_result.certificate.revocation_status {
                     RevocationStatus::Good | RevocationStatus::Unknown => {
                         // Either is acceptable since external services might be unreliable
-                        assert!(true);
                     }
                     RevocationStatus::Revoked(_) => {
                         // This would be unexpected for google.com - log it
                         println!("Unexpected RevocationStatus::Revoked for google.com");
-                        assert!(true);
                     }
                     RevocationStatus::NotChecked => {
                         // This should not happen since we requested checking
-                        assert!(
-                            false,
-                            "Revocation status should not be NotChecked when enabled"
-                        );
+                        panic!("Revocation status should not be NotChecked when enabled");
                     }
                 }
             }
             Err(e) => {
                 // Connection error - this is unexpected but could happen
                 println!("Connection error to google.com: {}", e);
-                assert!(true);
             }
         }
     }
@@ -2250,21 +2241,16 @@ mod tests {
                     | RevocationStatus::Unknown
                     | RevocationStatus::Revoked(_) => {
                         // Any of these is acceptable
-                        assert!(true);
                     }
                     RevocationStatus::NotChecked => {
                         // This should not happen since we requested checking
-                        assert!(
-                            false,
-                            "Revocation status should not be NotChecked when enabled"
-                        );
+                        panic!("Revocation status should not be NotChecked when enabled");
                     }
                 }
             }
             Err(e) => {
                 // Connection error - this is unexpected but could happen
                 println!("Connection error to digicert.com: {}", e);
-                assert!(true);
             }
         }
     }
@@ -2283,17 +2269,14 @@ mod tests {
                 match tls_result.certificate.revocation_status {
                     RevocationStatus::Revoked(_) => {
                         // This is the expected result
-                        assert!(true);
                     }
                     RevocationStatus::Unknown => {
                         // This is acceptable if the revocation services are unavailable
                         println!("Warning: revoked.badssl.com showed as Unknown, not Revoked");
-                        assert!(true);
                     }
                     status => {
                         // Any other status would be unexpected
-                        assert!(
-                            false,
+                        panic!(
                             "Expected Revoked or Unknown status for revoked.badssl.com, got {:?}",
                             status
                         );
@@ -3039,7 +3022,7 @@ mod tests {
         let (other, _) = make_test_ca("Unrelated Root");
         let store = make_store(&[&other]);
 
-        let status = super::validate_trust_with_store(&store, &leaf, &[leaf.clone()]);
+        let status = super::validate_trust_with_store(&store, &leaf, std::slice::from_ref(&leaf));
         match status {
             TrustStatus::Untrusted { reason } => {
                 assert!(
@@ -3490,7 +3473,7 @@ mod tests {
         let ordered = vec![leaf.clone(), ca_cert.clone()];
         assert!(super::is_chain_well_ordered(&ordered));
         // Single-element and empty chains are trivially ordered.
-        assert!(super::is_chain_well_ordered(&[leaf.clone()]));
+        assert!(super::is_chain_well_ordered(std::slice::from_ref(&leaf)));
         assert!(super::is_chain_well_ordered(&[]));
     }
 
