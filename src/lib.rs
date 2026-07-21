@@ -3039,7 +3039,7 @@ mod tests {
         let (other, _) = make_test_ca("Unrelated Root");
         let store = make_store(&[&other]);
 
-        let status = super::validate_trust_with_store(&store, &leaf, &[leaf.clone()]);
+        let status = super::validate_trust_with_store(&store, &leaf, std::slice::from_ref(&leaf));
         match status {
             TrustStatus::Untrusted { reason } => {
                 assert!(
@@ -3490,7 +3490,7 @@ mod tests {
         let ordered = vec![leaf.clone(), ca_cert.clone()];
         assert!(super::is_chain_well_ordered(&ordered));
         // Single-element and empty chains are trivially ordered.
-        assert!(super::is_chain_well_ordered(&[leaf.clone()]));
+        assert!(super::is_chain_well_ordered(std::slice::from_ref(&leaf)));
         assert!(super::is_chain_well_ordered(&[]));
     }
 

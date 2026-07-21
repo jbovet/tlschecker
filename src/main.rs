@@ -2112,7 +2112,7 @@ pub(crate) mod tests {
         let mut tls = make_test_tls();
         tls.certificate.validity_days = 20;
         tls.certificate.is_expired = false;
-        let results = vec![tls];
+        let results = [tls];
 
         let min_validity = 30;
         let below = results
@@ -2125,7 +2125,7 @@ pub(crate) mod tests {
     fn test_min_validity_above_threshold_no_failure() {
         // Cert with 365 days left, threshold 30 → should be above min validity
         let tls = make_test_tls(); // validity_days = 365
-        let results = vec![tls];
+        let results = [tls];
 
         let min_validity = 30;
         let below = results
@@ -2140,7 +2140,7 @@ pub(crate) mod tests {
         let mut tls = make_test_tls();
         tls.certificate.validity_days = 30;
         tls.certificate.is_expired = false;
-        let results = vec![tls];
+        let results = [tls];
 
         let min_validity = 30;
         let below = results
@@ -2155,7 +2155,7 @@ pub(crate) mod tests {
         let mut tls = make_test_tls();
         tls.certificate.validity_days = 5;
         tls.certificate.is_expired = false;
-        let results = vec![tls];
+        let results = [tls];
 
         let min_validity = 0;
         // The exit logic only checks when min_validity > 0
@@ -2177,7 +2177,7 @@ pub(crate) mod tests {
         let mut tls = make_test_tls();
         tls.certificate.validity_days = -10;
         tls.certificate.is_expired = true;
-        let results = vec![tls];
+        let results = [tls];
 
         let min_validity = 30;
         let below = results
@@ -2193,7 +2193,7 @@ pub(crate) mod tests {
         let mut tls_expiring = make_test_tls();
         tls_expiring.certificate.validity_days = 10;
         tls_expiring.certificate.is_expired = false;
-        let results = vec![tls_healthy, tls_expiring];
+        let results = [tls_healthy, tls_expiring];
 
         let min_validity = 30;
         let below = results
