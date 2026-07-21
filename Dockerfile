@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.25
 FROM rust:1.97-slim-bookworm AS build
 WORKDIR /src
 
