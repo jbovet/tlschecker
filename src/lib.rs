@@ -33,7 +33,8 @@ pub mod probe;
 pub mod sct;
 
 use std::fmt::Debug;
-use std::time::Duration;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
 
 use openssl::asn1::{Asn1Time, Asn1TimeRef};
 use openssl::error::ErrorStack;
@@ -46,7 +47,10 @@ use thiserror::Error;
 use tracing::{instrument, warn};
 
 /// Default timeout for TLS connection attempts (30 seconds).
-static TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Used by [`TLS::from`]; callers that need a different budget go through
+/// [`TLS::from_with_timeout`].
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Revocation Status
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -1268,17 +1272,133 @@ fn is_crl_fresh(crl: &X509Crl, source: &str) -> bool {
     }
 }
 
+/// Resolves `host:port` and returns every address DNS reports, in resolution
+/// order.
+///
+/// Resolution is done through the `(host, port)` tuple rather than a
+/// `"{host}:{port}"` string so IPv6 literals (e.g. `::1`) work without bracket
+/// syntax.
+fn resolve_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, TLSError> {
+    let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(TLSError::DNS(format!(
+            "No addresses resolved for '{}'",
+            host
+        )));
+    }
+    Ok(addrs)
+}
+
+/// Connects to the first address in `addrs` that accepts, within a total
+/// `timeout` budget shared across all attempts.
+///
+/// A hostname commonly resolves to several addresses — an A and a AAAA record,
+/// or a pool of load-balanced servers. Trying only the first makes a check fail
+/// whenever that single address is unreachable even though the host is happily
+/// serving on another, which is exactly what happens on an IPv4-only network
+/// whose resolver still returns the AAAA record first.
+///
+/// The `timeout` is the budget for the *whole* connect phase, not per address:
+/// that keeps the worst case bounded at the value the caller asked for no
+/// matter how many addresses DNS returns, which matters because each check
+/// occupies a worker thread. This costs nothing in the case that motivates
+/// trying several addresses — an unroutable address family or a refused
+/// connection fails immediately rather than burning the budget — while a
+/// genuinely blackholed first address will still consume it.
+///
+/// Returns the last connection error when every address fails, so the reported
+/// reason describes an actual attempt rather than a synthesized message.
+fn connect_first_available(addrs: &[SocketAddr], timeout: Duration) -> Result<TcpStream, TLSError> {
+    let deadline = Instant::now() + timeout;
+    let mut last_err: Option<std::io::Error> = None;
+
+    for addr in addrs {
+        // `connect_timeout` rejects a zero duration, and no budget left means
+        // there is nothing useful to do anyway.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(addr, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                if addrs.len() > 1 {
+                    warn!(
+                        "Connection to {} failed: {}; trying next address",
+                        addr, err
+                    );
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+
+    Err(match last_err {
+        Some(err) => TLSError::Connection(err),
+        // Only reachable when the budget was already spent before the first
+        // attempt, so no attempt ever produced an error.
+        None => TLSError::Connection(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "connection timed out before any address could be tried",
+        )),
+    })
+}
+
 impl TLS {
-    #[instrument]
+    /// Establishes a TLS connection and inspects the presented certificate,
+    /// using the default 30-second connection budget.
+    ///
+    /// See [`TLS::from_with_timeout`] for the full description; this is that
+    /// function with [`DEFAULT_TIMEOUT`].
     pub fn from(
         host: &str,
         port: Option<u16>,
         check_revocation: bool,
         calculate_grade: bool,
     ) -> Result<TLS, TLSError> {
+        TLS::from_with_timeout(
+            host,
+            port,
+            check_revocation,
+            calculate_grade,
+            DEFAULT_TIMEOUT,
+        )
+    }
+
+    /// Establishes a TLS connection and inspects the presented certificate,
+    /// bounding the connect phase by `timeout`.
+    ///
+    /// `timeout` is the budget for connecting (shared across every address the
+    /// hostname resolves to — see [`connect_first_available`]) and is also
+    /// applied as the socket read timeout, so a server that accepts the TCP
+    /// connection but never completes the handshake cannot block indefinitely.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use tlschecker::TLS;
+    ///
+    /// let result = TLS::from_with_timeout(
+    ///     "example.com",
+    ///     None,
+    ///     false,
+    ///     false,
+    ///     Duration::from_secs(5),
+    /// )?;
+    /// println!("Expires in {} days", result.certificate.validity_days);
+    /// # Ok::<(), tlschecker::TLSError>(())
+    /// ```
+    #[instrument]
+    pub fn from_with_timeout(
+        host: &str,
+        port: Option<u16>,
+        check_revocation: bool,
+        calculate_grade: bool,
+        timeout: Duration,
+    ) -> Result<TLS, TLSError> {
         use openssl::nid::Nid;
         use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
-        use std::net::{TcpStream, ToSocketAddrs};
 
         // Trim any whitespace, and strip brackets that wrap IPv6 literals
         // (e.g. "[::1]" -> "::1") so address resolution and hostname matching
@@ -1307,16 +1427,12 @@ impl TLS {
 
         // Use the provided port or default to 443
         let port = port.unwrap_or(443);
-        // Resolve via the (host, port) tuple rather than "{host}:{port}" so IPv6
-        // literals (e.g. "::1") work without bracket syntax.
-        let socket_addr = (host, port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| TLSError::DNS("Failed parse remote hostname".to_string()))?;
+        // Try every resolved address rather than only the first, so a host that
+        // is up on one of its addresses is not reported as unreachable.
+        let addrs = resolve_addrs(host, port)?;
+        let tcp_stream = connect_first_available(&addrs, timeout)?;
 
-        let tcp_stream = TcpStream::connect_timeout(&socket_addr, TIMEOUT)?;
-
-        tcp_stream.set_read_timeout(Some(TIMEOUT))?;
+        tcp_stream.set_read_timeout(Some(timeout))?;
         let stream = connector.connect(tcp_stream)?;
 
         // `Ssl` object associated with this stream
@@ -1952,9 +2068,94 @@ mod tests {
     use crate::grading;
     use crate::probe::ProtoVersion;
     use crate::{
-        CertificateInfo, Chain, Cipher, Issuer, RevocationStatus, SecurityWarning, Subject,
-        TLSError, TrustStatus, TLS,
+        connect_first_available, resolve_addrs, CertificateInfo, Chain, Cipher, Issuer,
+        RevocationStatus, SecurityWarning, Subject, TLSError, TrustStatus, TLS,
     };
+    use std::net::{SocketAddr, TcpListener};
+    use std::time::Duration;
+
+    /// Binds a loopback listener and returns it with its address. The listener
+    /// is never accepted from; the kernel backlog is enough for a connect to
+    /// succeed, which is all these tests need.
+    fn live_addr() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        (listener, addr)
+    }
+
+    /// Returns a loopback address with nothing listening on it, by binding a
+    /// port and immediately releasing it. Connecting there is refused
+    /// immediately rather than timing out, which is the fast-failure case
+    /// multi-address connect relies on.
+    fn dead_addr() -> SocketAddr {
+        let (listener, addr) = live_addr();
+        drop(listener);
+        addr
+    }
+
+    #[test]
+    fn test_resolve_addrs_returns_loopback() {
+        let addrs = resolve_addrs("127.0.0.1", 443).expect("loopback resolves");
+        assert_eq!(addrs, vec!["127.0.0.1:443".parse::<SocketAddr>().unwrap()]);
+    }
+
+    /// Network test: `to_socket_addrs` calls the system resolver, so this is
+    /// gated like the other network tests. It is not merely slow — a resolver
+    /// that hijacks NXDOMAIN (ISP "search assist", captive portals, corporate
+    /// wildcard DNS) answers `.invalid` with a real address and fails the
+    /// assertion, which would make `cargo test` red because of the tester's
+    /// network rather than the code.
+    #[test]
+    #[ignore]
+    fn test_resolve_addrs_unresolvable_host_errors() {
+        // `.invalid` is reserved by RFC 2606 and must never resolve.
+        let err = resolve_addrs("nonexistent.invalid", 443);
+        assert!(err.is_err(), "reserved .invalid TLD must not resolve");
+    }
+
+    #[test]
+    fn test_connect_uses_first_reachable_address() {
+        let (_listener, live) = live_addr();
+        let dead = dead_addr();
+
+        // The reachable address is deliberately last: taking only the first
+        // resolved address (the old behaviour) would fail here.
+        let stream = connect_first_available(&[dead, live], Duration::from_secs(5))
+            .expect("should fall through to the reachable address");
+        assert_eq!(stream.peer_addr().unwrap(), live);
+    }
+
+    #[test]
+    fn test_connect_prefers_earlier_address_when_reachable() {
+        let (_first, first_addr) = live_addr();
+        let (_second, second_addr) = live_addr();
+
+        let stream = connect_first_available(&[first_addr, second_addr], Duration::from_secs(5))
+            .expect("first address is reachable");
+        assert_eq!(
+            stream.peer_addr().unwrap(),
+            first_addr,
+            "resolution order must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_connect_all_addresses_fail_reports_connection_error() {
+        let addrs = [dead_addr(), dead_addr()];
+        let err = connect_first_available(&addrs, Duration::from_secs(5))
+            .expect_err("no address is reachable");
+        assert!(
+            matches!(err, TLSError::Connection(_)),
+            "expected a connection error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_connect_with_no_addresses_errors() {
+        let err = connect_first_available(&[], Duration::from_secs(5))
+            .expect_err("nothing to connect to");
+        assert!(matches!(err, TLSError::Connection(_)));
+    }
 
     /// Creates a synthetic TLS struct for offline testing.
     /// No network connection needed — all fields are populated with realistic data.

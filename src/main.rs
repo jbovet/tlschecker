@@ -3,6 +3,7 @@ use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 mod config;
 mod metrics;
 mod tui;
@@ -120,6 +121,19 @@ struct Args {
     /// --exit-code, so CI pipelines can catch hosts that are down entirely.
     #[arg(long)]
     fail_on_error: bool,
+
+    /// Seconds to spend connecting to each host before giving up [default: 30].
+    ///
+    /// This is the budget for the connect phase of one host — shared across
+    /// every address its hostname resolves to — and is also applied as the
+    /// socket read timeout during the handshake. Lower it to keep a large host
+    /// list moving when some hosts are unreachable; raise it for slow links.
+    ///
+    /// It does NOT bound the whole check: --check-revocation (OCSP/CRL) and
+    /// --ct-check keep their own timeouts, and --scan caps its per-handshake
+    /// wait at 10s since it performs many connections.
+    #[arg(long, value_name = "SECONDS")]
+    connect_timeout: Option<u64>,
 
     /// Look the presented leaf certificate up in public Certificate
     /// Transparency logs (via crt.sh).
@@ -790,6 +804,31 @@ impl FinalConfig {
 /// machine's available parallelism or the number of hosts.
 const MAX_CONCURRENT_CHECKS: usize = 16;
 
+/// Largest accepted `--connect-timeout`. Anything beyond an hour is a typo
+/// rather than an intent, and the value must stay small enough that adding it
+/// to an `Instant` cannot overflow — `Instant + Duration` panics on overflow,
+/// so an unbounded value would crash the worker instead of failing validation.
+const MAX_CONNECT_TIMEOUT_SECS: u64 = 3600;
+
+/// Turns the optional `--connect-timeout` value into a [`Duration`], falling
+/// back to the library default when it was not given.
+///
+/// Both ends are rejected rather than clamped silently. Zero would make every
+/// check fail instantly, which reads as a network outage rather than a
+/// misconfiguration; an out-of-range upper value is a typo worth reporting
+/// (and, left unchecked, would overflow the deadline arithmetic and panic).
+fn resolve_connect_timeout(seconds: Option<u64>) -> Result<Duration, String> {
+    match seconds {
+        None => Ok(tlschecker::DEFAULT_TIMEOUT),
+        Some(0) => Err("--connect-timeout must be at least 1 second".to_string()),
+        Some(secs) if secs > MAX_CONNECT_TIMEOUT_SECS => Err(format!(
+            "--connect-timeout must be at most {} seconds (got {})",
+            MAX_CONNECT_TIMEOUT_SECS, secs
+        )),
+        Some(secs) => Ok(Duration::from_secs(secs)),
+    }
+}
+
 /// Checks a single host: TLS connection plus the optional scan and CT lookup.
 ///
 /// Returns the error unlogged so each frontend can present it its own way:
@@ -797,15 +836,20 @@ const MAX_CONCURRENT_CHECKS: usize = 16;
 fn check_host(host_port: &HostPort, opts: CheckOptions) -> Result<TLS, TLSError> {
     let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
 
-    let mut cert = TLS::from(
+    let mut cert = TLS::from_with_timeout(
         &host_port.host,
         host_port.port,
         opts.check_revocation,
         opts.calculate_grade,
+        opts.connect_timeout,
     )?;
 
     if opts.do_scan {
-        if let Ok(scan) = tlschecker::probe::scan_tls(&host_port.host, host_port.port) {
+        if let Ok(scan) = tlschecker::probe::scan_tls_with_timeout(
+            &host_port.host,
+            host_port.port,
+            opts.connect_timeout,
+        ) {
             // Fold scan-derived warnings into the result and
             // recompute the grade to reflect full posture.
             cert.apply_scan(scan);
@@ -839,6 +883,8 @@ struct CheckOptions {
     calculate_grade: bool,
     do_scan: bool,
     do_ct: bool,
+    /// Budget for the connect phase of a single host (see `--connect-timeout`).
+    connect_timeout: Duration,
 }
 
 /// The result of attempting to check one host.
@@ -1003,7 +1049,16 @@ fn main() -> Result<()> {
         .collect();
     let hosts_len = jobs.len();
 
+    let connect_timeout = match resolve_connect_timeout(cli.connect_timeout) {
+        Ok(timeout) => timeout,
+        Err(msg) => {
+            error!("{}", msg);
+            std::process::exit(1);
+        }
+    };
+
     let opts = CheckOptions {
+        connect_timeout,
         check_revocation: final_config.check_revocation,
         // `--scan` implies `--grade` (the scan is surfaced via the grade), and
         // the dashboard always grades: its detail pane shows the breakdown and
@@ -1290,6 +1345,48 @@ pub(crate) mod tests {
         let hp = parse_host_port("example.com:8443").unwrap();
         assert_eq!(hp.host, "example.com");
         assert_eq!(hp.port, Some(8443));
+    }
+
+    #[test]
+    fn test_resolve_connect_timeout_defaults_when_unset() {
+        assert_eq!(
+            resolve_connect_timeout(None).unwrap(),
+            tlschecker::DEFAULT_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn test_resolve_connect_timeout_uses_supplied_seconds() {
+        assert_eq!(
+            resolve_connect_timeout(Some(5)).unwrap(),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn test_resolve_connect_timeout_rejects_zero() {
+        // Zero would make every check fail instantly and read as an outage.
+        assert!(resolve_connect_timeout(Some(0)).is_err());
+    }
+
+    #[test]
+    fn test_resolve_connect_timeout_accepts_upper_bound() {
+        assert_eq!(
+            resolve_connect_timeout(Some(MAX_CONNECT_TIMEOUT_SECS)).unwrap(),
+            Duration::from_secs(MAX_CONNECT_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn test_resolve_connect_timeout_rejects_above_upper_bound() {
+        assert!(resolve_connect_timeout(Some(MAX_CONNECT_TIMEOUT_SECS + 1)).is_err());
+    }
+
+    #[test]
+    fn test_resolve_connect_timeout_rejects_overflowing_value() {
+        // `Instant + Duration` panics on overflow, so an unbounded value would
+        // crash a worker thread instead of failing validation.
+        assert!(resolve_connect_timeout(Some(u64::MAX)).is_err());
     }
 
     #[test]

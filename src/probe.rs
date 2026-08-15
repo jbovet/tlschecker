@@ -9,7 +9,7 @@
 //! This is opt-in (`--scan`) because it opens many short-lived connections and
 //! is therefore slower than a normal certificate check.
 
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::Duration;
 
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode, SslVersion};
@@ -82,8 +82,12 @@ impl<'de> Deserialize<'de> for ProtoVersion {
     }
 }
 
-/// Per-handshake timeout while probing. Kept short since a scan performs many
-/// connection attempts.
+/// Upper bound on the per-handshake timeout while probing. Kept short since a
+/// scan performs many connection attempts: honouring a long connect timeout for
+/// each of them would make a scan of an unresponsive host take minutes.
+///
+/// A caller-supplied timeout narrows this (see [`scan_tls_with_timeout`]) but
+/// never raises it.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Candidate cipher suites for TLS 1.2 and below, including a few deliberately
@@ -161,6 +165,7 @@ fn try_handshake(
     version: SslVersion,
     cipher_list: Option<&str>,
     ciphersuites: Option<&str>,
+    timeout: Duration,
 ) -> Option<String> {
     let mut ctx = SslContext::builder(SslMethod::tls()).ok()?;
     ctx.set_verify(SslVerifyMode::empty());
@@ -180,9 +185,9 @@ fn try_handshake(
     let mut ssl = Ssl::new(&ctx).ok()?;
     ssl.set_hostname(host).ok()?;
 
-    let tcp = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
-    tcp.set_read_timeout(Some(PROBE_TIMEOUT)).ok()?;
-    tcp.set_write_timeout(Some(PROBE_TIMEOUT)).ok()?;
+    let tcp = TcpStream::connect_timeout(&addr, timeout).ok()?;
+    tcp.set_read_timeout(Some(timeout)).ok()?;
+    tcp.set_write_timeout(Some(timeout)).ok()?;
 
     let stream = ssl.connect(tcp).ok()?;
     stream.ssl().current_cipher().map(|c| c.name().to_string())
@@ -204,8 +209,23 @@ fn try_handshake(
 /// A [`TlsScan`] describing per-version support, [`TLSError::Validation`] if
 /// the hostname is empty, or a connection/DNS error when the host does not
 /// resolve.
-#[instrument]
 pub fn scan_tls(host: &str, port: Option<u16>) -> Result<TlsScan, TLSError> {
+    scan_tls_with_timeout(host, port, PROBE_TIMEOUT)
+}
+
+/// [`scan_tls`] with a caller-supplied per-handshake timeout.
+///
+/// The timeout is capped at [`PROBE_TIMEOUT`]: a scan issues on the order of a
+/// hundred handshakes, so a long connect budget that is reasonable for a single
+/// check would make a scan of a black-holed host take minutes. Lowering the
+/// timeout below the cap does take effect, which is how `--timeout` speeds up
+/// scans of hosts known to be fast.
+#[instrument]
+pub fn scan_tls_with_timeout(
+    host: &str,
+    port: Option<u16>,
+    timeout: Duration,
+) -> Result<TlsScan, TLSError> {
     // Strip IPv6 brackets so "[::1]" resolves like the bare "::1", and
     // convert IDN hostnames to their ASCII form for resolution.
     let host = crate::to_ascii_hostname(crate::unbracket_host(host.trim()));
@@ -214,27 +234,30 @@ pub fn scan_tls(host: &str, port: Option<u16>) -> Result<TlsScan, TLSError> {
         return Err(TLSError::Validation("Hostname cannot be empty".to_string()));
     }
     let port = port.unwrap_or(443);
+    let timeout = timeout.min(PROBE_TIMEOUT);
 
-    // Resolve once up front: a scan performs on the order of a hundred
-    // handshake attempts, and per-attempt resolution would both hammer the
-    // resolver and risk probing different IPs of a multi-address host,
-    // making per-version results incoherent.
-    let addr = (host, port)
-        .to_socket_addrs()
-        .map_err(TLSError::Connection)?
-        .next()
-        .ok_or_else(|| TLSError::DNS("Failed parse remote hostname".to_string()))?;
+    // Resolve and pick a reachable address once up front, then pin it: a scan
+    // performs on the order of a hundred handshake attempts, and re-resolving
+    // per attempt would both hammer the resolver and risk probing different IPs
+    // of a multi-address host, making per-version results incoherent. Picking
+    // the address by actually connecting (rather than taking the first DNS
+    // answer) means a host whose first address is unreachable still gets
+    // scanned on the address that works.
+    let addrs = crate::resolve_addrs(host, port)?;
+    let addr = crate::connect_first_available(&addrs, timeout)?.peer_addr()?;
 
     let mut protocols = Vec::with_capacity(VERSIONS.len());
     for &(ssl_version, version) in VERSIONS {
         // Is this version accepted at all (with a default cipher selection)?
-        let supported = try_handshake(host, addr, ssl_version, None, None).is_some();
+        let supported = try_handshake(host, addr, ssl_version, None, None, timeout).is_some();
 
         let mut ciphers = Vec::new();
         if supported {
             if ssl_version == SslVersion::TLS1_3 {
                 for suite in TLS13_CIPHERS {
-                    if let Some(name) = try_handshake(host, addr, ssl_version, None, Some(suite)) {
+                    if let Some(name) =
+                        try_handshake(host, addr, ssl_version, None, Some(suite), timeout)
+                    {
                         if !ciphers.contains(&name) {
                             ciphers.push(name);
                         }
@@ -242,7 +265,9 @@ pub fn scan_tls(host: &str, port: Option<u16>) -> Result<TlsScan, TLSError> {
                 }
             } else {
                 for cipher in LEGACY_CIPHERS {
-                    if let Some(name) = try_handshake(host, addr, ssl_version, Some(cipher), None) {
+                    if let Some(name) =
+                        try_handshake(host, addr, ssl_version, Some(cipher), None, timeout)
+                    {
                         if !ciphers.contains(&name) {
                             ciphers.push(name);
                         }
