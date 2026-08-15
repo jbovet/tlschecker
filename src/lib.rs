@@ -1308,10 +1308,7 @@ fn resolve_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, TLSError> {
 ///
 /// Returns the last connection error when every address fails, so the reported
 /// reason describes an actual attempt rather than a synthesized message.
-fn connect_first_available(
-    addrs: &[SocketAddr],
-    timeout: Duration,
-) -> Result<TcpStream, TLSError> {
+fn connect_first_available(addrs: &[SocketAddr], timeout: Duration) -> Result<TcpStream, TLSError> {
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<std::io::Error> = None;
 
@@ -1326,7 +1323,10 @@ fn connect_first_available(
             Ok(stream) => return Ok(stream),
             Err(err) => {
                 if addrs.len() > 1 {
-                    warn!("Connection to {} failed: {}; trying next address", addr, err);
+                    warn!(
+                        "Connection to {} failed: {}; trying next address",
+                        addr, err
+                    );
                 }
                 last_err = Some(err);
             }
