@@ -203,6 +203,20 @@ Descriptive, changeable metadata therefore lives on a dedicated info metric, `tl
 tlschecker_days_before_expired * on(instance) group_left(grade, issuer) tlschecker_certificate_info
 ```
 
+### Connection Timeout
+
+Each host gets 30 seconds to connect by default. Use `--connect-timeout` to change that budget (1–3600 seconds):
+
+```sh
+➜ tlschecker --connect-timeout 5 example.com internal.example.com
+```
+
+The value is the budget for the **connect phase of one host** — shared across every address the hostname resolves to — and is also applied as the socket read timeout during the handshake. Because each check occupies a worker thread, lowering it keeps a large host list moving when some hosts are unreachable; raise it for slow links.
+
+It is deliberately named for what it bounds: it does **not** cap the whole check. `--check-revocation` (OCSP and each CRL distribution point) and `--ct-check` keep their own separate timeouts, and `--scan` caps its per-handshake wait at 10 seconds regardless of this setting, since a scan performs on the order of a hundred connections. Note that lowering the timeout can make `--scan` report a protocol as unsupported when the probe merely timed out.
+
+Hostnames that resolve to several addresses (an A and a AAAA record, or a pool of load-balanced servers) are tried **in resolution order until one accepts**, so a host that is up on one of its addresses is not reported as unreachable just because the first address it resolves to is not. This matters most on IPv4-only networks whose resolver still returns AAAA records.
+
 ### Certificate Fingerprints
 
 Every check reports the SHA-256 and SHA-1 fingerprints of the leaf certificate (colon-separated uppercase hex, the same format as browsers and `openssl x509 -fingerprint`). They appear in `text` and `json` output and are useful for certificate pinning and comparison.
