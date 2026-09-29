@@ -63,16 +63,72 @@ sudo install tlschecker /usr/local/bin/tlschecker
 ### Interactive dashboard
 
 When run in an interactive terminal, tlschecker opens a live dashboard by
-default: hosts stream in as they are checked, with a fleet list and verdict
-tally on the left and a detail pane (expiry lifetime gauge, TLS grade
-breakdown, security warnings) for the selected host on the right. Navigate
-with `j`/`k` (or arrow keys), jump with `g`/`G`, quit with `q`.
+default. Hosts stream in as they are checked:
 
-Press `Enter` on a host to open the full certificate explorer: subject and
-issuer details, validity dates, serial number and fingerprints, SANs, the
-presented chain, embedded SCTs, the grade breakdown with reasons, and scan
-results when `--scan` was used. Scroll with `j`/`k` or `PgUp`/`PgDn`, and
-return with `Esc`.
+```sh
+➜ tlschecker jpbd.dev expired.badssl.com google.com cloudflare.com
+```
+
+![Dashboard: fleet list and tally on the left, the selected host's detail pane on the right](/img/dashboard.webp)
+
+**Fleet list.** Every host with its verdict and grade:
+
+- `✓` healthy · `⚠` warning (self-signed, any security warning, or ≤ 30 days
+  left) · `✗` critical (expired, revoked, or ≤ 15 days left). A host that could
+  not be checked shows why, e.g. `✗ host (DNS)`.
+- A yellow `?` after the grade means a revocation or CT check you asked for
+  could not reach a verdict (see *Not verified* below). It does not change the
+  verdict: an unreachable OCSP responder or a crt.sh outage says nothing bad
+  about the certificate.
+
+The **Tally** below counts hosts per verdict, failed checks, and hosts with
+unverified checks.
+
+**Detail pane.** For the selected host:
+
+- **Facts** — negotiated protocol, cipher and ALPN; issuer; key; `Revocation`
+  (`Not revoked`, `Revoked (via CRL)`, `Unknown`, `Not checked`); `CT`
+  (`Logged · <crt.sh link>`, `Not logged`, `Unknown` — shown once CT was
+  checked); chain `Trust`; SHA-256 fingerprint.
+- **Expiry gauge** — how much of the certificate's lifetime has elapsed.
+- **Grade** with a gauge per category.
+- **Not verified** — why a requested revocation or CT check came back
+  `Unknown`, e.g. `OCSP: http://ocsp.example: response signature verification
+  failed; CRL: certificate lists no CRL distribution point`.
+- **Warnings** — every security warning for the host.
+
+**Certificate explorer.** Press `Enter` on a host for the full report: subject
+and issuer, validity, **Trust & Revocation** (self-signed, trust, revocation
+and CT, with each failed OCSP responder / CRL distribution point on its own
+`↳` line), certificate details (serial, fingerprints, key identifiers,
+validation level, key usage, basic constraints), issuer and revocation URLs,
+connection, SANs, embedded SCTs, the presented chain, the grade breakdown with
+reasons, and scan results when `--scan` was used.
+
+![Certificate explorer](/img/explorer.webp)
+
+**Checks on demand.** Revocation and CT lookups are opt-in on the command line
+because they cost network round trips — but you can run them from the
+dashboard at any time for the selected host: `r` checks revocation (OCSP, then
+CRL, against the chain already retrieved — no new TLS connection) and `c` looks
+the certificate up in Certificate Transparency. The footer offers each one only
+while the host has no definitive answer yet (never checked, or `Unknown`, so a
+failed check can be retried). The pane shows `checking…` meanwhile; the verdict
+and grade update when the result arrives, and a revocation found this way
+counts toward `--exit-code`.
+
+**Keys:**
+
+| Key | Fleet list | Explorer |
+|---|---|---|
+| `j` / `k`, arrows | move | scroll |
+| `PgUp` / `PgDn`, `Space` | — | page |
+| `g` / `G` | first / last host | top / bottom |
+| `Enter` | open the explorer | back |
+| `Esc`, `Backspace` | `Esc` quits | back |
+| `r` / `c` | check revocation / CT for the selected host | same |
+| `e` | export the chain as PEM | same |
+| `q`, `Ctrl+C` | quit | quit |
 
 Press `e` on either screen to export the selected host's certificate chain as
 PEM. The prompt is prefilled with a filename derived from the host (so
@@ -153,11 +209,11 @@ When you enable revocation checking, TLSChecker will:
 2. If OCSP doesn't provide a definitive answer, fall back to CRL checking
 3. Report the certificate as revoked if either method indicates revocation
 
-The revocation status will be displayed in the output:
-- **Valid**: Certificate is not revoked (confirmed by OCSP or CRL)
-- **Revoked**: Certificate has been revoked (with reason if available)
-- **Unknown**: Revocation status couldn't be determined
-- **Not Checked**: Revocation status was not checked (default when not using the flag)
+The revocation status is shown the same way in every output (summary, text, and the dashboard):
+- **Not revoked**: confirmed by OCSP or CRL
+- **Revoked**: the certificate has been revoked, with how or when when available, e.g. `Revoked (via CRL)`
+- **Unknown**: the status could not be determined. The reason — each OCSP responder and CRL distribution point that failed — is shown in `text` output, in JSON as `revocation_detail`, and in the dashboard's *Not verified* block
+- **Not checked**: revocation was not requested (the default without the flag; in the dashboard, press `r` to check the selected host)
 
 Example with a revoked certificate:
 ```sh
@@ -281,7 +337,7 @@ This performs a network request to an external service (crt.sh), so it is opt-in
 
 - **Logged** — the exact certificate was found in CT. The `text`/`json` output include a direct `crt.sh` link; the summary table shows `✓`.
 - **Not logged** — crt.sh has no record of the certificate *and* it carries no embedded SCTs, so absence from CT is plausible. Reported as a security warning (see below) and shown as `✗` in the summary. A publicly-trusted certificate that is not logged will be rejected by modern browsers.
-- **Unknown** — crt.sh was unreachable or rate-limited, or it has no record of a certificate that carries embedded SCTs (crt.sh is an aggregator and misses some certificates the logs do include), so the status could not be determined (`?` in the summary). This is kept distinct from "not logged" so an outage is never mistaken for a problem; the reason is logged to **stderr** (stdout stays clean for `… -o json | jq`).
+- **Unknown** — crt.sh was unreachable or rate-limited, or it has no record of a certificate that carries embedded SCTs (crt.sh is an aggregator and misses some certificates the logs do include), so the status could not be determined (`?` in the summary). This is kept distinct from "not logged" so an outage is never mistaken for a problem. The reason — together with any embedded-SCT evidence — is logged to **stderr** (stdout stays clean for `… -o json | jq`), kept in JSON as `ct_detail`, and shown in `text` output and the dashboard.
 
 When `--ct-check` is used, the summary table gains a `CT` column (`✓`/`✗`/`?`); without it the column is hidden. Being absent from CT does **not** affect the grade — many legitimate internal/private certificates are intentionally absent from public CT logs, so what that means is left to you rather than the grade.
 
