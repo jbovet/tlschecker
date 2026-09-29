@@ -268,8 +268,8 @@ Modern browsers reject publicly-trusted certificates that are not logged in [Cer
 This performs a network request to an external service (crt.sh), so it is opt-in and adds latency. The result is **tri-state**, like revocation status:
 
 - **Logged** — the exact certificate was found in CT. The `text`/`json` output include a direct `crt.sh` link; the summary table shows `✓`.
-- **Not logged** — definitively absent from CT. Reported as a security warning (see below) and shown as `✗` in the summary. A publicly-trusted certificate that is not logged will be rejected by modern browsers.
-- **Unknown** — crt.sh was unreachable or rate-limited, so the status could not be determined (`?` in the summary). This is kept distinct from "not logged" so an outage is never mistaken for a problem; the reason is logged to **stderr** (stdout stays clean for `… -o json | jq`).
+- **Not logged** — crt.sh has no record of the certificate *and* it carries no embedded SCTs, so absence from CT is plausible. Reported as a security warning (see below) and shown as `✗` in the summary. A publicly-trusted certificate that is not logged will be rejected by modern browsers.
+- **Unknown** — crt.sh was unreachable or rate-limited, or it has no record of a certificate that carries embedded SCTs (crt.sh is an aggregator and misses some certificates the logs do include), so the status could not be determined (`?` in the summary). This is kept distinct from "not logged" so an outage is never mistaken for a problem; the reason is logged to **stderr** (stdout stays clean for `… -o json | jq`).
 
 When `--ct-check` is used, the summary table gains a `CT` column (`✓`/`✗`/`?`); without it the column is hidden. Being absent from CT does **not** affect the grade — many legitimate internal/private certificates are intentionally absent from public CT logs, so what that means is left to you rather than the grade.
 
@@ -281,12 +281,13 @@ In addition to revocation and grading, tlschecker surfaces certificate problems 
 - **Incomplete chain** — the certificate's issuer was not found in the presented chain
 - **Invalid chain order** — the chain is not in issuer order (each certificate should be followed by the one that issued it)
 - **Hostname mismatch** — the certificate is not valid for the hostname you checked (no matching SAN, with wildcard support, or Common Name)
+- **Invalid chain signature** — a presented certificate is not validly signed by the issuer found for it in the chain (forged or corrupted certificate)
 - **Expiring intermediate** — an intermediate certificate in the chain has expired or expires within 30 days
 - **Weak protocol** (`--scan`) — the server still supports an obsolete (SSLv3) or deprecated (TLS 1.0/1.1) protocol version
 - **Weak cipher** (`--scan`) — the server accepts a weak cipher suite (RC4, DES/3DES, NULL, EXPORT, anonymous, ...)
 - **Not in CT log** (`--ct-check`) — the presented certificate was not found in any public Certificate Transparency log
 
-A hostname mismatch, support for an obsolete protocol (SSLv3/TLS 1.0), or acceptance of a weak cipher each cap the TLS grade at C, the same as a self-signed certificate.
+A hostname mismatch, an invalid chain signature, support for an obsolete protocol (SSLv3/TLS 1.0), or acceptance of a weak cipher each cap the TLS grade at C, the same as a self-signed certificate.
 
 ### Troubleshooting Connection Issues
 

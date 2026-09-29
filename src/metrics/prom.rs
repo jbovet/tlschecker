@@ -247,6 +247,7 @@ mod tests {
                 sans: vec![],
                 chain: None,
                 revocation_status: RevocationStatus::NotChecked,
+                revocation_detail: None,
                 trust: tlschecker::TrustStatus::Unknown,
                 is_self_signed: false,
                 security_warnings: vec![],
@@ -270,6 +271,7 @@ mod tests {
             grade: None,
             scan: None,
             ct: None,
+            ct_detail: None,
         }
     }
 

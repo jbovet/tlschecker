@@ -208,8 +208,9 @@ pub(crate) fn usage(cert: &X509Ref) -> Usage {
     if let Some(ku) = find_extension_value(&der, &KEY_USAGE_OID) {
         if let Some((0x03, bits, _)) = read_tlv(ku) {
             // bits[0] is the count of unused trailing bits; the flags follow,
-            // MSB-first across the value bytes.
-            let value = &bits[1..];
+            // MSB-first across the value bytes. A malformed empty BIT STRING
+            // has no count byte at all, which reads as no flags set.
+            let value = bits.get(1..).unwrap_or_default();
             for (i, name) in KEY_USAGE_NAMES.iter().enumerate() {
                 let byte = i / 8;
                 let mask = 0x80u8 >> (i % 8);
@@ -506,6 +507,14 @@ mod tests {
         assert!(u.key_usage.contains(&"keyEncipherment".to_string()));
         assert!(u.ext_key_usage.contains(&"serverAuth".to_string()));
         assert!(!u.is_ca, "a leaf must not assert CA:TRUE");
+    }
+
+    #[test]
+    fn test_usage_empty_key_usage_bit_string_does_not_panic() {
+        // `03 00`: a BIT STRING with no content — not even the unused-bits
+        // byte. Malformed, but a server can present it.
+        let cert = cert_with_extension("2.5.29.15", &[0x03, 0x00]);
+        assert!(usage(&cert).key_usage.is_empty());
     }
 
     #[test]

@@ -44,7 +44,7 @@ use openssl::ssl::HandshakeError;
 use openssl::x509::{CrlStatus, ReasonCode, X509Crl, X509NameEntries, X509Ref, X509};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{instrument, warn};
+use tracing::{info, instrument, warn};
 
 /// Default timeout for TLS connection attempts (30 seconds).
 ///
@@ -166,6 +166,11 @@ pub struct TLS {
     /// Certificate Transparency lookup result (populated when --ct-check is enabled)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ct: Option<ct::CtStatus>,
+    /// Why `ct` is `Unknown`: crt.sh could not be queried, answered with
+    /// something unrecognized, or has no record of a certificate that carries
+    /// embedded SCTs. `None` for a definitive status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ct_detail: Option<String>,
 }
 
 /// TLS cipher suite information.
@@ -176,7 +181,12 @@ pub struct TLS {
 pub struct Cipher {
     /// Name of the cipher suite (e.g., "ECDHE-RSA-AES128-GCM-SHA256")
     pub name: String,
-    /// TLS protocol version (e.g., "TLSv1.3", "TLSv1.2")
+    /// Negotiated TLS protocol version, as OpenSSL names it: "TLSv1.3",
+    /// "TLSv1.2", "TLSv1.1", "TLSv1" (TLS 1.0) or "SSLv3".
+    ///
+    /// This is the connection's version, not the cipher suite's: a suite such
+    /// as `ECDHE-RSA-AES128-SHA` dates from TLS 1.0 but is routinely
+    /// negotiated over TLS 1.2.
     pub version: String,
     /// Cipher suite key length in bits
     pub bits: i32,
@@ -230,6 +240,11 @@ pub struct CertificateInfo {
     pub chain: Option<Vec<Chain>>,
     /// Certificate revocation status (if checked)
     pub revocation_status: RevocationStatus,
+    /// Why `revocation_status` is `Unknown` when a check was attempted — each
+    /// OCSP responder's and CRL distribution point's failure — or `None` when
+    /// the status is definitive or revocation was not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_detail: Option<String>,
     /// Whether the chain builds to a trusted system root (always computed;
     /// `Unknown` when no trust store is available)
     #[serde(default)]
@@ -929,6 +944,9 @@ fn build_grading_input(
         has_incomplete_chain: has(|w| matches!(w, SecurityWarning::IncompleteChain(_))),
         has_weak_signature: has(|w| matches!(w, SecurityWarning::WeakSignatureAlgorithm(_))),
         has_hostname_mismatch: has(|w| matches!(w, SecurityWarning::HostnameMismatch(_))),
+        has_invalid_chain_signature: has(|w| {
+            matches!(w, SecurityWarning::InvalidChainSignature(_))
+        }),
         supports_obsolete_protocol: scan.map(scan_supports_obsolete_protocol).unwrap_or(false),
         // Penalise a weak cipher even without `--scan`: the negotiated cipher
         // name alone (e.g. RC4/3DES/NULL) is enough to cap the grade. The scan,
@@ -952,294 +970,293 @@ fn build_grading_input(
 /// If the OCSP response is not valid, it returns Unknown.
 #[instrument(skip(cert, chain))]
 pub fn check_ocsp_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus, TLSError> {
-    use openssl::hash::MessageDigest;
-    use openssl::ocsp::OcspCertId;
-
-    // First, find the issuer certificate in the chain
-    let issuer = match find_issuer_cert(cert, chain) {
-        Some(issuer) => issuer,
-        None => return Ok(RevocationStatus::Unknown), // Can't verify without issuer
-    };
-
-    // Get OCSP responder URLs from certificate
-    let ocsp_responders = match cert.ocsp_responders() {
-        Ok(responders) if !responders.is_empty() => responders,
-        Ok(_) => return Ok(RevocationStatus::Unknown), // No OCSP responders found
-        Err(_) => return Ok(RevocationStatus::Unknown), // Error getting responders
-    };
-
-    // Create the OCSP request
-    let ocsp_cert_id = match OcspCertId::from_cert(MessageDigest::sha1(), cert, issuer) {
-        Ok(id) => id,
-        Err(_) => return Ok(RevocationStatus::Unknown), // Couldn't create cert ID
-    };
-
-    let mut ocsp_req = match openssl::ocsp::OcspRequest::new() {
-        Ok(req) => req,
-        Err(_) => return Ok(RevocationStatus::Unknown), // Couldn't create request
-    };
-
-    if ocsp_req.add_id(ocsp_cert_id).is_err() {
-        return Ok(RevocationStatus::Unknown); // Couldn't add ID to request
-    }
-
-    let req_bytes = match ocsp_req.to_der() {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(RevocationStatus::Unknown), // Couldn't encode request
-    };
-
-    // Try each responder URL
-    for responder in ocsp_responders.iter() {
-        let responder_url = match std::str::from_utf8(responder.as_ref()) {
-            Ok(url) => url,
-            Err(_) => continue,
-        };
-
-        // Make HTTP POST request to OCSP responder
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let response = match client
-            .post(responder_url)
-            .header("Content-Type", "application/ocsp-request")
-            .body(req_bytes.clone())
-            .send()
-        {
-            Ok(resp) => resp,
-            Err(_) => continue, // Try next responder if this one fails
-        };
-
-        if !response.status().is_success() {
-            continue;
-        }
-
-        let resp_bytes = match response.bytes() {
-            Ok(bytes) => bytes.to_vec(),
-            Err(_) => continue,
-        };
-
-        // Parse OCSP response
-        let ocsp_response = match openssl::ocsp::OcspResponse::from_der(&resp_bytes) {
-            Ok(resp) => resp,
-            Err(_) => continue,
-        };
-
-        if ocsp_response.status() != openssl::ocsp::OcspResponseStatus::SUCCESSFUL {
-            continue;
-        }
-
-        let basic_resp = match ocsp_response.basic() {
-            Ok(resp) => resp,
-            Err(_) => continue,
-        };
-
-        // Verify the OCSP response - need to build a store with the issuer
-        let mut store_builder = match openssl::x509::store::X509StoreBuilder::new() {
-            Ok(builder) => builder,
-            Err(_) => continue,
-        };
-
-        if store_builder.add_cert(issuer.to_owned()).is_err() {
-            continue;
-        }
-
-        let store = store_builder.build();
-
-        // Verify the OCSP response signature before trusting any status it
-        // reports. Per RFC 6960 an unsigned or improperly signed response
-        // must not be relied upon: doing so would let an on-path attacker forge
-        // a "good" response and mask a revoked certificate. If verification
-        // fails we skip this responder and ultimately fall back to CRL checking
-        // (returning `Unknown`) rather than trusting a potentially forged status.
-        //
-        // The `certs` stack supplies *untrusted* intermediates used only to
-        // build the path from the response's signer to the trusted issuer in
-        // `store`. Many CAs use a delegated OCSP responder whose certificate is
-        // issued by the CA: without the chain intermediates available, that
-        // path can't be built and a perfectly valid response would fail to
-        // verify (degrading to `Unknown`). Trust is still anchored solely by
-        // `store` (the issuer), so providing these does not weaken the check.
-        let mut certs = match openssl::stack::Stack::<X509>::new() {
-            Ok(certs) => certs,
-            Err(_) => continue,
-        };
-        for c in chain {
-            let _ = certs.push(c.to_owned());
-        }
-        if basic_resp
-            .verify(&certs, &store, openssl::ocsp::OcspFlag::empty())
-            .is_err()
-        {
-            warn!("OCSP response signature verification failed; ignoring response from {responder_url}");
-            continue;
-        }
-
-        // Check status
-        // Create a new cert_id for each check since find_status consumes it
-        let check_cert_id = match OcspCertId::from_cert(MessageDigest::sha1(), cert, issuer) {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-
-        match basic_resp.find_status(&check_cert_id) {
-            Some(status) => {
-                // Check validity of the OCSP response
-                if status.check_validity(300, None).is_err() {
-                    continue;
-                }
-
-                match status.status {
-                    OcspCertStatus::GOOD => return Ok(RevocationStatus::Good),
-                    OcspCertStatus::REVOKED => {
-                        let reason = if let Some(reason) = status.revocation_time {
-                            format!("Revoked at {}", reason)
-                        } else {
-                            "Unknown reason".to_string()
-                        };
-                        return Ok(RevocationStatus::Revoked(reason));
-                    }
-                    OcspCertStatus::UNKNOWN => return Ok(RevocationStatus::Unknown),
-                    _ => return Ok(RevocationStatus::Unknown),
-                }
-            }
-            None => continue,
-        }
-    }
-
-    // If we tried all responders and none worked, return Unknown
-    Ok(RevocationStatus::Unknown)
+    Ok(ocsp_revocation(cert, chain).unwrap_or(RevocationStatus::Unknown))
 }
 
 /// Combined revocation checking function that tries both OCSP and CRL
 #[instrument(skip(cert, chain))]
 pub fn check_revocation_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus, TLSError> {
-    // First try OCSP checking as it's typically more up-to-date
-    match check_ocsp_status(cert, chain) {
-        Ok(RevocationStatus::Good) => Ok(RevocationStatus::Good),
-        Ok(revoked @ RevocationStatus::Revoked(_)) => Ok(revoked),
-        _ => {
-            // Fallback to CRL checking if OCSP was inconclusive
-            check_crl_status(cert, chain)
-        }
-    }
+    Ok(revocation_status_with_detail(cert, chain).0)
 }
 
 #[instrument(skip(cert, chain))]
 pub fn check_crl_status(cert: &X509, chain: &[X509]) -> Result<RevocationStatus, TLSError> {
-    use openssl::x509::store::X509StoreBuilder;
+    Ok(crl_revocation(cert, chain).unwrap_or(RevocationStatus::Unknown))
+}
 
-    // Find the issuer certificate in the chain
-    let issuer = match find_issuer_cert(cert, chain) {
-        Some(issuer) => issuer,
-        None => return Ok(RevocationStatus::Unknown), // Can't verify without issuer
+/// Checks revocation for a chain given as PEM, leaf first — the form
+/// [`CertificateInfo::pem`] keeps — without opening a new TLS connection.
+///
+/// This is how a result inspected without `check_revocation` can be checked
+/// later (the dashboard does it on demand). Returns the status and, when it
+/// is `Unknown`, why — as stored in [`CertificateInfo::revocation_detail`].
+pub fn check_revocation_from_pem(pem: &str) -> (RevocationStatus, Option<String>) {
+    match X509::stack_from_pem(pem.as_bytes()) {
+        Ok(chain) if !chain.is_empty() => revocation_status_with_detail(&chain[0], &chain),
+        _ => (
+            RevocationStatus::Unknown,
+            Some("no certificate chain was kept for this result".to_string()),
+        ),
+    }
+}
+
+/// OCSP first (typically more up to date), then CRL when OCSP is
+/// inconclusive. Returns the status and, when it is `Unknown`, why both
+/// mechanisms failed — e.g. `OCSP: http://ocsp.example: request failed: …;
+/// CRL: certificate lists no CRL distribution point`.
+fn revocation_status_with_detail(
+    cert: &X509,
+    chain: &[X509],
+) -> (RevocationStatus, Option<String>) {
+    match ocsp_revocation(cert, chain) {
+        Ok(status) => (status, None),
+        Err(ocsp) => match crl_revocation(cert, chain) {
+            Ok(status) => (status, None),
+            Err(crl) => (
+                RevocationStatus::Unknown,
+                Some(format!("OCSP: {ocsp}; CRL: {crl}")),
+            ),
+        },
+    }
+}
+
+/// Queries the certificate's OCSP responders in turn.
+///
+/// `Ok` is a definitive `Good` or `Revoked`. `Err` is why no responder gave
+/// one — including a responder answering "unknown" — with each responder's
+/// failure prefixed by its URL.
+fn ocsp_revocation(cert: &X509, chain: &[X509]) -> Result<RevocationStatus, String> {
+    use openssl::hash::MessageDigest;
+    use openssl::ocsp::{OcspCertId, OcspRequest};
+
+    let issuer = find_issuer_cert(cert, chain)
+        .ok_or_else(|| "issuer certificate is not in the presented chain".to_string())?;
+    let responders = match cert.ocsp_responders() {
+        Ok(responders) if !responders.is_empty() => responders,
+        _ => return Err("certificate lists no OCSP responder".to_string()),
     };
+    let request = OcspCertId::from_cert(MessageDigest::sha1(), cert, issuer)
+        .and_then(|id| {
+            let mut request = OcspRequest::new()?;
+            request.add_id(id)?;
+            request.to_der()
+        })
+        .map_err(|e| format!("could not build the OCSP request: {e}"))?;
 
-    // Get CRL distribution point URLs from the certificate. Same helper the
-    // reported `crl_urls` come from, so what we display is what we fetch.
-    let crl_dp_urls = crl_urls(cert);
-    if crl_dp_urls.is_empty() {
-        return Ok(RevocationStatus::Unknown); // No CRL distribution points found
-    }
-
-    // Create a store for verification
-    let mut store_builder = match X509StoreBuilder::new() {
-        Ok(builder) => builder,
-        Err(_) => return Ok(RevocationStatus::Unknown),
-    };
-
-    // Add the issuer certificate to the store
-    if store_builder.add_cert(issuer.to_owned()).is_err() {
-        return Ok(RevocationStatus::Unknown);
-    }
-
-    // Try each CRL distribution point
-    for crl_url in &crl_dp_urls {
-        // Download the CRL
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let response = match client.get(crl_url).send() {
-            Ok(resp) => resp,
-            Err(_) => continue,
-        };
-
-        if !response.status().is_success() {
+    let mut failures = Vec::new();
+    for responder in responders.iter() {
+        let Ok(url) = std::str::from_utf8(responder.as_ref()) else {
+            failures.push("responder URL is not valid UTF-8".to_string());
             continue;
-        }
-
-        let crl_data = match response.bytes() {
-            Ok(bytes) => bytes.to_vec(),
-            Err(_) => continue,
         };
-
-        // Try parsing as DER first, then as PEM
-        let crl = match X509Crl::from_der(&crl_data) {
-            Ok(crl) => crl,
-            Err(_) => {
-                // Try PEM format if DER parsing failed
-                match X509Crl::from_pem(&crl_data) {
-                    Ok(crl) => crl,
-                    Err(_) => continue,
-                }
-            }
-        };
-
-        // Verify the CRL signature. An issuer whose public key cannot be
-        // extracted is treated like a failed verification: skip this CRL
-        // (degrading to `Unknown`) rather than panicking.
-        let issuer_key = match issuer.public_key() {
-            Ok(key) => key,
-            Err(_) => continue,
-        };
-        if crl.verify(&issuer_key).is_err() {
-            continue; // CRL signature verification failed
-        }
-
-        // Reject stale CRLs: a correctly-signed but expired CRL (nextUpdate in
-        // the past) may predate a revocation, so trusting it could mask a
-        // revoked certificate — e.g. an on-path attacker replaying an old CRL.
-        // Skipping degrades to `Unknown`, mirroring the OCSP
-        // verification-failure handling.
-        if !is_crl_fresh(&crl, crl_url) {
-            continue;
-        }
-
-        // Check if the certificate is in the CRL
-        match crl.get_by_cert(cert) {
-            CrlStatus::Revoked(revoked) => {
-                // Certificate is revoked
-                // Try to get the revocation reason if available
-                let reason = match revoked.extension::<ReasonCode>() {
-                    Ok(Some(_)) => "Revoked via CRL".to_string(),
-                    _ => "Revoked via CRL (no reason specified)".to_string(),
-                };
-
-                return Ok(RevocationStatus::Revoked(reason));
-            }
-            CrlStatus::NotRevoked => {
-                // Certificate is not in the CRL, so it's good according to this CRL
-                return Ok(RevocationStatus::Good);
-            }
-            CrlStatus::RemoveFromCrl(_) => {
-                // This is rare but could happen if a certificate was temporarily suspended
-                // and then reinstated
-                return Ok(RevocationStatus::Good);
-            }
+        match query_ocsp_responder(url, &request, cert, issuer, chain) {
+            Ok(status) => return Ok(status),
+            Err(reason) => failures.push(format!("{url}: {reason}")),
         }
     }
+    Err(failures.join("; "))
+}
 
-    // If we've tried all CRLs and none worked or none contained information about this certificate
-    Ok(RevocationStatus::Unknown)
+/// Asks one OCSP responder about `cert`. `Ok` is a definitive `Good` or
+/// `Revoked`; `Err` is why this responder's answer could not be used.
+fn query_ocsp_responder(
+    url: &str,
+    request: &[u8],
+    cert: &X509,
+    issuer: &X509,
+    chain: &[X509],
+) -> Result<RevocationStatus, String> {
+    use openssl::hash::MessageDigest;
+    use openssl::ocsp::{OcspCertId, OcspFlag, OcspResponse, OcspResponseStatus};
+
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .and_then(|client| {
+            client
+                .post(url)
+                .header("Content-Type", "application/ocsp-request")
+                .body(request.to_vec())
+                .send()
+        })
+        .map_err(|e| format!("request failed: {}", error_chain(&e.without_url())))?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let body = response.bytes().map_err(|e| {
+        format!(
+            "could not read the response: {}",
+            error_chain(&e.without_url())
+        )
+    })?;
+
+    let ocsp_response = OcspResponse::from_der(&body)
+        .map_err(|_| "response is not a valid OCSP response".to_string())?;
+    if ocsp_response.status() != OcspResponseStatus::SUCCESSFUL {
+        return Err(format!(
+            "responder answered {}",
+            ocsp_response_status_name(ocsp_response.status())
+        ));
+    }
+    let basic = ocsp_response
+        .basic()
+        .map_err(|_| "response carries no basic OCSP response".to_string())?;
+
+    // Verify the OCSP response signature before trusting any status it
+    // reports. Per RFC 6960 an unsigned or improperly signed response
+    // must not be relied upon: doing so would let an on-path attacker forge
+    // a "good" response and mask a revoked certificate. If verification
+    // fails we skip this responder and ultimately fall back to CRL checking
+    // (returning `Unknown`) rather than trusting a potentially forged status.
+    //
+    // The `certs` stack supplies *untrusted* intermediates used only to
+    // build the path from the response's signer to the trusted issuer in
+    // `store`. Many CAs use a delegated OCSP responder whose certificate is
+    // issued by the CA: without the chain intermediates available, that
+    // path can't be built and a perfectly valid response would fail to
+    // verify (degrading to `Unknown`). Trust is still anchored solely by
+    // `store` (the issuer), so providing these does not weaken the check.
+    let internal = |e: ErrorStack| format!("could not verify the response: {e}");
+    let mut store = openssl::x509::store::X509StoreBuilder::new().map_err(internal)?;
+    store.add_cert(issuer.to_owned()).map_err(internal)?;
+    let store = store.build();
+    let mut certs = openssl::stack::Stack::<X509>::new().map_err(internal)?;
+    for c in chain {
+        let _ = certs.push(c.to_owned());
+    }
+    if basic.verify(&certs, &store, OcspFlag::empty()).is_err() {
+        warn!("OCSP response signature verification failed; ignoring response from {url}");
+        return Err("response signature verification failed".to_string());
+    }
+
+    let cert_id = OcspCertId::from_cert(MessageDigest::sha1(), cert, issuer).map_err(internal)?;
+    let status = basic
+        .find_status(&cert_id)
+        .ok_or_else(|| "response has no status for this certificate".to_string())?;
+    if status.check_validity(300, None).is_err() {
+        return Err("response is outside its validity window".to_string());
+    }
+    match status.status {
+        OcspCertStatus::GOOD => Ok(RevocationStatus::Good),
+        OcspCertStatus::REVOKED => Ok(RevocationStatus::Revoked(match status.revocation_time {
+            Some(time) => format!("Revoked at {}", time),
+            None => "Unknown reason".to_string(),
+        })),
+        _ => Err("responder does not know this certificate".to_string()),
+    }
+}
+
+/// RFC 6960 name of a non-successful OCSP response status.
+fn ocsp_response_status_name(status: openssl::ocsp::OcspResponseStatus) -> String {
+    match status.as_raw() {
+        1 => "malformedRequest".to_string(),
+        2 => "internalError".to_string(),
+        3 => "tryLater".to_string(),
+        5 => "sigRequired".to_string(),
+        6 => "unauthorized".to_string(),
+        other => format!("status {other}"),
+    }
+}
+
+/// Checks the certificate's CRL distribution points in turn.
+///
+/// `Ok` is a definitive `Good` or `Revoked`. `Err` is why no CRL gave one,
+/// with each distribution point's failure prefixed by its URL.
+fn crl_revocation(cert: &X509, chain: &[X509]) -> Result<RevocationStatus, String> {
+    let issuer = find_issuer_cert(cert, chain)
+        .ok_or_else(|| "issuer certificate is not in the presented chain".to_string())?;
+    // Same helper the reported `crl_urls` come from, so what we display is
+    // what we fetch.
+    let urls = crl_urls(cert);
+    if urls.is_empty() {
+        return Err("certificate lists no CRL distribution point".to_string());
+    }
+
+    let mut failures = Vec::new();
+    for url in &urls {
+        match crl_status_from(url, cert, issuer) {
+            Ok(status) => return Ok(status),
+            Err(reason) => failures.push(format!("{url}: {reason}")),
+        }
+    }
+    Err(failures.join("; "))
+}
+
+/// Downloads one CRL and looks `cert` up in it. `Ok` is a definitive `Good`
+/// or `Revoked`; `Err` is why this CRL could not be used.
+fn crl_status_from(url: &str, cert: &X509, issuer: &X509) -> Result<RevocationStatus, String> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .and_then(|client| client.get(url).send())
+        .map_err(|e| format!("request failed: {}", error_chain(&e.without_url())))?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let body = response.bytes().map_err(|e| {
+        format!(
+            "could not read the response: {}",
+            error_chain(&e.without_url())
+        )
+    })?;
+
+    // DER is what RFC 5280 distribution points serve; accept PEM too.
+    let crl = X509Crl::from_der(&body)
+        .or_else(|_| X509Crl::from_pem(&body))
+        .map_err(|_| "response is not a CRL".to_string())?;
+
+    if !is_crl_signed_by(&crl, issuer) {
+        warn!("CRL from {url} is not signed by the certificate's issuer; ignoring it");
+        return Err("CRL is not signed by the certificate's issuer".to_string());
+    }
+    // Reject stale CRLs: a correctly-signed but expired CRL (nextUpdate in
+    // the past) may predate a revocation, so trusting it could mask a
+    // revoked certificate — e.g. an on-path attacker replaying an old CRL.
+    if !is_crl_fresh(&crl, url) {
+        return Err("CRL is stale (nextUpdate is in the past)".to_string());
+    }
+
+    match crl.get_by_cert(cert) {
+        CrlStatus::Revoked(revoked) => Ok(RevocationStatus::Revoked(
+            match revoked.extension::<ReasonCode>() {
+                Ok(Some(_)) => "Revoked via CRL".to_string(),
+                _ => "Revoked via CRL (no reason specified)".to_string(),
+            },
+        )),
+        // Not listed, or removed from the CRL after a temporary hold.
+        CrlStatus::NotRevoked | CrlStatus::RemoveFromCrl(_) => Ok(RevocationStatus::Good),
+    }
+}
+
+/// Renders an error followed by its `source()` chain (`a: b: c`).
+///
+/// reqwest's top-level message ("error sending request") leaves out the
+/// cause — timed out, connection refused, DNS failure — which is the part
+/// that tells a user what went wrong.
+pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !out.contains(&cause_text) {
+            out.push_str(": ");
+            out.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    out
+}
+
+/// Checks whether `crl` carries a valid signature from `issuer`'s key.
+///
+/// Only `Ok(true)` counts: `X509Crl::verify` reports a signature that does not
+/// match as `Ok(false)` and reserves `Err` for malformed input, so treating
+/// "not an error" as success would accept a CRL signed by any key. An issuer
+/// whose public key cannot be extracted fails the check rather than panicking.
+fn is_crl_signed_by(crl: &X509Crl, issuer: &X509) -> bool {
+    issuer
+        .public_key()
+        .is_ok_and(|key| matches!(crl.verify(&key), Ok(true)))
 }
 
 /// Checks whether a CRL is still fresh enough to be trusted.
@@ -1373,6 +1390,12 @@ impl TLS {
     /// applied as the socket read timeout, so a server that accepts the TCP
     /// connection but never completes the handshake cannot block indefinitely.
     ///
+    /// A server that rejects the handshake at the protocol level (e.g. it only
+    /// speaks TLS 1.0, which OpenSSL's default security level refuses) is
+    /// retried once with legacy protocols enabled, on a new connection with
+    /// its own `timeout` — so it is inspected and graded rather than reported
+    /// as a failure. The negotiated `cipher.version` shows the outcome.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -1398,7 +1421,6 @@ impl TLS {
         timeout: Duration,
     ) -> Result<TLS, TLSError> {
         use openssl::nid::Nid;
-        use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
 
         // Trim any whitespace, and strip brackets that wrap IPv6 literals
         // (e.g. "[::1]" -> "::1") so address resolution and hostname matching
@@ -1413,27 +1435,20 @@ impl TLS {
             return Err(TLSError::Validation("Hostname cannot be empty".to_string()));
         }
 
-        let mut context = SslContext::builder(SslMethod::tls())?;
-        context.set_verify(SslVerifyMode::empty());
-        // Advertise HTTP/2 and HTTP/1.1 via ALPN so we can report what the
-        // server negotiates. Wire format: each protocol is a length-prefixed
-        // byte string. Best-effort — a server that ignores ALPN just yields
-        // `None`, and a failure to set it must not abort the diagnostic.
-        let _ = context.set_alpn_protos(b"\x02h2\x08http/1.1");
-        let context_builder = context.build();
-
-        let mut connector = Ssl::new(&context_builder)?;
-        connector.set_hostname(host)?;
-
         // Use the provided port or default to 443
         let port = port.unwrap_or(443);
         // Try every resolved address rather than only the first, so a host that
         // is up on one of its addresses is not reported as unreachable.
         let addrs = resolve_addrs(host, port)?;
-        let tcp_stream = connect_first_available(&addrs, timeout)?;
-
-        tcp_stream.set_read_timeout(Some(timeout))?;
-        let stream = connector.connect(tcp_stream)?;
+        let stream = match inspecting_handshake(host, &addrs, timeout, false) {
+            Err(err) if is_protocol_rejection(&err) => {
+                info!("{host}: handshake rejected with default settings; retrying with legacy protocols enabled");
+                // If the legacy attempt fails too, the original error is the
+                // one that describes a normal client's experience.
+                inspecting_handshake(host, &addrs, timeout, true).map_err(|_| err)?
+            }
+            other => other?,
+        };
 
         // `Ssl` object associated with this stream
         let ssl = stream.ssl();
@@ -1443,10 +1458,9 @@ impl TLS {
                 .current_cipher()
                 .map(|c| c.name().to_string())
                 .unwrap_or_else(|| "Unknown".to_string()),
-            version: ssl
-                .current_cipher()
-                .map(|c| c.version().to_string())
-                .unwrap_or_else(|| "Unknown".to_string()),
+            // The connection's protocol — not `SslCipherRef::version`, which is
+            // the oldest version the suite exists in.
+            version: ssl.version_str().to_string(),
             bits: ssl.current_cipher().map(|c| c.bits().secret).unwrap_or(0),
             // The negotiated ALPN protocol, if any (e.g. "h2", "http/1.1").
             alpn: ssl
@@ -1476,21 +1490,21 @@ impl TLS {
             .ok_or_else(|| TLSError::Certificate("Certificate not found".to_string()))?;
 
         // Check revocation status if requested
-        let revocation_status = if check_revocation {
+        let (revocation_status, revocation_detail) = if check_revocation {
             // Extract all certificates in the chain to X509 objects
             let cert_chain: Vec<openssl::x509::X509> =
                 peer_cert_chain.iter().map(|cert| cert.to_owned()).collect();
-
-            match check_revocation_status(&x509_ref, &cert_chain) {
-                Ok(status) => status,
-                Err(_) => RevocationStatus::Unknown,
-            }
+            revocation_status_with_detail(&x509_ref, &cert_chain)
         } else {
-            RevocationStatus::NotChecked
+            (RevocationStatus::NotChecked, None)
         };
+        if let Some(detail) = &revocation_detail {
+            warn!("Revocation status of {host} could not be determined: {detail}");
+        }
 
         let mut data = get_certificate_info(&x509_ref);
         data.revocation_status = revocation_status;
+        data.revocation_detail = revocation_detail;
 
         // Analyze certificate chain for security issues
         let cert_chain: Vec<openssl::x509::X509> =
@@ -1604,6 +1618,7 @@ impl TLS {
             sans: data.sans,
             chain: Some(chain_info),
             revocation_status: data.revocation_status,
+            revocation_detail: data.revocation_detail,
             trust,
             is_self_signed: data.is_self_signed,
             security_warnings,
@@ -1643,6 +1658,7 @@ impl TLS {
             grade,
             scan: None,
             ct: None,
+            ct_detail: None,
         })
     }
 
@@ -1672,11 +1688,81 @@ impl TLS {
     /// warning — an outage must not be reported as a problem. The
     /// [`ct::CtStatus`] is then stored for output.
     ///
+    /// A `NotLogged` for a certificate that carries embedded SCTs is recorded
+    /// as `Unknown` instead: crt.sh is one aggregator, not the logs, and it
+    /// misses certificates the logs themselves prove they include (seen with
+    /// google.com and letsencrypt.org leaves). The SCTs show the certificate
+    /// was submitted, so crt.sh's miss cannot be read as absence.
+    ///
     /// CT inclusion is informational and does **not** cap the grade: many
     /// legitimately private/internal certificates are intentionally absent
     /// from public CT logs, so callers — not the grade — decide what that
     /// means for a given host.
     pub fn apply_ct(&mut self, ct: ct::CtStatus) {
+        self.apply_ct_with_reason(ct, None);
+    }
+
+    /// Records a revocation result obtained after the initial check (e.g.
+    /// [`check_revocation_from_pem`], on demand) and recomputes the grade,
+    /// which a revoked certificate caps at F.
+    pub fn apply_revocation(&mut self, status: RevocationStatus, detail: Option<String>) {
+        self.certificate.revocation_status = status;
+        self.certificate.revocation_detail = detail;
+        if self.grade.is_some() {
+            let input = build_grading_input(&self.cipher, &self.certificate, self.scan.as_ref());
+            self.grade = Some(grading::calculate_grade(&input));
+        }
+    }
+
+    /// Incorporates the outcome of [`ct::check_ct_status`].
+    ///
+    /// A definitive answer goes through [`TLS::apply_ct`]. An `Err` ("could
+    /// not check") is recorded as [`ct::CtStatus::Unknown`] — never
+    /// `NotLogged` — with the reason kept in [`TLS::ct_detail`] and logged.
+    pub fn apply_ct_lookup(&mut self, lookup: Result<ct::CtStatus, TLSError>) {
+        match lookup {
+            Ok(status) => self.apply_ct(status),
+            Err(err) => {
+                // The `ct` module reports these as Unknown/Certificate with a
+                // self-describing message; skip the variant's generic prefix.
+                let reason = match err {
+                    TLSError::Unknown(msg) | TLSError::Certificate(msg) => msg,
+                    other => other.to_string(),
+                };
+                self.apply_ct_with_reason(ct::CtStatus::Unknown, Some(reason));
+            }
+        }
+    }
+
+    /// Records a CT status and, for an `Unknown` one, [`TLS::ct_detail`]:
+    /// `reason` (why crt.sh could not answer), then the certificate's embedded
+    /// SCTs as offline evidence it was submitted — which still holds when
+    /// crt.sh is down, and is why a crt.sh miss is not read as absence.
+    fn apply_ct_with_reason(&mut self, ct: ct::CtStatus, reason: Option<String>) {
+        let scts = self.certificate.scts.len();
+        let (ct, reason) = match ct {
+            ct::CtStatus::NotLogged if scts > 0 => (
+                ct::CtStatus::Unknown,
+                Some("crt.sh has no record of this certificate".to_string()),
+            ),
+            other => (other, reason),
+        };
+        self.ct_detail = None;
+        if matches!(ct, ct::CtStatus::Unknown) {
+            let evidence = (scts > 0).then(|| {
+                format!("the certificate carries {scts} embedded SCT(s), so it was submitted to CT logs")
+            });
+            self.ct_detail = match (reason, evidence) {
+                (Some(reason), Some(evidence)) => Some(format!("{reason}; {evidence}")),
+                (reason, evidence) => reason.or(evidence),
+            };
+            if let Some(detail) = &self.ct_detail {
+                warn!(
+                    "CT status of {} is unknown: {detail}",
+                    self.certificate.hostname
+                );
+            }
+        }
         if matches!(ct, ct::CtStatus::NotLogged) {
             self.certificate
                 .security_warnings
@@ -1687,6 +1773,52 @@ impl TLS {
         }
         self.ct = Some(ct);
     }
+}
+
+/// Connects to `addrs` and completes the inspecting handshake with `host`.
+///
+/// Peer verification is disabled on purpose (see [`TLS::from_with_timeout`]).
+/// With `legacy`, OpenSSL's security level is lowered to 0 so protocol
+/// versions and parameters the default level refuses (TLS 1.0/1.1, SHA-1
+/// signatures, small keys) can still be negotiated — only used to retry a
+/// server that rejected the default handshake.
+fn inspecting_handshake(
+    host: &str,
+    addrs: &[SocketAddr],
+    timeout: Duration,
+    legacy: bool,
+) -> Result<openssl::ssl::SslStream<TcpStream>, TLSError> {
+    use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
+
+    let mut context = SslContext::builder(SslMethod::tls())?;
+    context.set_verify(SslVerifyMode::empty());
+    if legacy {
+        context.set_security_level(0);
+    }
+    // Advertise HTTP/2 and HTTP/1.1 via ALPN so we can report what the
+    // server negotiates. Wire format: each protocol is a length-prefixed
+    // byte string. Best-effort — a server that ignores ALPN just yields
+    // `None`, and a failure to set it must not abort the diagnostic.
+    let _ = context.set_alpn_protos(b"\x02h2\x08http/1.1");
+    let context = context.build();
+
+    let mut connector = Ssl::new(&context)?;
+    connector.set_hostname(host)?;
+
+    let tcp_stream = connect_first_available(addrs, timeout)?;
+    tcp_stream.set_read_timeout(Some(timeout))?;
+    Ok(connector.connect(tcp_stream)?)
+}
+
+/// Whether a handshake failed because the server rejected it at the TLS
+/// protocol level (an alert, or no common version/cipher) — the case a legacy
+/// retry can fix. Timeouts and socket errors carry an I/O error and are not
+/// retried: a second attempt would only cost another `timeout`.
+fn is_protocol_rejection(err: &TLSError) -> bool {
+    matches!(
+        err,
+        TLSError::Handshake(HandshakeError::Failure(mid)) if mid.error().io_error().is_none()
+    )
 }
 
 /// Extracts the first entry from X.509 name entries and converts it to a string.
@@ -1811,6 +1943,7 @@ fn get_certificate_info(cert_ref: &X509) -> CertificateInfo {
         sans,
         chain: None,
         revocation_status: RevocationStatus::NotChecked,
+        revocation_detail: None,
         trust: TrustStatus::Unknown,
         is_self_signed: is_self_signed_certificate(cert_ref),
         security_warnings: Vec::new(),
@@ -2057,10 +2190,12 @@ pub fn is_self_signed_certificate(cert: &X509) -> bool {
 
     // A certificate is considered self-signed if the issuer and subject are the same,
     // and the certificate's signature can be verified with its own public key.
+    // `verify` returns `Ok(false)` for a signature that does not match, so
+    // only `Ok(true)` proves the certificate signed itself.
     subject.try_cmp(issuer).is_ok_and(|o| o.is_eq())
         && cert
             .public_key()
-            .is_ok_and(|pkey| cert.verify(&pkey).is_ok())
+            .is_ok_and(|pkey| matches!(cert.verify(&pkey), Ok(true)))
 }
 
 #[cfg(test)]
@@ -2091,6 +2226,131 @@ mod tests {
         let (listener, addr) = live_addr();
         drop(listener);
         addr
+    }
+
+    /// Starts an in-process loopback TLS server accepting protocol versions
+    /// `min..=max` (security level 0, so legacy versions are really offered)
+    /// with the given OpenSSL `cipher_list`, and returns its port. It serves
+    /// handshakes sequentially until the test process exits — enough for a
+    /// check or a scan, without depending on any external host.
+    fn spawn_tls_server(
+        min: openssl::ssl::SslVersion,
+        max: openssl::ssl::SslVersion,
+        cipher_list: &str,
+    ) -> u16 {
+        use openssl::ssl::{Ssl, SslContext, SslMethod};
+
+        let (cert, key) = make_test_x509("localhost");
+        let mut ctx = SslContext::builder(SslMethod::tls_server()).unwrap();
+        ctx.set_security_level(0);
+        ctx.set_min_proto_version(Some(min)).unwrap();
+        ctx.set_max_proto_version(Some(max)).unwrap();
+        ctx.set_cipher_list(cipher_list).unwrap();
+        ctx.set_certificate(&cert).unwrap();
+        ctx.set_private_key(&key).unwrap();
+        let ctx = ctx.build();
+
+        let (listener, addr) = live_addr();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                if let Ok(ssl) = Ssl::new(&ctx) {
+                    // Failures are expected: the scan offers versions and
+                    // ciphers the server rejects, and connect_first_available
+                    // opens a plain TCP connection first.
+                    let _ = ssl.accept(stream);
+                }
+            }
+        });
+        addr.port()
+    }
+
+    #[test]
+    fn test_reports_negotiated_protocol_not_cipher_minimum_version() {
+        // ECDHE-RSA-AES128-SHA dates from TLS 1.0, so the cipher's own version
+        // is "TLSv1.0" even though TLS 1.2 is what was negotiated.
+        use openssl::ssl::SslVersion;
+        let port = spawn_tls_server(
+            SslVersion::TLS1_2,
+            SslVersion::TLS1_2,
+            "ECDHE-RSA-AES128-SHA",
+        );
+
+        let tls =
+            TLS::from_with_timeout("127.0.0.1", Some(port), false, true, Duration::from_secs(5))
+                .expect("loopback TLS 1.2 handshake");
+
+        assert_eq!(tls.cipher.name, "ECDHE-RSA-AES128-SHA");
+        assert_eq!(tls.cipher.version, "TLSv1.2");
+        let protocol = &tls.grade.unwrap().categories[0];
+        assert_eq!(protocol.category, "Protocol Version");
+        assert_eq!(protocol.score, 80, "graded as TLS 1.2: {}", protocol.reason);
+    }
+
+    #[test]
+    fn test_tls10_only_server_is_inspected() {
+        // A diagnostic tool must report a legacy-only server, not fail on it.
+        use openssl::ssl::SslVersion;
+        let port = spawn_tls_server(SslVersion::TLS1, SslVersion::TLS1, "DEFAULT");
+
+        let tls =
+            TLS::from_with_timeout("127.0.0.1", Some(port), false, true, Duration::from_secs(5))
+                .expect("a TLS 1.0-only server should still be inspected");
+
+        assert_eq!(tls.cipher.version, "TLSv1");
+        let grade = tls.grade.unwrap();
+        assert!(
+            grade.score <= 54,
+            "TLS 1.0 caps the grade at D, got {}",
+            grade.score
+        );
+    }
+
+    #[test]
+    fn test_scan_detects_tls10_and_tls11() {
+        use openssl::ssl::SslVersion;
+        let port = spawn_tls_server(SslVersion::TLS1, SslVersion::TLS1_3, "DEFAULT");
+
+        let scan =
+            crate::probe::scan_tls_with_timeout("127.0.0.1", Some(port), Duration::from_secs(5))
+                .expect("loopback scan");
+        let supported = |v: ProtoVersion| {
+            scan.protocols
+                .iter()
+                .find(|p| p.version == v)
+                .is_some_and(|p| p.supported)
+        };
+
+        for v in [
+            ProtoVersion::Tls1_0,
+            ProtoVersion::Tls1_1,
+            ProtoVersion::Tls1_2,
+            ProtoVersion::Tls1_3,
+        ] {
+            assert!(
+                supported(v),
+                "{v} is accepted by the server but was not detected"
+            );
+        }
+        let sslv3 = scan
+            .protocols
+            .iter()
+            .find(|p| p.version == ProtoVersion::Ssl3)
+            .unwrap();
+        assert!(
+            !sslv3.tested,
+            "SSLv3 is compiled out, so it cannot be probed"
+        );
+        let tls10 = scan
+            .protocols
+            .iter()
+            .find(|p| p.version == ProtoVersion::Tls1_0)
+            .unwrap();
+        assert!(
+            tls10.ciphers.iter().any(|c| c == "ECDHE-RSA-AES128-SHA"),
+            "TLS 1.0 ciphers should be enumerated: {:?}",
+            tls10.ciphers
+        );
     }
 
     #[test]
@@ -2204,6 +2464,7 @@ mod tests {
                     signature_algorithm: "sha256WithRSAEncryption".to_string(),
                 }]),
                 revocation_status: RevocationStatus::NotChecked,
+                revocation_detail: None,
                 trust: TrustStatus::Unknown,
                 is_self_signed: false,
                 security_warnings: vec![],
@@ -2227,6 +2488,7 @@ mod tests {
             grade: None,
             scan: None,
             ct: None,
+            ct_detail: None,
         }
     }
 
@@ -2244,6 +2506,7 @@ mod tests {
             has_incomplete_chain: false,
             has_weak_signature: false,
             has_hostname_mismatch: false,
+            has_invalid_chain_signature: false,
             supports_obsolete_protocol: false,
             accepts_weak_cipher: false,
             is_revoked: false,
@@ -3013,10 +3276,21 @@ mod tests {
     /// from now (negative = already stale). The builder requires an AKID,
     /// a CRL number, and at least one revoked entry, so those are included.
     fn make_test_crl(next_update_offset_secs: i64) -> openssl::x509::X509Crl {
+        let (issuer_cert, issuer_key) = make_test_x509("Test CA");
+        make_test_crl_signed_by(next_update_offset_secs, &issuer_cert, &issuer_key)
+    }
+
+    /// Like [`make_test_crl`], but naming `issuer_cert` as the CRL issuer and
+    /// signing with `signing_key` — which need not be `issuer_cert`'s key, so
+    /// a forged CRL can be built.
+    fn make_test_crl_signed_by(
+        next_update_offset_secs: i64,
+        issuer_cert: &X509,
+        signing_key: &PKey<Private>,
+    ) -> openssl::x509::X509Crl {
         use openssl::x509::extension::AuthorityKeyIdentifier;
         use openssl::x509::{CrlNumber, X509CrlBuilder, X509RevokedBuilder};
 
-        let (issuer_cert, issuer_key) = make_test_x509("Test CA");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3052,8 +3326,26 @@ mod tests {
         builder.append_extension(aki).unwrap();
         builder.append_extension(crl_number).unwrap();
         builder.add_revoked(revoked.build()).unwrap();
-        builder.sign(&issuer_key, MessageDigest::sha256()).unwrap();
+        builder.sign(signing_key, MessageDigest::sha256()).unwrap();
         builder.build().unwrap()
+    }
+
+    #[test]
+    fn test_crl_signed_by_issuer_is_accepted() {
+        let (issuer_cert, issuer_key) = make_test_x509("Test CA");
+        let crl = make_test_crl_signed_by(7 * 86_400, &issuer_cert, &issuer_key);
+        assert!(crate::is_crl_signed_by(&crl, &issuer_cert));
+    }
+
+    #[test]
+    fn test_crl_with_foreign_signature_is_rejected() {
+        // Names the real issuer but is signed by an unrelated key — what an
+        // on-path attacker serving a forged CRL over HTTP would produce.
+        // `X509Crl::verify` reports a bad signature as `Ok(false)`, not `Err`.
+        let (issuer_cert, _) = make_test_x509("Test CA");
+        let (_, attacker_key) = make_test_x509("Attacker");
+        let crl = make_test_crl_signed_by(7 * 86_400, &issuer_cert, &attacker_key);
+        assert!(!crate::is_crl_signed_by(&crl, &issuer_cert));
     }
 
     #[test]
@@ -3304,6 +3596,55 @@ mod tests {
         assert!(
             super::is_self_signed_certificate(&self_signed_cert),
             "Certificate created by make_test_x509 should be self-signed"
+        );
+    }
+
+    /// Builds a *self-issued* cert (subject == issuer) whose signature was
+    /// made by a key other than the one it carries — it looks like a root by
+    /// name but its signature does not verify against its own key. Also
+    /// returns the private half of the key it carries, so it can still issue
+    /// validly-signed children.
+    fn make_test_x509_forged_self_issued(common_name: &str) -> (X509, PKey<Private>) {
+        let (template, key) = make_test_x509(common_name);
+        let (_, other_key) = make_test_x509("Other Key");
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_serial_number(template.serial_number()).unwrap();
+        builder.set_subject_name(template.subject_name()).unwrap();
+        builder.set_issuer_name(template.subject_name()).unwrap();
+        builder.set_pubkey(&template.public_key().unwrap()).unwrap();
+        builder.set_not_before(template.not_before()).unwrap();
+        builder.set_not_after(template.not_after()).unwrap();
+        builder.sign(&other_key, MessageDigest::sha256()).unwrap();
+        (builder.build(), key)
+    }
+
+    #[test]
+    fn test_self_issued_with_bad_signature_is_not_self_signed() {
+        let (forged, _) = make_test_x509_forged_self_issued("Forged Root");
+        assert!(
+            !super::is_self_signed_certificate(&forged),
+            "a self-issued cert whose signature does not verify is not self-signed"
+        );
+    }
+
+    #[test]
+    fn test_analyze_chain_flags_forged_self_issued_cert() {
+        // A forged "root" used to be skipped as self-signed, so its bad
+        // signature was never reported. The leaf is validly signed by the
+        // root's key, so the only broken link is the root itself.
+        let (forged, root_key) = make_test_x509_forged_self_issued("Forged Root");
+        let leaf = make_test_x509_signed_by("leaf.example.com", &forged, &root_key);
+        let warnings = super::analyze_certificate_chain(&leaf, &[leaf.clone(), forged]);
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                super::SecurityWarning::InvalidChainSignature(msg)
+                    if msg.starts_with("Certificate 'Forged Root'")
+            )),
+            "expected an InvalidChainSignature warning for the forged root, got {:?}",
+            warnings
         );
     }
 
@@ -3791,6 +4132,7 @@ mod tests {
     ) -> crate::probe::ProtocolSupport {
         crate::probe::ProtocolSupport {
             version,
+            tested: true,
             supported,
             ciphers: ciphers.iter().map(|s| s.to_string()).collect(),
         }
@@ -3953,6 +4295,246 @@ mod tests {
         // A strong negotiated cipher must NOT trip the flag.
         let strong = crate::build_grading_input(&make_test_tls().cipher, &tls.certificate, None);
         assert!(!strong.accepts_weak_cipher);
+    }
+
+    #[test]
+    fn test_invalid_chain_signature_caps_grade_without_trust_store() {
+        // Without a trust store the trust verdict is `Unknown`, so the chain
+        // analysis is the only thing that saw the forged signature — it must
+        // still keep the grade from reading as healthy.
+        let mut tls = make_test_tls();
+        tls.certificate.trust = TrustStatus::Unknown;
+        tls.certificate
+            .security_warnings
+            .push(SecurityWarning::InvalidChainSignature(
+                "Certificate 'test.example.com' is not validly signed by its issuer 'Test CA Root'"
+                    .to_string(),
+            ));
+
+        let grade = grading::calculate_grade(&crate::build_grading_input(
+            &tls.cipher,
+            &tls.certificate,
+            None,
+        ));
+        assert!(
+            grade.score <= 69,
+            "an invalid chain signature should cap the grade at C (69), got {} ({})",
+            grade.score,
+            grade.grade
+        );
+    }
+
+    #[test]
+    fn test_apply_ct_not_logged_with_embedded_scts_is_unknown() {
+        // crt.sh is one aggregator, not the logs: it has answered "Certificate
+        // not found" for google.com and letsencrypt.org leaves whose SCTs are
+        // valid and whose precertificates the logs prove they include.
+        let mut tls = make_test_tls();
+        tls.certificate.scts = vec![crate::sct::Sct {
+            version: 0,
+            log_id: "ab".repeat(32),
+            timestamp_ms: 1_789_071_715_432,
+            timestamp: "2026-09-10T20:21:55Z".to_string(),
+        }];
+
+        tls.apply_ct(crate::ct::CtStatus::NotLogged);
+
+        assert_eq!(tls.ct, Some(crate::ct::CtStatus::Unknown));
+        assert!(tls
+            .ct_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("1 embedded SCT")));
+        assert!(!tls
+            .certificate
+            .security_warnings
+            .iter()
+            .any(|w| matches!(w, SecurityWarning::NotInCertificateTransparency(_))));
+    }
+
+    #[test]
+    fn test_revocation_detail_when_issuer_missing() {
+        let (ca_cert, ca_key) = make_test_x509("Detail CA");
+        let leaf = make_test_x509_signed_by("leaf.example.com", &ca_cert, &ca_key);
+
+        let (status, detail) =
+            crate::revocation_status_with_detail(&leaf, std::slice::from_ref(&leaf));
+
+        assert_eq!(status, RevocationStatus::Unknown);
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                "OCSP: issuer certificate is not in the presented chain; \
+                 CRL: issuer certificate is not in the presented chain"
+            )
+        );
+    }
+
+    #[test]
+    fn test_revocation_detail_when_certificate_lists_no_endpoints() {
+        let (ca_cert, ca_key) = make_test_x509("Detail CA");
+        let leaf = make_test_x509_signed_by("leaf.example.com", &ca_cert, &ca_key);
+
+        let (status, detail) =
+            crate::revocation_status_with_detail(&leaf, &[leaf.clone(), ca_cert]);
+
+        assert_eq!(status, RevocationStatus::Unknown);
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                "OCSP: certificate lists no OCSP responder; \
+                 CRL: certificate lists no CRL distribution point"
+            )
+        );
+    }
+
+    #[test]
+    fn test_revocation_detail_names_unreachable_crl_and_cause() {
+        // Loopback with nothing listening: refused immediately, no network.
+        let url = format!("http://{}/ca.crl", dead_addr());
+        let cert = make_test_x509_with_crl_dps(&[url.as_str()]);
+
+        let (status, detail) =
+            crate::revocation_status_with_detail(&cert, std::slice::from_ref(&cert));
+
+        assert_eq!(status, RevocationStatus::Unknown);
+        let detail = detail.expect("an Unknown status carries its reason");
+        assert!(
+            detail.contains(&format!("CRL: {url}: request failed")),
+            "{detail}"
+        );
+        // The cause from reqwest's source chain, not just "error sending request".
+        assert!(detail.to_lowercase().contains("refused"), "{detail}");
+    }
+
+    #[test]
+    fn test_definitive_revocation_has_no_detail() {
+        let tls = make_test_tls();
+        assert!(tls.certificate.revocation_detail.is_none());
+    }
+
+    #[test]
+    fn test_apply_ct_lookup_error_is_unknown_with_reason() {
+        let mut tls = make_test_tls();
+        tls.apply_ct_lookup(Err(TLSError::Unknown(
+            "CT lookup returned HTTP 502 Bad Gateway".to_string(),
+        )));
+
+        assert_eq!(tls.ct, Some(crate::ct::CtStatus::Unknown));
+        assert_eq!(
+            tls.ct_detail.as_deref(),
+            Some("CT lookup returned HTTP 502 Bad Gateway")
+        );
+        assert!(tls.certificate.security_warnings.is_empty());
+    }
+
+    #[test]
+    fn test_ct_detail_carries_embedded_sct_evidence() {
+        let sct = crate::sct::Sct {
+            version: 0,
+            log_id: "ab".repeat(32),
+            timestamp_ms: 0,
+            timestamp: "2026-09-10T20:21:55Z".to_string(),
+        };
+        let evidence = "the certificate carries 1 embedded SCT(s), so it was submitted to CT logs";
+
+        // crt.sh could not be queried: its reason, then the offline evidence.
+        let mut failed = make_test_tls();
+        failed.certificate.scts = vec![sct.clone()];
+        failed.apply_ct_lookup(Err(TLSError::Unknown("timeout".to_string())));
+        assert_eq!(failed.ct_detail, Some(format!("timeout; {evidence}")));
+
+        // crt.sh has no record: why that was not read as absence.
+        let mut unlisted = make_test_tls();
+        unlisted.certificate.scts = vec![sct];
+        unlisted.apply_ct(crate::ct::CtStatus::NotLogged);
+        assert_eq!(
+            unlisted.ct_detail,
+            Some(format!(
+                "crt.sh has no record of this certificate; {evidence}"
+            ))
+        );
+
+        // No SCTs: nothing to add.
+        let mut plain = make_test_tls();
+        plain.apply_ct_lookup(Err(TLSError::Unknown("timeout".to_string())));
+        assert_eq!(plain.ct_detail.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn test_check_revocation_from_pem_uses_the_kept_chain() {
+        let (ca_cert, ca_key) = make_test_x509("Kept CA");
+        let leaf = make_test_x509_signed_by("leaf.example.com", &ca_cert, &ca_key);
+        let pem = [leaf.to_pem().unwrap(), ca_cert.to_pem().unwrap()].concat();
+
+        let (status, detail) = crate::check_revocation_from_pem(&String::from_utf8(pem).unwrap());
+
+        // The issuer came from the PEM: the failures are about endpoints, not
+        // a missing issuer.
+        assert_eq!(status, RevocationStatus::Unknown);
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                "OCSP: certificate lists no OCSP responder; \
+                 CRL: certificate lists no CRL distribution point"
+            )
+        );
+    }
+
+    #[test]
+    fn test_check_revocation_from_pem_without_chain() {
+        let (status, detail) = crate::check_revocation_from_pem("");
+        assert_eq!(status, RevocationStatus::Unknown);
+        assert_eq!(
+            detail.as_deref(),
+            Some("no certificate chain was kept for this result")
+        );
+    }
+
+    #[test]
+    fn test_apply_revocation_recomputes_grade() {
+        let mut tls = make_test_tls();
+        tls.grade = Some(grading::calculate_grade(&crate::build_grading_input(
+            &tls.cipher,
+            &tls.certificate,
+            None,
+        )));
+        assert!(tls.grade.as_ref().unwrap().score > 0);
+
+        tls.apply_revocation(
+            RevocationStatus::Revoked("Revoked via CRL".to_string()),
+            None,
+        );
+
+        assert_eq!(tls.grade.as_ref().unwrap().grade, "F");
+        assert_eq!(
+            tls.certificate.revocation_status,
+            RevocationStatus::Revoked("Revoked via CRL".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_ct_definitive_clears_detail() {
+        let mut tls = make_test_tls();
+        tls.apply_ct_lookup(Err(TLSError::Unknown("timeout".to_string())));
+        tls.apply_ct(crate::ct::CtStatus::Logged {
+            crtsh_id: 1,
+            crtsh_url: "https://crt.sh/?id=1".to_string(),
+        });
+        assert!(tls.ct_detail.is_none());
+    }
+
+    #[test]
+    fn test_apply_ct_not_logged_without_scts_warns() {
+        // No embedded SCTs and absent from crt.sh: absence is plausible.
+        let mut tls = make_test_tls(); // scts empty
+        tls.apply_ct(crate::ct::CtStatus::NotLogged);
+
+        assert_eq!(tls.ct, Some(crate::ct::CtStatus::NotLogged));
+        assert!(tls
+            .certificate
+            .security_warnings
+            .iter()
+            .any(|w| matches!(w, SecurityWarning::NotInCertificateTransparency(_))));
     }
 
     #[test]
