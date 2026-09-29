@@ -32,8 +32,10 @@ pub mod grading;
 pub mod probe;
 pub mod sct;
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use openssl::asn1::{Asn1Time, Asn1TimeRef};
@@ -1083,12 +1085,7 @@ fn query_ocsp_responder(
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    let body = response.bytes().map_err(|e| {
-        format!(
-            "could not read the response: {}",
-            error_chain(&e.without_url())
-        )
-    })?;
+    let body = read_body_limited(response, MAX_OCSP_RESPONSE_BYTES)?;
 
     let ocsp_response = OcspResponse::from_der(&body)
         .map_err(|_| "response is not a valid OCSP response".to_string())?;
@@ -1182,29 +1179,15 @@ fn crl_revocation(cert: &X509, chain: &[X509]) -> Result<RevocationStatus, Strin
     Err(failures.join("; "))
 }
 
-/// Downloads one CRL and looks `cert` up in it. `Ok` is a definitive `Good`
-/// or `Revoked`; `Err` is why this CRL could not be used.
+/// Looks `cert` up in the CRL at `url` (downloaded once and shared — see
+/// [`cached_crl`]). `Ok` is a definitive `Good` or `Revoked`; `Err` is why
+/// this CRL could not be used.
 fn crl_status_from(url: &str, cert: &X509, issuer: &X509) -> Result<RevocationStatus, String> {
-    let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .and_then(|client| client.get(url).send())
-        .map_err(|e| format!("request failed: {}", error_chain(&e.without_url())))?;
-    if !response.status().is_success() {
-        return Err(format!("HTTP {}", response.status()));
-    }
-    let body = response.bytes().map_err(|e| {
-        format!(
-            "could not read the response: {}",
-            error_chain(&e.without_url())
-        )
-    })?;
+    let crl = cached_crl(url)?;
 
-    // DER is what RFC 5280 distribution points serve; accept PEM too.
-    let crl = X509Crl::from_der(&body)
-        .or_else(|_| X509Crl::from_pem(&body))
-        .map_err(|_| "response is not a CRL".to_string())?;
-
+    // Signature and freshness are checked on every use, not once per
+    // download: the cache is keyed by URL, and each certificate brings its
+    // own issuer to verify against.
     if !is_crl_signed_by(&crl, issuer) {
         warn!("CRL from {url} is not signed by the certificate's issuer; ignoring it");
         return Err("CRL is not signed by the certificate's issuer".to_string());
@@ -1225,6 +1208,210 @@ fn crl_status_from(url: &str, cert: &X509, issuer: &X509) -> Result<RevocationSt
         )),
         // Not listed, or removed from the CRL after a temporary hold.
         CrlStatus::NotRevoked | CrlStatus::RemoveFromCrl(_) => Ok(RevocationStatus::Good),
+    }
+}
+
+/// Largest CRL accepted. Real ones run from tens of KB to tens of MB; the URL
+/// comes from the certificate under inspection, so without a bound a hostile
+/// or broken distribution point could exhaust memory.
+const MAX_CRL_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Largest OCSP response accepted (real ones are a few KB).
+const MAX_OCSP_RESPONSE_BYTES: u64 = 256 * 1024;
+
+/// How long a downloaded CRL is reused. Freshness is still checked on every
+/// use ([`is_crl_fresh`]); this only bounds how long a long-running process
+/// holds one.
+const CRL_CACHE_TTL: Duration = Duration::from_secs(3600);
+
+/// How long a failed download is remembered, so hosts sharing a dead or hung
+/// distribution point don't each wait out the 10s timeout — short, so a
+/// transient failure doesn't stick.
+const CRL_FAILURE_TTL: Duration = Duration::from_secs(60);
+
+/// Downloaded CRLs kept at most, by count and by total size. A parsed CRL
+/// takes several times its encoded size in memory, and a fleet on a CA that
+/// shards its CRLs (Let's Encrypt, Google) touches many distinct ones.
+const CRL_CACHE_MAX_ENTRIES: usize = 16;
+const CRL_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// One URL's download: the parsed CRL shared by every check that needs it,
+/// or why it could not be fetched.
+struct CachedCrl {
+    crl: Result<Arc<X509Crl>, String>,
+    /// Encoded size, counted against [`CRL_CACHE_MAX_BYTES`].
+    size: usize,
+    fetched: Instant,
+}
+
+impl CachedCrl {
+    fn expired(&self) -> bool {
+        let ttl = if self.crl.is_ok() {
+            CRL_CACHE_TTL
+        } else {
+            CRL_FAILURE_TTL
+        };
+        self.fetched.elapsed() > ttl
+    }
+}
+
+struct CrlCacheEntry {
+    /// Filled once by whichever check asks first; the others block on it.
+    cell: Arc<OnceLock<CachedCrl>>,
+    last_used: Instant,
+}
+
+/// Downloaded CRLs by URL, shared across threads.
+///
+/// Hosts issued by the same CA name the same distribution point; without
+/// this, each re-downloaded and re-parsed it — every concurrent worker at
+/// once. A caller that finds a download in progress waits for it rather than
+/// starting its own. The map lock is only held to find the entry, never
+/// during the download.
+struct CrlCache {
+    entries: Mutex<HashMap<String, CrlCacheEntry>>,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl CrlCache {
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        CrlCache {
+            entries: Mutex::default(),
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    /// The CRL at `url`, from the cache or — at most once per TTL, however
+    /// many threads ask — from `fetch`.
+    fn get(
+        &self,
+        url: &str,
+        fetch: impl FnOnce(&str) -> Result<(X509Crl, usize), String>,
+    ) -> Result<Arc<X509Crl>, String> {
+        let cell = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if entries
+                .get(url)
+                .and_then(|entry| entry.cell.get())
+                .is_some_and(CachedCrl::expired)
+            {
+                entries.remove(url);
+            }
+            let now = Instant::now();
+            let entry = entries
+                .entry(url.to_string())
+                .or_insert_with(|| CrlCacheEntry {
+                    cell: Arc::default(),
+                    last_used: now,
+                });
+            entry.last_used = now;
+            let cell = Arc::clone(&entry.cell);
+            self.evict(&mut entries, url);
+            cell
+        };
+        cell.get_or_init(|| {
+            let (crl, size) = match fetch(url) {
+                Ok((crl, size)) => (Ok(Arc::new(crl)), size),
+                Err(reason) => (Err(reason), 0),
+            };
+            CachedCrl {
+                crl,
+                size,
+                fetched: Instant::now(),
+            }
+        })
+        .crl
+        .clone()
+    }
+
+    /// Drops least-recently-used finished downloads until the cache is within
+    /// its bounds. Downloads in progress, and `keep` (the one just
+    /// requested), are never evicted; a check already holding an evicted CRL
+    /// keeps its own reference.
+    fn evict(&self, entries: &mut HashMap<String, CrlCacheEntry>, keep: &str) {
+        loop {
+            let finished = || {
+                entries
+                    .iter()
+                    .filter_map(|(url, entry)| entry.cell.get().map(|c| (url, entry, c)))
+            };
+            let count = finished().count();
+            let bytes: usize = finished().map(|(_, _, c)| c.size).sum();
+            if count <= self.max_entries && bytes <= self.max_bytes {
+                return;
+            }
+            let Some(oldest) = finished()
+                .filter(|(url, _, _)| url.as_str() != keep)
+                .min_by_key(|(_, entry, _)| entry.last_used)
+                .map(|(url, _, _)| url.clone())
+            else {
+                return;
+            };
+            entries.remove(&oldest);
+        }
+    }
+}
+
+/// The CRL at `url`, through the process-wide [`CrlCache`].
+fn cached_crl(url: &str) -> Result<Arc<X509Crl>, String> {
+    static CACHE: OnceLock<CrlCache> = OnceLock::new();
+    CACHE
+        .get_or_init(|| CrlCache::new(CRL_CACHE_MAX_ENTRIES, CRL_CACHE_MAX_BYTES))
+        .get(url, |url| fetch_crl(url, MAX_CRL_BYTES))
+}
+
+/// Downloads and parses one CRL (at most `limit` bytes), returning it with
+/// its encoded size.
+fn fetch_crl(url: &str, limit: u64) -> Result<(X509Crl, usize), String> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .and_then(|client| client.get(url).send())
+        .map_err(|e| format!("request failed: {}", error_chain(&e.without_url())))?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let body = read_body_limited(response, limit)?;
+
+    // DER is what RFC 5280 distribution points serve; accept PEM too.
+    let crl = X509Crl::from_der(&body)
+        .or_else(|_| X509Crl::from_pem(&body))
+        .map_err(|_| "response is not a CRL".to_string())?;
+    Ok((crl, body.len()))
+}
+
+/// Reads a response body, failing once it exceeds `limit` bytes — checked
+/// against Content-Length up front, and enforced while reading since that
+/// header can be absent or wrong.
+fn read_body_limited(response: reqwest::blocking::Response, limit: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let too_large = || format!("response exceeds the {} limit", format_bytes(limit));
+    if response.content_length().is_some_and(|len| len > limit) {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    response
+        .take(limit + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| format!("could not read the response: {}", error_chain(&e)))?;
+    if body.len() as u64 > limit {
+        return Err(too_large());
+    }
+    Ok(body)
+}
+
+/// `32 MiB` / `256 KiB` / `100 bytes`, for limit messages.
+fn format_bytes(n: u64) -> String {
+    match n {
+        n if n >= 1024 * 1024 && n % (1024 * 1024) == 0 => format!("{} MiB", n / (1024 * 1024)),
+        n if n >= 1024 && n % 1024 == 0 => format!("{} KiB", n / 1024),
+        n => format!("{n} bytes"),
     }
 }
 
@@ -4349,6 +4536,227 @@ mod tests {
             .security_warnings
             .iter()
             .any(|w| matches!(w, SecurityWarning::NotInCertificateTransparency(_))));
+    }
+
+    // ── CRL cache and download limits ─────────────────────────────────
+
+    /// Minimal loopback HTTP/1.1 server answering every request with
+    /// `status` and `body` after `delay`, counting requests. Each connection
+    /// gets its own thread, so concurrent clients really overlap.
+    fn spawn_http_server(
+        status: u16,
+        body: Vec<u8>,
+        send_length: bool,
+        delay: Duration,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (counter, body) = (Arc::clone(&hits), Arc::new(body));
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let (counter, body) = (Arc::clone(&counter), Arc::clone(&body));
+                std::thread::spawn(move || {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(delay);
+                    let length = if send_length {
+                        format!("Content-Length: {}\r\n", body.len())
+                    } else {
+                        String::new()
+                    };
+                    let head = format!("HTTP/1.1 {status} X\r\n{length}Connection: close\r\n\r\n");
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&body);
+                });
+            }
+        });
+        (base, hits)
+    }
+
+    /// A CA-issued leaf whose CRL Distribution Point is `url`.
+    fn make_test_leaf_with_crl_dp(ca_cert: &X509, ca_key: &PKey<Private>, url: &str) -> X509 {
+        use openssl::asn1::{Asn1Object, Asn1OctetString};
+        use openssl::x509::X509Extension;
+
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "crl-leaf.example")
+            .unwrap();
+        let name = name.build();
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(ca_cert.subject_name()).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(30).unwrap())
+            .unwrap();
+        let obj = Asn1Object::from_str("2.5.29.31").unwrap();
+        let value = Asn1OctetString::new_from_bytes(&crl_dp_der(&[url])).unwrap();
+        builder
+            .append_extension(X509Extension::new_from_der(&obj, false, &value).unwrap())
+            .unwrap();
+        builder.sign(ca_key, MessageDigest::sha256()).unwrap();
+        builder.build()
+    }
+
+    /// DER of a fresh CRL from a throwaway CA, for fake downloads.
+    fn test_crl_der() -> Vec<u8> {
+        make_test_crl(7 * 86_400).to_der().unwrap()
+    }
+
+    #[test]
+    fn test_crl_cache_downloads_once_for_concurrent_callers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = crate::CrlCache::new(16, 16 << 20);
+        let der = test_crl_der();
+        let downloads = AtomicUsize::new(0);
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        cache.get("http://ca.example/shared.crl", |_| {
+                            downloads.fetch_add(1, Ordering::SeqCst);
+                            // Slow enough that every caller arrives mid-download.
+                            std::thread::sleep(Duration::from_millis(150));
+                            Ok((openssl::x509::X509Crl::from_der(&der).unwrap(), der.len()))
+                        })
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert!(handle.join().unwrap().is_ok());
+            }
+        });
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_crl_cache_reuses_downloads_and_remembers_failures() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = crate::CrlCache::new(16, 16 << 20);
+        let der = test_crl_der();
+        let downloads = AtomicUsize::new(0);
+        let ok = |_: &str| {
+            downloads.fetch_add(1, Ordering::SeqCst);
+            Ok((openssl::x509::X509Crl::from_der(&der).unwrap(), der.len()))
+        };
+        let failing = |_: &str| {
+            downloads.fetch_add(1, Ordering::SeqCst);
+            Err("request failed: operation timed out".to_string())
+        };
+
+        assert!(cache.get("http://ok.example/a.crl", ok).is_ok());
+        assert!(cache.get("http://ok.example/a.crl", ok).is_ok());
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+
+        // A hung distribution point costs its timeout once, not once per host.
+        for _ in 0..2 {
+            assert_eq!(
+                cache
+                    .get("http://dead.example/a.crl", failing)
+                    .err()
+                    .as_deref(),
+                Some("request failed: operation timed out")
+            );
+        }
+        assert_eq!(downloads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_crl_cache_evicts_least_recently_used() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let der = test_crl_der();
+        let downloads = AtomicUsize::new(0);
+        let fetch = |_: &str| {
+            downloads.fetch_add(1, Ordering::SeqCst);
+            Ok((openssl::x509::X509Crl::from_der(&der).unwrap(), der.len()))
+        };
+        let count = || downloads.load(Ordering::SeqCst);
+
+        // By count: room for two.
+        let cache = crate::CrlCache::new(2, usize::MAX);
+        cache.get("a", fetch).unwrap();
+        cache.get("b", fetch).unwrap();
+        cache.get("a", fetch).unwrap(); // hit; `a` is now the most recent
+        cache.get("c", fetch).unwrap(); // over the bound once `c` is in
+        assert_eq!(count(), 3);
+        cache.get("a", fetch).unwrap(); // still cached — `b` was the oldest
+        assert_eq!(count(), 3);
+        cache.get("b", fetch).unwrap(); // evicted, so downloaded again
+        assert_eq!(count(), 4);
+
+        // By size: room for one CRL's bytes.
+        downloads.store(0, Ordering::SeqCst);
+        let cache = crate::CrlCache::new(16, der.len());
+        cache.get("x", fetch).unwrap();
+        cache.get("y", fetch).unwrap();
+        cache.get("y", fetch).unwrap(); // evicts `x` to fit
+        cache.get("x", fetch).unwrap();
+        assert_eq!(count(), 3);
+    }
+
+    #[test]
+    fn test_fetch_crl_rejects_oversized_bodies() {
+        for send_length in [true, false] {
+            let (base, hits) = spawn_http_server(200, vec![0u8; 4096], send_length, Duration::ZERO);
+            let err = crate::fetch_crl(&format!("{base}/big.crl"), 1024).err();
+            assert_eq!(
+                err.as_deref(),
+                Some("response exceeds the 1 KiB limit"),
+                "Content-Length sent: {send_length}"
+            );
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn test_hosts_sharing_a_crl_download_it_once() {
+        // End to end through the revocation check and the process-wide cache:
+        // eight concurrent checks of certificates from one CA, one download.
+        let (ca_cert, ca_key) = make_test_x509("Shared CRL CA");
+        let crl = make_test_crl_signed_by(7 * 86_400, &ca_cert, &ca_key);
+        let (base, hits) =
+            spawn_http_server(200, crl.to_der().unwrap(), true, Duration::from_millis(150));
+        let url = format!("{base}/shared.crl");
+        let leaves: Vec<X509> = (0..8)
+            .map(|_| make_test_leaf_with_crl_dp(&ca_cert, &ca_key, &url))
+            .collect();
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = leaves
+                .iter()
+                .map(|leaf| {
+                    let chain = vec![leaf.clone(), ca_cert.clone()];
+                    s.spawn(move || crate::crl_revocation(leaf, &chain))
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), Ok(RevocationStatus::Good));
+            }
+        });
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

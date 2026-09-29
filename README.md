@@ -215,6 +215,18 @@ The value is the budget for the **connect phase of one host** — shared across 
 
 It is deliberately named for what it bounds: it does **not** cap the whole check. `--check-revocation` (OCSP and each CRL distribution point) and `--ct-check` keep their own separate timeouts, and `--scan` caps its per-handshake wait at 10 seconds regardless of this setting, since a scan performs on the order of a hundred connections. Note that lowering the timeout can make `--scan` report a protocol as unsupported when the probe merely timed out.
 
+### Concurrency
+
+Hosts are checked 32 at a time by default. Use `--concurrency` to change that (1–128):
+
+```sh
+➜ tlschecker --concurrency 64 $(cat hosts.txt)
+```
+
+A check spends its time waiting on the network, not the CPU, so the default does not depend on the machine's cores: a container limited to a single CPU checks as many hosts at once as a large server. Raise it for large host lists; lower it to go easy on a shared network or on many hosts behind a single address.
+
+With `--check-revocation`, hosts whose certificates name the same CRL distribution point share one download of it, and a download is refused above 32 MiB (256 KiB for an OCSP response), so checking many hosts at once does not multiply memory use.
+
 Hostnames that resolve to several addresses (an A and a AAAA record, or a pool of load-balanced servers) are tried **in resolution order until one accepts**, so a host that is up on one of its addresses is not reported as unreachable just because the first address it resolves to is not. This matters most on IPv4-only networks whose resolver still returns AAAA records.
 
 ### Certificate Fingerprints

@@ -136,6 +136,15 @@ struct Args {
     #[arg(long, value_name = "SECONDS")]
     connect_timeout: Option<u64>,
 
+    /// Hosts to check at the same time [default: 32, max: 128].
+    ///
+    /// Checks spend their time waiting on the network, not the CPU, so this
+    /// does not depend on the machine's cores: a container limited to one CPU
+    /// runs as many checks at once as a large server. Raise it for large host
+    /// lists; lower it to go easy on a shared network or a single target.
+    #[arg(long, value_name = "N")]
+    concurrency: Option<usize>,
+
     /// Look the presented leaf certificate up in public Certificate
     /// Transparency logs (via crt.sh).
     ///
@@ -873,9 +882,35 @@ impl FinalConfig {
     }
 }
 
-/// Upper bound on concurrent host checks; the pool also never exceeds the
-/// machine's available parallelism or the number of hosts.
-const MAX_CONCURRENT_CHECKS: usize = 16;
+/// Host checks run at once when `--concurrency` is not given.
+///
+/// Deliberately independent of the CPU count: a check costs well under a
+/// millisecond of CPU and otherwise waits on the network, so sizing the pool
+/// by cores (as `available_parallelism` does) left a container limited to one
+/// CPU checking hosts one at a time, each unreachable one stalling the whole
+/// run for the full connect timeout.
+const DEFAULT_CONCURRENCY: usize = 32;
+
+/// Largest accepted `--concurrency`. Each worker holds up to about two sockets
+/// at once (the TLS connection plus an OCSP/CRL request), and macOS's default
+/// open-file limit is 256.
+const MAX_CONCURRENCY: usize = 128;
+
+/// Turns the optional `--concurrency` value into a worker count, falling back
+/// to [`DEFAULT_CONCURRENCY`]. Like `--connect-timeout`, out-of-range values
+/// are rejected rather than clamped: zero would check nothing and look like a
+/// hang.
+fn resolve_concurrency(n: Option<usize>) -> Result<usize, String> {
+    match n {
+        None => Ok(DEFAULT_CONCURRENCY),
+        Some(0) => Err("--concurrency must be at least 1".to_string()),
+        Some(n) if n > MAX_CONCURRENCY => Err(format!(
+            "--concurrency must be at most {} (got {})",
+            MAX_CONCURRENCY, n
+        )),
+        Some(n) => Ok(n),
+    }
+}
 
 /// Largest accepted `--connect-timeout`. Anything beyond an hour is a typo
 /// rather than an intent, and the value must stay small enough that adding it
@@ -948,6 +983,8 @@ struct CheckOptions {
     do_ct: bool,
     /// Budget for the connect phase of a single host (see `--connect-timeout`).
     connect_timeout: Duration,
+    /// Host checks run at once (see `--concurrency`).
+    concurrency: usize,
 }
 
 /// The result of attempting to check one host.
@@ -1006,12 +1043,8 @@ fn spawn_checks_with(
     let (tx, rx) = std::sync::mpsc::channel();
 
     // Bounded pool: a large host list would otherwise spawn an unbounded
-    // number of threads, each potentially holding a 30s connection timeout.
-    let worker_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(MAX_CONCURRENT_CHECKS)
-        .min(jobs.len().max(1));
+    // number of threads. Never more workers than hosts.
+    let worker_count = opts.concurrency.min(jobs.len()).max(1);
 
     let queue: Arc<Mutex<VecDeque<HostJob>>> = Arc::new(Mutex::new(jobs.into_iter().collect()));
 
@@ -1167,8 +1200,17 @@ fn main() -> Result<()> {
         }
     };
 
+    let concurrency = match resolve_concurrency(cli.concurrency) {
+        Ok(n) => n,
+        Err(msg) => {
+            error!("{}", msg);
+            std::process::exit(1);
+        }
+    };
+
     let opts = CheckOptions {
         connect_timeout,
+        concurrency,
         check_revocation: final_config.check_revocation,
         // `--scan` implies `--grade` (the scan is surfaced via the grade), and
         // the dashboard always grades: its detail pane shows the breakdown and
@@ -1450,7 +1492,74 @@ pub(crate) mod tests {
             do_scan: false,
             do_ct: false,
             connect_timeout: Duration::from_secs(1),
+            concurrency: DEFAULT_CONCURRENCY,
         }
+    }
+
+    #[test]
+    fn test_resolve_concurrency() {
+        assert_eq!(resolve_concurrency(None), Ok(DEFAULT_CONCURRENCY));
+        assert_eq!(resolve_concurrency(Some(1)), Ok(1));
+        assert_eq!(
+            resolve_concurrency(Some(MAX_CONCURRENCY)),
+            Ok(MAX_CONCURRENCY)
+        );
+        assert!(resolve_concurrency(Some(0)).is_err());
+        assert!(resolve_concurrency(Some(MAX_CONCURRENCY + 1)).is_err());
+    }
+
+    /// Checks in flight right now / the most ever seen, for the pool tests.
+    /// Each test uses its own pair, since tests run in parallel.
+    macro_rules! counting_check {
+        ($active:ident, $peak:ident) => {{
+            use std::sync::atomic::AtomicUsize;
+            static $active: AtomicUsize = AtomicUsize::new(0);
+            static $peak: AtomicUsize = AtomicUsize::new(0);
+            fn check(_: &HostPort, _: CheckOptions) -> Result<TLS, TLSError> {
+                let now = $active.fetch_add(1, Ordering::SeqCst) + 1;
+                $peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                $active.fetch_sub(1, Ordering::SeqCst);
+                Err(TLSError::Validation("counted".to_string()))
+            }
+            (check as CheckFn, &$peak)
+        }};
+    }
+
+    fn host_jobs(n: usize) -> Vec<HostJob> {
+        (0..n)
+            .map(|i| {
+                (
+                    i,
+                    Ok(HostPort {
+                        host: format!("h{i}.example"),
+                        port: None,
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_pool_runs_exactly_concurrency_checks_at_once() {
+        let (check, peak) = counting_check!(ACTIVE_A, PEAK_A);
+        let opts = CheckOptions {
+            concurrency: 5,
+            ..test_check_options()
+        };
+        let done = spawn_checks_with(host_jobs(20), opts, check).iter().count();
+        assert_eq!(done, 20);
+        assert_eq!(peak.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn test_pool_never_exceeds_host_count() {
+        let (check, peak) = counting_check!(ACTIVE_B, PEAK_B);
+        let done = spawn_checks_with(host_jobs(3), test_check_options(), check)
+            .iter()
+            .count();
+        assert_eq!(done, 3);
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
     }
 
     #[test]
