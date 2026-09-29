@@ -31,26 +31,40 @@ The TUI is only used when stdout is an interactive terminal. In non-interactive 
 If you are utilizing M1 or higher, please add the option --platform linux/x86_64.
 
 ```sh
-docker run --platform linux/x86_64 josebovet/tlschecker:2.0.1 jpbd.dev
+docker run --platform linux/x86_64 josebovet/tlschecker:2.0.2 jpbd.dev
 ```
 
 ## Install
 
-Linux
+Linux (x86_64)
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v2.0.1/tlschecker-linux.zip
-unzip tlschecker-linux.zip
-chmod 755 tlschecker
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v2.0.2/tlschecker-linux-x86_64.tar.gz
+tar -xzf tlschecker-linux-x86_64.tar.gz
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
 
-Osx
+Linux (aarch64)
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v2.0.1/tlschecker-macos.zip
-unzip tlschecker-macos.zip
-chmod 755 tlschecker
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v2.0.2/tlschecker-linux-aarch64.tar.gz
+tar -xzf tlschecker-linux-aarch64.tar.gz
+sudo install tlschecker /usr/local/bin/tlschecker
+```
+
+macOS (x86_64)
+
+```sh
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v2.0.2/tlschecker-macos-x86_64.tar.gz
+tar -xzf tlschecker-macos-x86_64.tar.gz
+sudo install tlschecker /usr/local/bin/tlschecker
+```
+
+macOS (Apple Silicon)
+
+```sh
+curl -LO https://github.com/jbovet/tlschecker/releases/download/v2.0.2/tlschecker-macos-aarch64.tar.gz
+tar -xzf tlschecker-macos-aarch64.tar.gz
 sudo install tlschecker /usr/local/bin/tlschecker
 ```
 

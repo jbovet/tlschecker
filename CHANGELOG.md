@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - 2026-09-29
+
+### Added
+
+- Configurable connection timeout for host checks.
+
+### Fixed
+
+- Verify OCSP/CRL signatures and harden certificate-extension parsing against
+  malformed input.
+
+### Changed
+
+- Update dependencies, improve interactive dashboard documentation, and expand
+  configuration and integration-test coverage.
+- Update GitHub Actions workflows and expand integration-test coverage.
+
 ## [2.0.1] - 2026-07-20
 
 A maintenance release focused on Prometheus/observability robustness and the
@@ -93,5 +110,6 @@ scanning, and Certificate Transparency support.
 See the Git history for changes in 1.1.1 and earlier.
 
 [2.0.1]: https://github.com/jbovet/tlschecker/compare/v2.0.0...v2.0.1
+[2.0.2]: https://github.com/jbovet/tlschecker/compare/v2.0.1...v2.0.2
 [2.0.0]: https://github.com/jbovet/tlschecker/compare/v1.1.1...v2.0.0
 [1.1.1]: https://github.com/jbovet/tlschecker/releases/tag/v1.1.1
