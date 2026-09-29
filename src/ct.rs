@@ -63,7 +63,12 @@ pub enum CtStatus {
         /// inspecting which logs carry it and investigating mis-issuance.
         crtsh_url: String,
     },
-    /// The certificate was definitively not found in public CT logs.
+    /// crt.sh has no record of the certificate.
+    ///
+    /// crt.sh aggregates the logs rather than being them, and it misses some
+    /// certificates the logs do include, so this is only treated as absence
+    /// for a certificate without embedded SCTs — see
+    /// [`TLS::apply_ct`](crate::TLS::apply_ct).
     NotLogged,
     /// The CT status could not be determined (crt.sh unreachable, rate-limited,
     /// or an unrecognized response).
@@ -115,10 +120,12 @@ pub fn check_ct_status(cert_sha256: &str) -> Result<CtStatus, TLSError> {
         .build()
         .map_err(|e| TLSError::Unknown(format!("Failed to build CT HTTP client: {e}")))?;
 
-    let response = client
-        .get(&url)
-        .send()
-        .map_err(|e| TLSError::Unknown(format!("CT lookup request failed: {e}")))?;
+    let response = client.get(&url).send().map_err(|e| {
+        TLSError::Unknown(format!(
+            "CT lookup request failed: {}",
+            crate::error_chain(&e.without_url())
+        ))
+    })?;
 
     if !response.status().is_success() {
         return Err(TLSError::Unknown(format!(
@@ -206,16 +213,31 @@ mod tests {
         assert!(extract_crtsh_id("no link here").is_none());
     }
 
-    /// Network test: confirms a well-known, publicly-trusted host's leaf is
-    /// present in CT logs. Tolerant of crt.sh flakiness / rate limiting.
+    /// Network test: a well-known, publicly-trusted host must never be
+    /// flagged as absent from CT. Tolerant of crt.sh flakiness / rate limiting.
+    ///
+    /// It deliberately does not assert `Logged`: crt.sh has answered
+    /// "Certificate not found" for google.com leaves that the logs prove they
+    /// include, so its answer alone cannot be asserted on.
     #[test]
     #[ignore]
     fn test_check_ct_status_live() {
-        let tls = crate::TLS::from("google.com", None, false, false).unwrap();
+        let mut tls = crate::TLS::from("google.com", None, false, false).unwrap();
+        assert!(
+            !tls.certificate.scts.is_empty(),
+            "google.com leaf should carry embedded SCTs"
+        );
         // crt.sh may be unreachable / 5xx / rate-limited; only assert when the
         // lookup actually succeeds so the test isn't flaky on CI.
         if let Ok(status) = check_ct_status(&tls.certificate.cert_sha256) {
-            assert!(status.is_logged(), "google.com leaf should be in CT logs");
+            tls.apply_ct(status);
+            assert!(
+                !tls.certificate
+                    .security_warnings
+                    .iter()
+                    .any(|w| matches!(w, crate::SecurityWarning::NotInCertificateTransparency(_))),
+                "google.com must not be reported as absent from CT"
+            );
         }
     }
 }

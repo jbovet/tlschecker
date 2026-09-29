@@ -42,6 +42,9 @@ pub struct GradingInput {
     pub has_incomplete_chain: bool,
     pub has_weak_signature: bool,
     pub has_hostname_mismatch: bool,
+    /// A presented certificate's signature does not verify against the key of
+    /// the issuer found for it in the chain.
+    pub has_invalid_chain_signature: bool,
     /// Server supports an obsolete protocol (SSLv3 / TLS 1.0), via `--scan`.
     pub supports_obsolete_protocol: bool,
     /// Server accepts a weak cipher suite, via `--scan`.
@@ -153,6 +156,10 @@ fn score_certificate_trust(input: &GradingInput) -> (u8, String) {
         score = score.min(20);
         reasons.push("Hostname mismatch");
     }
+    if input.has_invalid_chain_signature {
+        score = score.min(20);
+        reasons.push("Invalid chain signature");
+    }
     if input.has_weak_signature {
         score = score.min(30);
         reasons.push("Weak signature algorithm");
@@ -188,7 +195,8 @@ fn score_to_letter(score: u8) -> String {
 /// "D at best" — keep this in lockstep with that band if it ever changes.
 const CAP_NEGOTIATED_OBSOLETE_PROTOCOL: u8 = 54; // D max
 
-/// Ceiling applied for trust problems (self-signed, hostname mismatch) and for
+/// Ceiling applied for trust problems (self-signed, untrusted chain, hostname
+/// mismatch, invalid chain signature) and for
 /// scan-/negotiation-discovered weaknesses (obsolete protocol support, weak
 /// cipher).
 ///
@@ -209,6 +217,9 @@ const CAP_TRUST_OR_WEAKNESS: u8 = 69; // C max
 /// - Self-signed cert: score capped at 69 (C max)
 /// - Untrusted chain (does not build to a system root): score capped at 69 (C max)
 /// - Hostname mismatch: score capped at 69 (C max)
+/// - Invalid chain signature: score capped at 69 (C max) — like an untrusted
+///   chain, which it usually also is; capping on the signature itself keeps
+///   the grade honest when no system trust store is available (trust `Unknown`)
 /// - Accepts a weak cipher (negotiated, or discovered via `--scan`) or supports
 ///   an obsolete protocol (SSLv3/TLS 1.0, via `--scan`): score capped at 69 (C max)
 pub fn calculate_grade(input: &GradingInput) -> TLSGrade {
@@ -270,6 +281,9 @@ pub fn calculate_grade(input: &GradingInput) -> TLSGrade {
     if input.has_hostname_mismatch {
         composite = composite.min(CAP_TRUST_OR_WEAKNESS);
     }
+    if input.has_invalid_chain_signature {
+        composite = composite.min(CAP_TRUST_OR_WEAKNESS);
+    }
     if input.supports_obsolete_protocol || input.accepts_weak_cipher {
         composite = composite.min(CAP_TRUST_OR_WEAKNESS);
     }
@@ -299,6 +313,7 @@ mod tests {
             has_incomplete_chain: false,
             has_weak_signature: false,
             has_hostname_mismatch: false,
+            has_invalid_chain_signature: false,
             supports_obsolete_protocol: false,
             accepts_weak_cipher: false,
             is_revoked: false,
@@ -392,6 +407,24 @@ mod tests {
             trust.score
         );
         assert!(trust.reason.contains("Hostname mismatch"));
+    }
+
+    #[test]
+    fn test_invalid_chain_signature_lowers_trust_and_caps_grade() {
+        let input = make_input(|i| {
+            i.cert_key_bits = 4096;
+            i.has_invalid_chain_signature = true;
+        });
+        let grade = calculate_grade(&input);
+        assert_eq!(grade.grade, "C");
+        assert_eq!(grade.score, 69);
+        let trust = grade
+            .categories
+            .iter()
+            .find(|c| c.category == "Certificate Trust")
+            .unwrap();
+        assert_eq!(trust.score, 20);
+        assert!(trust.reason.contains("Invalid chain signature"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::IsTerminal;
+use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -21,7 +22,7 @@ use url::Url;
 use anyhow::Result;
 use config::{Config, ConfigError};
 use tlschecker::TLSError;
-use tracing::{error, warn};
+use tracing::error;
 
 /// Experimental TLS/SSL certificate checker.
 ///
@@ -135,6 +136,15 @@ struct Args {
     #[arg(long, value_name = "SECONDS")]
     connect_timeout: Option<u64>,
 
+    /// Hosts to check at the same time [default: 32, max: 128].
+    ///
+    /// Checks spend their time waiting on the network, not the CPU, so this
+    /// does not depend on the machine's cores: a container limited to one CPU
+    /// runs as many checks at once as a large server. Raise it for large host
+    /// lists; lower it to go easy on a shared network or a single target.
+    #[arg(long, value_name = "N")]
+    concurrency: Option<usize>,
+
     /// Look the presented leaf certificate up in public Certificate
     /// Transparency logs (via crt.sh).
     ///
@@ -244,6 +254,82 @@ pub(crate) fn warning_label(warning: &tlschecker::SecurityWarning) -> (&'static 
         CertificateMisissuance(msg) => ("MISISSUANCE", msg),
         InvalidChainSignature(msg) => ("INVALID CHAIN SIGNATURE", msg),
     }
+}
+
+/// How a status reads, independent of any frontend's palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tone {
+    /// The check passed.
+    Good,
+    /// The check found a problem.
+    Bad,
+    /// The check was requested but could not reach a verdict.
+    Unverified,
+    /// The check was not requested.
+    Muted,
+}
+
+/// A status as displayed: short text, optional detail, and its tone.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StatusLabel<'a> {
+    pub text: &'static str,
+    pub detail: Option<&'a str>,
+    pub tone: Tone,
+}
+
+/// Display label for a certificate's revocation status.
+///
+/// Single source of truth for all frontends (text, summary, dashboard), like
+/// [`warning_label`]. `Good` reads "Not revoked" — it says nothing about the
+/// certificate otherwise being valid. For `Revoked` the detail is the
+/// library's reason with its leading "Revoked " dropped, since the text
+/// already says so; for `Unknown` it is why the check failed.
+pub(crate) fn revocation_label(cert: &tlschecker::CertificateInfo) -> StatusLabel<'_> {
+    match &cert.revocation_status {
+        RevocationStatus::Good => StatusLabel {
+            text: "Not revoked",
+            detail: None,
+            tone: Tone::Good,
+        },
+        RevocationStatus::Revoked(reason) => StatusLabel {
+            text: "Revoked",
+            detail: Some(reason.strip_prefix("Revoked ").unwrap_or(reason)),
+            tone: Tone::Bad,
+        },
+        RevocationStatus::Unknown => StatusLabel {
+            text: "Unknown",
+            detail: cert.revocation_detail.as_deref(),
+            tone: Tone::Unverified,
+        },
+        RevocationStatus::NotChecked => StatusLabel {
+            text: "Not checked",
+            detail: None,
+            tone: Tone::Muted,
+        },
+    }
+}
+
+/// Display label for the CT lookup, or `None` when `--ct-check` was not
+/// requested. The detail is the crt.sh link for `Logged` and why the lookup
+/// failed (plus any embedded-SCT evidence) for `Unknown`.
+pub(crate) fn ct_label(tls: &TLS) -> Option<StatusLabel<'_>> {
+    Some(match tls.ct.as_ref()? {
+        tlschecker::ct::CtStatus::Logged { crtsh_url, .. } => StatusLabel {
+            text: "Logged",
+            detail: Some(crtsh_url),
+            tone: Tone::Good,
+        },
+        tlschecker::ct::CtStatus::NotLogged => StatusLabel {
+            text: "Not logged",
+            detail: None,
+            tone: Tone::Bad,
+        },
+        tlschecker::ct::CtStatus::Unknown => StatusLabel {
+            text: "Unknown",
+            detail: tls.ct_detail.as_deref(),
+            tone: Tone::Unverified,
+        },
+    })
 }
 
 /// Text formatter - outputs detailed certificate information.
@@ -377,16 +463,15 @@ impl Formatter for TextFormat {
                 writeln!(output, "ALPN: {}", alpn).unwrap();
             }
 
-            writeln!(
-                output,
-                "Revocation Status: {}",
-                match &cert.revocation_status {
-                    RevocationStatus::Good => "Good (Not Revoked)".to_string(),
-                    RevocationStatus::Revoked(reason) => format!("Revoked ({})", reason),
-                    RevocationStatus::Unknown => "Unknown (Could not determine)".to_string(),
-                    RevocationStatus::NotChecked => "Not Checked".to_string(),
-                }
-            )
+            let revocation = revocation_label(cert);
+            match revocation.detail {
+                Some(detail) => writeln!(
+                    output,
+                    "Revocation Status: {} ({})",
+                    revocation.text, detail
+                ),
+                None => writeln!(output, "Revocation Status: {}", revocation.text),
+            }
             .unwrap();
 
             writeln!(
@@ -433,16 +518,13 @@ impl Formatter for TextFormat {
                         writeln!(output, "  Logged: no").unwrap();
                     }
                     tlschecker::ct::CtStatus::Unknown => {
-                        writeln!(output, "  Logged: unknown (could not query crt.sh)").unwrap();
-                        // Offline evidence still applies even when crt.sh is down.
-                        if !cert.scts.is_empty() {
-                            writeln!(
-                                output,
-                                "  Note: {} embedded SCT(s) present — certificate was submitted to CT logs",
-                                cert.scts.len()
-                            )
-                            .unwrap();
-                        }
+                        // The detail carries the embedded-SCT evidence too.
+                        writeln!(
+                            output,
+                            "  Logged: unknown ({})",
+                            rs.ct_detail.as_deref().unwrap_or("could not query crt.sh")
+                        )
+                        .unwrap();
                     }
                 }
             }
@@ -450,7 +532,14 @@ impl Formatter for TextFormat {
             if let Some(ref scan) = rs.scan {
                 writeln!(output, "\nSupported Protocols & Ciphers:").unwrap();
                 for proto in &scan.protocols {
-                    if proto.supported {
+                    if !proto.tested {
+                        writeln!(
+                            output,
+                            "  {}: not tested (this build's OpenSSL cannot offer it)",
+                            proto.version
+                        )
+                        .unwrap();
+                    } else if proto.supported {
                         writeln!(output, "  {}: supported", proto.version).unwrap();
                         for cipher in &proto.ciphers {
                             writeln!(output, "    - {}", cipher).unwrap();
@@ -575,24 +664,17 @@ impl Formatter for SummaryFormat {
                     .set_alignment(CellAlignment::Center),
             };
 
-            let revocation_cell = match &rs.certificate.revocation_status {
-                RevocationStatus::Good => Cell::new("Valid")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Green)
-                    .set_alignment(CellAlignment::Center),
-                RevocationStatus::Revoked(_) => Cell::new("Revoked")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Red)
-                    .set_alignment(CellAlignment::Center),
-                RevocationStatus::Unknown => Cell::new("Unknown")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Yellow)
-                    .set_alignment(CellAlignment::Center),
-                RevocationStatus::NotChecked => Cell::new("Not Checked")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::DarkGrey)
-                    .set_alignment(CellAlignment::Center),
-            };
+            // The table has no room for the detail; text/JSON carry it.
+            let revocation = revocation_label(&rs.certificate);
+            let revocation_cell = Cell::new(revocation.text)
+                .add_attribute(Attribute::Bold)
+                .fg(match revocation.tone {
+                    Tone::Good => Color::Green,
+                    Tone::Bad => Color::Red,
+                    Tone::Unverified => Color::Yellow,
+                    Tone::Muted => Color::DarkGrey,
+                })
+                .set_alignment(CellAlignment::Center);
 
             let self_signed_cell = match rs.certificate.is_self_signed {
                 true => Cell::new("Yes")
@@ -800,9 +882,35 @@ impl FinalConfig {
     }
 }
 
-/// Upper bound on concurrent host checks; the pool also never exceeds the
-/// machine's available parallelism or the number of hosts.
-const MAX_CONCURRENT_CHECKS: usize = 16;
+/// Host checks run at once when `--concurrency` is not given.
+///
+/// Deliberately independent of the CPU count: a check costs well under a
+/// millisecond of CPU and otherwise waits on the network, so sizing the pool
+/// by cores (as `available_parallelism` does) left a container limited to one
+/// CPU checking hosts one at a time, each unreachable one stalling the whole
+/// run for the full connect timeout.
+const DEFAULT_CONCURRENCY: usize = 32;
+
+/// Largest accepted `--concurrency`. Each worker holds up to about two sockets
+/// at once (the TLS connection plus an OCSP/CRL request), and macOS's default
+/// open-file limit is 256.
+const MAX_CONCURRENCY: usize = 128;
+
+/// Turns the optional `--concurrency` value into a worker count, falling back
+/// to [`DEFAULT_CONCURRENCY`]. Like `--connect-timeout`, out-of-range values
+/// are rejected rather than clamped: zero would check nothing and look like a
+/// hang.
+fn resolve_concurrency(n: Option<usize>) -> Result<usize, String> {
+    match n {
+        None => Ok(DEFAULT_CONCURRENCY),
+        Some(0) => Err("--concurrency must be at least 1".to_string()),
+        Some(n) if n > MAX_CONCURRENCY => Err(format!(
+            "--concurrency must be at most {} (got {})",
+            MAX_CONCURRENCY, n
+        )),
+        Some(n) => Ok(n),
+    }
+}
 
 /// Largest accepted `--connect-timeout`. Anything beyond an hour is a typo
 /// rather than an intent, and the value must stay small enough that adding it
@@ -834,8 +942,6 @@ fn resolve_connect_timeout(seconds: Option<u64>) -> Result<Duration, String> {
 /// Returns the error unlogged so each frontend can present it its own way:
 /// the CLI path logs to stderr, the dashboard renders it as a failed row.
 fn check_host(host_port: &HostPort, opts: CheckOptions) -> Result<TLS, TLSError> {
-    let port_display = host_port.port.map_or(String::new(), |p| format!(":{}", p));
-
     let mut cert = TLS::from_with_timeout(
         &host_port.host,
         host_port.port,
@@ -858,20 +964,12 @@ fn check_host(host_port: &HostPort, opts: CheckOptions) -> Result<TLS, TLSError>
     if opts.do_ct {
         // Look the leaf up in public CT logs (crt.sh, by
         // SHA-256 fingerprint). A failed/inconclusive lookup
-        // is non-fatal: the reason is logged to stderr and the
-        // result is recorded as `Unknown` rather than dropped,
-        // so "could not check" is never mistaken for "absent".
-        let ct = match tlschecker::ct::check_ct_status(&cert.certificate.cert_sha256) {
-            Ok(ct) => ct,
-            Err(e) => {
-                warn!(
-                    "CT lookup could not be completed for {}{}: {}",
-                    host_port.host, port_display, e
-                );
-                tlschecker::ct::CtStatus::Unknown
-            }
-        };
-        cert.apply_ct(ct);
+        // is non-fatal: it is recorded as `Unknown` with its reason
+        // (also logged to stderr) rather than dropped, so "could not
+        // check" is never mistaken for "absent".
+        cert.apply_ct_lookup(tlschecker::ct::check_ct_status(
+            &cert.certificate.cert_sha256,
+        ));
     }
     Ok(cert)
 }
@@ -885,6 +983,8 @@ struct CheckOptions {
     do_ct: bool,
     /// Budget for the connect phase of a single host (see `--connect-timeout`).
     connect_timeout: Duration,
+    /// Host checks run at once (see `--concurrency`).
+    concurrency: usize,
 }
 
 /// The result of attempting to check one host.
@@ -927,45 +1027,88 @@ fn spawn_checks(
     jobs: Vec<HostJob>,
     opts: CheckOptions,
 ) -> std::sync::mpsc::Receiver<(usize, HostOutcome)> {
+    spawn_checks_with(jobs, opts, check_host)
+}
+
+/// A host check function; [`check_host`] outside of tests.
+type CheckFn = fn(&HostPort, CheckOptions) -> Result<TLS, TLSError>;
+
+/// [`spawn_checks`] with the per-host check injected, so the pool's handling
+/// of a misbehaving check can be tested without a network.
+fn spawn_checks_with(
+    jobs: Vec<HostJob>,
+    opts: CheckOptions,
+    check: CheckFn,
+) -> std::sync::mpsc::Receiver<(usize, HostOutcome)> {
     let (tx, rx) = std::sync::mpsc::channel();
 
     // Bounded pool: a large host list would otherwise spawn an unbounded
-    // number of threads, each potentially holding a 30s connection timeout.
-    let worker_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(MAX_CONCURRENT_CHECKS)
-        .min(jobs.len().max(1));
+    // number of threads. Never more workers than hosts.
+    let worker_count = opts.concurrency.min(jobs.len()).max(1);
 
     let queue: Arc<Mutex<VecDeque<HostJob>>> = Arc::new(Mutex::new(jobs.into_iter().collect()));
 
     for _ in 0..worker_count {
         let queue = Arc::clone(&queue);
         let tx = tx.clone();
-        thread::spawn(move || loop {
-            let job = queue.lock().unwrap().pop_front();
-            let Some((index, job)) = job else { break };
-            let outcome = match job {
-                Ok(host_port) => match check_host(&host_port, opts) {
-                    Ok(tls) => HostOutcome::Checked(Box::new(tls)),
-                    Err(err) => HostOutcome::Failed {
-                        kind: error_kind(&err),
-                        detail: err.to_string(),
+        thread::Builder::new()
+            .name(WORKER_THREAD_NAME.to_string())
+            .spawn(move || loop {
+                let job = queue.lock().unwrap().pop_front();
+                let Some((index, job)) = job else { break };
+                let outcome = match job {
+                    // Certificates come from arbitrary servers, so a parsing
+                    // bug must cost one failed row rather than the worker: an
+                    // unwound worker never sends, leaving the slot `None`,
+                    // which reads as "not checked" and escapes
+                    // --fail-on-error.
+                    Ok(host_port) => match panic::catch_unwind(|| check(&host_port, opts)) {
+                        Ok(Ok(tls)) => HostOutcome::Checked(Box::new(tls)),
+                        Ok(Err(err)) => HostOutcome::Failed {
+                            kind: error_kind(&err),
+                            detail: err.to_string(),
+                        },
+                        Err(payload) => HostOutcome::Failed {
+                            kind: "internal",
+                            detail: format!(
+                                "internal error while checking host: {}",
+                                panic_message(payload.as_ref())
+                            ),
+                        },
                     },
-                },
-                Err(msg) => HostOutcome::Failed {
-                    kind: "invalid",
-                    detail: msg,
-                },
-            };
-            // A closed receiver means the frontend is gone; stop working.
-            if tx.send((index, outcome)).is_err() {
-                break;
-            }
-        });
+                    Err(msg) => HostOutcome::Failed {
+                        kind: "invalid",
+                        detail: msg,
+                    },
+                };
+                // A closed receiver means the frontend is gone; stop working.
+                if tx.send((index, outcome)).is_err() {
+                    break;
+                }
+            })
+            .expect("failed to spawn check worker thread");
     }
 
     rx
+}
+
+/// Name given to every check worker thread, so the dashboard's panic hook can
+/// tell a worker panic (caught and shown as a failed row) from a fatal one.
+pub(crate) const WORKER_THREAD_NAME: &str = "check-worker";
+
+/// Whether the calling thread is a check worker (see [`WORKER_THREAD_NAME`]).
+pub(crate) fn is_worker_thread() -> bool {
+    thread::current().name() == Some(WORKER_THREAD_NAME)
+}
+
+/// Extracts the message from a panic payload (`panic!` produces either a
+/// `&'static str` or a `String`).
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
 }
 
 /// True while the dashboard owns the terminal. Checked by the tracing writer
@@ -1057,8 +1200,17 @@ fn main() -> Result<()> {
         }
     };
 
+    let concurrency = match resolve_concurrency(cli.concurrency) {
+        Ok(n) => n,
+        Err(msg) => {
+            error!("{}", msg);
+            std::process::exit(1);
+        }
+    };
+
     let opts = CheckOptions {
         connect_timeout,
+        concurrency,
         check_revocation: final_config.check_revocation,
         // `--scan` implies `--grade` (the scan is surfaced via the grade), and
         // the dashboard always grades: its detail pane shows the breakdown and
@@ -1330,6 +1482,125 @@ fn parse_host_port(address: &str) -> Result<HostPort, String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // ── spawn_checks tests ───────────────────────────────────────────
+
+    fn test_check_options() -> CheckOptions {
+        CheckOptions {
+            check_revocation: false,
+            calculate_grade: false,
+            do_scan: false,
+            do_ct: false,
+            connect_timeout: Duration::from_secs(1),
+            concurrency: DEFAULT_CONCURRENCY,
+        }
+    }
+
+    #[test]
+    fn test_resolve_concurrency() {
+        assert_eq!(resolve_concurrency(None), Ok(DEFAULT_CONCURRENCY));
+        assert_eq!(resolve_concurrency(Some(1)), Ok(1));
+        assert_eq!(
+            resolve_concurrency(Some(MAX_CONCURRENCY)),
+            Ok(MAX_CONCURRENCY)
+        );
+        assert!(resolve_concurrency(Some(0)).is_err());
+        assert!(resolve_concurrency(Some(MAX_CONCURRENCY + 1)).is_err());
+    }
+
+    /// Checks in flight right now / the most ever seen, for the pool tests.
+    /// Each test uses its own pair, since tests run in parallel.
+    macro_rules! counting_check {
+        ($active:ident, $peak:ident) => {{
+            use std::sync::atomic::AtomicUsize;
+            static $active: AtomicUsize = AtomicUsize::new(0);
+            static $peak: AtomicUsize = AtomicUsize::new(0);
+            fn check(_: &HostPort, _: CheckOptions) -> Result<TLS, TLSError> {
+                let now = $active.fetch_add(1, Ordering::SeqCst) + 1;
+                $peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                $active.fetch_sub(1, Ordering::SeqCst);
+                Err(TLSError::Validation("counted".to_string()))
+            }
+            (check as CheckFn, &$peak)
+        }};
+    }
+
+    fn host_jobs(n: usize) -> Vec<HostJob> {
+        (0..n)
+            .map(|i| {
+                (
+                    i,
+                    Ok(HostPort {
+                        host: format!("h{i}.example"),
+                        port: None,
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_pool_runs_exactly_concurrency_checks_at_once() {
+        let (check, peak) = counting_check!(ACTIVE_A, PEAK_A);
+        let opts = CheckOptions {
+            concurrency: 5,
+            ..test_check_options()
+        };
+        let done = spawn_checks_with(host_jobs(20), opts, check).iter().count();
+        assert_eq!(done, 20);
+        assert_eq!(peak.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn test_pool_never_exceeds_host_count() {
+        let (check, peak) = counting_check!(ACTIVE_B, PEAK_B);
+        let done = spawn_checks_with(host_jobs(3), test_check_options(), check)
+            .iter()
+            .count();
+        assert_eq!(done, 3);
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_panicking_check_is_reported_as_failed() {
+        fn panicking_check(_: &HostPort, _: CheckOptions) -> Result<TLS, TLSError> {
+            panic!("malformed certificate");
+        }
+        let jobs: Vec<HostJob> = vec![
+            (
+                0,
+                Ok(HostPort {
+                    host: "a.example".to_string(),
+                    port: None,
+                }),
+            ),
+            (1, Err("bad address".to_string())),
+        ];
+
+        let outcomes: std::collections::HashMap<usize, HostOutcome> =
+            spawn_checks_with(jobs, test_check_options(), panicking_check)
+                .iter()
+                .collect();
+
+        // A panic must surface as a failed row, not vanish (a missing slot is
+        // read as "not checked" and never counts toward --fail-on-error).
+        assert!(
+            matches!(
+                outcomes.get(&0),
+                Some(HostOutcome::Failed { kind: "internal", detail })
+                    if detail.contains("malformed certificate")
+            ),
+            "panicking host was not reported as failed"
+        );
+        assert!(matches!(
+            outcomes.get(&1),
+            Some(HostOutcome::Failed {
+                kind: "invalid",
+                ..
+            })
+        ));
+    }
 
     // ── parse_host_port tests ────────────────────────────────────────
 
@@ -1755,6 +2026,7 @@ pub(crate) mod tests {
                     signature_algorithm: "sha256WithRSAEncryption".to_string(),
                 }]),
                 revocation_status: RevocationStatus::NotChecked,
+                revocation_detail: None,
                 trust: TrustStatus::Unknown,
                 is_self_signed: false,
                 security_warnings: vec![],
@@ -1778,6 +2050,7 @@ pub(crate) mod tests {
             grade: None,
             scan: None,
             ct: None,
+            ct_detail: None,
         }
     }
 
@@ -1844,7 +2117,7 @@ pub(crate) mod tests {
         assert!(output.contains("Certificate key: RSA 2048-bit"));
         assert!(output.contains("Cipher suite: TLS_AES_256_GCM_SHA384 (256-bit)"));
         assert!(output.contains("Protocol: TLSv1.3"));
-        assert!(output.contains("Revocation Status: Not Checked"));
+        assert!(output.contains("Revocation Status: Not checked"));
         assert!(output.contains("DNS Name: test.example.com"));
         assert!(output.contains("DNS Name: www.example.com"));
     }
@@ -1921,11 +2194,19 @@ pub(crate) mod tests {
             protocols: vec![
                 tlschecker::probe::ProtocolSupport {
                     version: tlschecker::probe::ProtoVersion::Tls1_3,
+                    tested: true,
                     supported: true,
                     ciphers: vec!["TLS_AES_256_GCM_SHA384".to_string()],
                 },
                 tlschecker::probe::ProtocolSupport {
+                    version: tlschecker::probe::ProtoVersion::Tls1_0,
+                    tested: true,
+                    supported: false,
+                    ciphers: vec![],
+                },
+                tlschecker::probe::ProtocolSupport {
                     version: tlschecker::probe::ProtoVersion::Ssl3,
+                    tested: false,
                     supported: false,
                     ciphers: vec![],
                 },
@@ -1935,7 +2216,10 @@ pub(crate) mod tests {
         assert!(output.contains("Supported Protocols & Ciphers:"));
         assert!(output.contains("TLSv1.3: supported"));
         assert!(output.contains("- TLS_AES_256_GCM_SHA384"));
-        assert!(output.contains("SSLv3: not supported"));
+        assert!(output.contains("TLSv1.0: not supported"));
+        // An untestable version must not read as the server refusing it.
+        assert!(output.contains("SSLv3: not tested"));
+        assert!(!output.contains("SSLv3: not supported"));
     }
 
     #[test]
@@ -1944,6 +2228,7 @@ pub(crate) mod tests {
         tls_entry.scan = Some(tlschecker::probe::TlsScan {
             protocols: vec![tlschecker::probe::ProtocolSupport {
                 version: tlschecker::probe::ProtoVersion::Tls1_2,
+                tested: true,
                 supported: true,
                 ciphers: vec!["ECDHE-RSA-AES256-GCM-SHA384".to_string()],
             }],
@@ -2100,6 +2385,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_text_format_explains_unknown_revocation_and_ct() {
+        let mut tls_entry = make_test_tls();
+        tls_entry.certificate.revocation_status = RevocationStatus::Unknown;
+        tls_entry.certificate.revocation_detail =
+            Some("OCSP: certificate lists no OCSP responder; CRL: HTTP 404".to_string());
+        tls_entry.apply_ct_lookup(Err(TLSError::Unknown(
+            "CT lookup returned HTTP 502 Bad Gateway".to_string(),
+        )));
+        let output = TextFormat.format(&[tls_entry]);
+        assert!(output.contains(
+            "Revocation Status: Unknown (OCSP: certificate lists no OCSP responder; CRL: HTTP 404)"
+        ));
+        assert!(output.contains("Logged: unknown (CT lookup returned HTTP 502 Bad Gateway)"));
+    }
+
+    #[test]
+    fn test_revocation_reads_the_same_in_text_and_summary() {
+        let mut revoked = make_test_tls();
+        revoked.certificate.revocation_status =
+            RevocationStatus::Revoked("Revoked at Sep  1 12:00:00 2026 GMT".to_string());
+        let text = TextFormat.format(&[revoked.clone()]);
+        // One "Revoked", not "Revoked (Revoked at …)".
+        assert!(text.contains("Revocation Status: Revoked (at Sep  1 12:00:00 2026 GMT)"));
+
+        let mut good = make_test_tls();
+        good.certificate.revocation_status = RevocationStatus::Good;
+        assert!(TextFormat
+            .format(&[good.clone()])
+            .contains("Revocation Status: Not revoked"));
+        let summary = SummaryFormat.format(&[good]);
+        // "Valid" read as "the certificate is valid"; Good only means "not revoked".
+        assert!(summary.contains("Not revoked"));
+        assert!(!summary.contains("Valid"));
+    }
+
+    #[test]
     fn test_not_logged_surfaces_warning_in_both_formatters() {
         let mut tls_entry = make_test_tls();
         // A certificate absent from CT logs is reported as a warning.
@@ -2144,8 +2465,9 @@ pub(crate) mod tests {
         tls_entry.certificate.scts = vec![sample_sct()];
         tls_entry.apply_ct(tlschecker::ct::CtStatus::Unknown);
         let output = TextFormat.format(&[tls_entry]);
-        assert!(output.contains("Logged: unknown"));
-        assert!(output.contains("embedded SCT(s) present"));
+        assert!(output.contains(
+            "Logged: unknown (the certificate carries 1 embedded SCT(s), so it was submitted to CT logs)"
+        ));
     }
 
     // ── Conditional CT column in the summary table ─────────────────

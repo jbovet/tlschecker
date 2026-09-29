@@ -14,13 +14,13 @@
 mod state;
 mod view;
 
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::HostOutcome;
-use state::{App, Screen};
+use state::{App, OnDemand, OnDemandJob, OnDemandResult, Screen};
 
 /// How long to wait for input before checking the result channel again.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -62,6 +62,29 @@ fn handle_export_key(app: &mut App, key: event::KeyEvent) -> PromptKey {
     PromptKey::Handled
 }
 
+/// Runs an on-demand check on its own thread and sends back the result.
+///
+/// The thread is named like the check workers, so a panic in it is handled
+/// the same way: the dashboard's hook leaves the terminal alone, and the
+/// panic becomes an `Unknown` result instead of a host stuck "checking…".
+fn spawn_on_demand(job: OnDemandJob, tx: Sender<(usize, OnDemandResult)>) {
+    let (index, kind) = (job.index(), job.kind());
+    let fail_tx = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name(crate::WORKER_THREAD_NAME.to_string())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
+                .unwrap_or_else(|payload| {
+                    OnDemandJob::failed(index, kind, crate::panic_message(payload.as_ref()))
+                });
+            // A closed receiver means the dashboard is gone; nothing to do.
+            let _ = tx.send(result);
+        });
+    if let Err(err) = spawned {
+        let _ = fail_tx.send(OnDemandJob::failed(index, kind, &err.to_string()));
+    }
+}
+
 /// Runs the dashboard until the user quits, collecting outcomes as they
 /// stream in over `rx`.
 ///
@@ -73,8 +96,19 @@ pub fn run(
     rx: Receiver<(usize, HostOutcome)>,
 ) -> std::io::Result<Vec<Option<HostOutcome>>> {
     let mut terminal = ratatui::init();
+    // Worker panics are caught and rendered as failed rows (`spawn_checks`),
+    // but the hook runs before unwinding: ratatui's would tear the terminal
+    // down while the dashboard keeps drawing. Only a panic elsewhere is fatal.
+    let ratatui_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !crate::is_worker_thread() {
+            ratatui_hook(info);
+        }
+    }));
     let mut app = App::new(labels);
     let mut channel_open = true;
+    // Results of checks started from the dashboard (`r` / `c`).
+    let (check_tx, check_rx) = std::sync::mpsc::channel::<(usize, OnDemandResult)>();
     let mut dirty = true;
 
     // Run the loop inside a closure so that an I/O error propagated by `?`
@@ -92,6 +126,11 @@ pub fn run(
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => channel_open = false,
                 }
+            }
+
+            while let Ok((index, result)) = check_rx.try_recv() {
+                app.finish_check(index, result);
+                dirty = true;
             }
 
             if dirty {
@@ -146,6 +185,19 @@ pub fn run(
                         (_, KeyCode::Char('e')) => {
                             app.begin_export();
                             dirty = true;
+                        }
+
+                        // Run a check the command line did not ask for (or
+                        // retry an Unknown one) for the selected host.
+                        (_, KeyCode::Char('r')) => {
+                            if let Some(job) = app.begin_check(OnDemand::Revocation) {
+                                spawn_on_demand(job, check_tx.clone());
+                            }
+                        }
+                        (_, KeyCode::Char('c')) => {
+                            if let Some(job) = app.begin_check(OnDemand::Ct) {
+                                spawn_on_demand(job, check_tx.clone());
+                            }
                         }
 
                         // Fleet: move selection, open the explorer.
@@ -238,6 +290,44 @@ mod tests {
 
         press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(path(&app), "aB");
+    }
+
+    #[test]
+    fn test_on_demand_revocation_runs_off_thread_and_reports_back() {
+        use openssl::x509::{X509Builder, X509NameBuilder};
+        use openssl::{asn1::Asn1Time, hash::MessageDigest, pkey::PKey, rsa::Rsa};
+
+        // A self-signed cert without OCSP/CRL endpoints: the check completes
+        // offline, with the reason it could not reach a verdict.
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "offline.example").unwrap();
+        let name = name.build();
+        let mut b = X509Builder::new().unwrap();
+        b.set_version(2).unwrap();
+        b.set_subject_name(&name).unwrap();
+        b.set_issuer_name(&name).unwrap();
+        b.set_pubkey(&key).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        b.set_not_after(&Asn1Time::days_from_now(30).unwrap())
+            .unwrap();
+        b.sign(&key, MessageDigest::sha256()).unwrap();
+        let pem = String::from_utf8(b.build().to_pem().unwrap()).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_on_demand(OnDemandJob::Revocation { index: 7, pem }, tx);
+        let (index, result) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the worker reports back");
+
+        assert_eq!(index, 7);
+        assert!(matches!(
+            result,
+            OnDemandResult::Revocation(tlschecker::RevocationStatus::Unknown, Some(ref d))
+                if d == "OCSP: certificate lists no OCSP responder; \
+                         CRL: certificate lists no CRL distribution point"
+        ));
     }
 
     #[test]

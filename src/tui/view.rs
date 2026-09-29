@@ -13,8 +13,10 @@ use ratatui::Frame;
 
 use tlschecker::TLS;
 
-use super::state::{verdict, App, ExportPrompt, FlashKind, Screen, Verdict};
-use crate::{warning_label, HostOutcome};
+use super::state::{
+    unverified_checks, verdict, App, ExportPrompt, FlashKind, OnDemand, Screen, Verdict,
+};
+use crate::{ct_label, revocation_label, warning_label, HostOutcome, StatusLabel, Tone};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 
@@ -65,7 +67,10 @@ fn draw_fleet(frame: &mut Frame, app: &App) {
     draw_footer(
         frame,
         app,
-        " j/k move · ⏎ explore · e export · g/G first/last · q quit",
+        &format!(
+            " j/k move · ⏎ explore · e export{} · g/G first/last · q quit",
+            check_hints_text(app)
+        ),
         footer,
     );
 }
@@ -89,7 +94,56 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// One list row: state symbol + label + grade letter.
+/// Marks what "not verified" looks like everywhere in the dashboard: a
+/// requested revocation / CT check that could not reach a verdict.
+const UNVERIFIED: Style = Style::new().fg(Color::Yellow);
+
+/// A key in the detail pane's facts block, padded to one shared width so
+/// every value starts in the same column — including "Revocation", the
+/// longest key, which used to need an extra space of its own.
+fn fact_key(key: &str) -> Span<'static> {
+    Span::styled(format!("{key:<11}"), DIM)
+}
+
+/// How an on-demand check in flight is shown in place of its status.
+const CHECKING: &str = "checking…";
+const CHECKING_STYLE: Style = Style::new().fg(Color::Cyan);
+
+/// Footer hints for the on-demand checks the selected host can still use
+/// (see [`App::check_hints`]), e.g. `" · r revocation · c CT"`.
+fn check_hints_text(app: &App) -> String {
+    app.check_hints()
+        .into_iter()
+        .map(|kind| match kind {
+            OnDemand::Revocation => " · r revocation",
+            OnDemand::Ct => " · c CT",
+        })
+        .collect()
+}
+
+/// The dashboard's rendering of a status [`Tone`].
+fn tone_style(tone: Tone) -> Style {
+    match tone {
+        Tone::Good => Style::new().fg(Color::Green),
+        Tone::Bad => Style::new().fg(Color::Red),
+        Tone::Unverified => UNVERIFIED,
+        Tone::Muted => DIM,
+    }
+}
+
+/// A status label as one line of text: the text, plus its detail when that is
+/// a short fact (revocation time/reason, crt.sh link). An `Unknown`'s reason
+/// is left out — it is long, and shown in full where there is room for it.
+fn status_text(label: &StatusLabel) -> String {
+    match (label.tone, label.detail) {
+        (Tone::Unverified, _) | (_, None) => label.text.to_string(),
+        (Tone::Bad, Some(detail)) => format!("{} ({})", label.text, detail),
+        (_, Some(detail)) => format!("{} · {}", label.text, detail),
+    }
+}
+
+/// One list row: state symbol + label + grade letter, plus a `?` when a
+/// requested check could not be verified.
 fn host_row(app: &App, index: usize) -> Line<'_> {
     let label = app.labels[index].as_str();
     match &app.slots[index] {
@@ -107,10 +161,16 @@ fn host_row(app: &App, index: usize) -> Line<'_> {
                 .as_ref()
                 .map(|g| format!("  {}", g.grade))
                 .unwrap_or_default();
+            let unverified = if unverified_checks(tls).is_empty() {
+                Span::raw("")
+            } else {
+                Span::styled("  ?", UNVERIFIED.add_modifier(Modifier::BOLD))
+            };
             Line::from(vec![
                 Span::styled(format!("{} ", verdict_symbol(v)), Style::new().fg(color)),
                 Span::raw(label),
                 Span::styled(grade, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                unverified,
             ])
         }
     }
@@ -138,6 +198,12 @@ fn draw_host_list(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("  ⚠ ", Style::new().fg(Color::Yellow)),
             Span::raw(format!("{} warning", tally.warning)),
+            // Shares the warning line so the box keeps its fixed height.
+            if tally.unverified > 0 {
+                Span::styled(format!(" · ? {} unverified", tally.unverified), UNVERIFIED)
+            } else {
+                Span::raw("")
+            },
         ]),
         Line::from(vec![
             Span::styled("  ✗ ", Style::new().fg(Color::Red)),
@@ -186,7 +252,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 area,
             );
         }
-        Some(HostOutcome::Checked(tls)) => draw_checked_detail(frame, tls, &label, area),
+        Some(HostOutcome::Checked(tls)) => draw_checked_detail(frame, app, tls, &label, area),
     }
 }
 
@@ -219,7 +285,8 @@ fn lifetime_consumed(tls: &TLS) -> f64 {
     ((now - from) as f64 / (to - from) as f64).clamp(0.0, 1.0)
 }
 
-fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
+fn draw_checked_detail(frame: &mut Frame, app: &App, tls: &TLS, label: &str, area: Rect) {
+    let checking = |kind| app.is_running(app.selected, kind);
     let v = verdict(tls);
     let color = verdict_color(v);
     let cert = &tls.certificate;
@@ -237,8 +304,11 @@ fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
         .as_ref()
         .map(|g| g.categories.len() as u16 + 1)
         .unwrap_or(0);
+    let ct = ct_label(tls);
+    let ct_checking = checking(OnDemand::Ct);
+    let info_rows = 6 + u16::from(ct.is_some() || ct_checking);
     let [info_area, gauge_area, grade_area, warn_area] = Layout::vertical([
-        Constraint::Length(6),
+        Constraint::Length(info_rows),
         Constraint::Length(1),
         Constraint::Length(grade_rows),
         Constraint::Min(0),
@@ -256,41 +326,55 @@ fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
     };
 
     // Basic facts.
-    let info = vec![
+    let revocation = revocation_label(cert);
+    let mut info = vec![
         Line::from(vec![
-            Span::styled("Protocol  ", DIM),
+            fact_key("Protocol"),
             Span::raw(match &tls.cipher.alpn {
                 Some(alpn) => format!("{} · {} · {}", tls.cipher.version, tls.cipher.name, alpn),
                 None => format!("{} · {}", tls.cipher.version, tls.cipher.name),
             }),
         ]),
         Line::from(vec![
-            Span::styled("Issuer    ", DIM),
+            fact_key("Issuer"),
             Span::raw(format!(
                 "{} ({})",
                 cert.issued.organization, cert.issued.common_name
             )),
         ]),
         Line::from(vec![
-            Span::styled("Key       ", DIM),
+            fact_key("Key"),
             Span::raw(format!(
                 "{} {}-bit · {}",
                 cert.cert_key_algorithm, cert.cert_key_bits, cert.cert_alg
             )),
         ]),
         Line::from(vec![
-            Span::styled("Revocation", DIM),
-            Span::raw(format!(" {:?}", cert.revocation_status)),
+            fact_key("Revocation"),
+            if checking(OnDemand::Revocation) {
+                Span::styled(CHECKING, CHECKING_STYLE)
+            } else {
+                Span::styled(status_text(&revocation), tone_style(revocation.tone))
+            },
         ]),
         Line::from(vec![
-            Span::styled("Trust     ", DIM),
+            fact_key("Trust"),
             Span::styled(trust_text, trust_style),
         ]),
         Line::from(vec![
-            Span::styled("SHA-256   ", DIM),
+            fact_key("SHA-256"),
             Span::raw(cert.cert_sha256.clone()),
         ]),
     ];
+    // Only once CT was requested (flag or `c`), like the summary's CT column.
+    let ct_value = match &ct {
+        _ if ct_checking => Some(Span::styled(CHECKING, CHECKING_STYLE)),
+        Some(ct) => Some(Span::styled(status_text(ct), tone_style(ct.tone))),
+        None => None,
+    };
+    if let Some(value) = ct_value {
+        info.insert(4, Line::from(vec![fact_key("CT"), value]));
+    }
     frame.render_widget(Paragraph::new(info), info_area);
 
     // Lifetime gauge: how much of notBefore→notAfter has elapsed.
@@ -321,12 +405,27 @@ fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
         }
     }
 
-    // Warnings.
+    // Requested checks that could not complete, then warnings. Kept apart:
+    // "not verified" is not a finding about the certificate.
+    let mut lines = Vec::new();
+    let unverified = unverified_checks(tls);
+    if !unverified.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Not verified",
+            UNVERIFIED.add_modifier(Modifier::BOLD),
+        )));
+        for check in &unverified {
+            lines.push(Line::from(vec![
+                Span::styled(format!("? {}: ", check.check), UNVERIFIED),
+                Span::raw(check.reason.unwrap_or("no reason recorded").to_string()),
+            ]));
+        }
+    }
     if !cert.security_warnings.is_empty() {
-        let mut lines = vec![Line::from(Span::styled(
+        lines.push(Line::from(Span::styled(
             "Warnings",
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ))];
+        )));
         for warning in &cert.security_warnings {
             let (kind, msg) = warning_label(warning);
             lines.push(Line::from(vec![
@@ -334,8 +433,21 @@ fn draw_checked_detail(frame: &mut Frame, tls: &TLS, label: &str, area: Rect) {
                 Span::raw(msg.to_string()),
             ]));
         }
+    }
+    if !lines.is_empty() {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), warn_area);
     }
+}
+
+/// Explorer lines for a "why unverified" reason, one per `; `-separated
+/// failure (each OCSP responder / CRL distribution point), under its key.
+fn reason_lines(detail: &str) -> impl Iterator<Item = Line<'static>> + '_ {
+    detail.split("; ").map(|part| {
+        Line::from(vec![
+            Span::raw(format!("  {:<22}", "")),
+            Span::styled(format!("↳ {}", part), UNVERIFIED),
+        ])
+    })
 }
 
 /// Section heading for the explorer.
@@ -357,6 +469,22 @@ fn kv(key: &str, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {:<22}", key), DIM),
         Span::styled(value, value_style),
+    ])
+}
+
+/// An explorer key/value line for a status label, colored by its tone.
+fn kv_status(key: &str, label: &StatusLabel) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {:<22}", key), DIM),
+        Span::styled(status_text(label), tone_style(label.tone)),
+    ])
+}
+
+/// An explorer key/value line for an on-demand check still in flight.
+fn kv_checking(key: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {:<22}", key), DIM),
+        Span::styled(CHECKING, CHECKING_STYLE),
     ])
 }
 
@@ -417,11 +545,12 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                     format!("{}d ({}h)", cert.validity_days, cert.validity_hours)
                 },
             ));
+
+            lines.push(section("Trust & Revocation"));
             lines.push(kv(
                 "Self-signed",
                 if cert.is_self_signed { "yes" } else { "no" },
             ));
-            lines.push(kv("Revocation", format!("{:?}", cert.revocation_status)));
             lines.push(kv(
                 "Trust",
                 match &cert.trust {
@@ -432,17 +561,24 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                     tlschecker::TrustStatus::Unknown => "unknown".to_string(),
                 },
             ));
-            if let Some(ct) = &tls.ct {
-                lines.push(kv(
-                    "CT (crt.sh)",
-                    match ct {
-                        tlschecker::ct::CtStatus::Logged { crtsh_url, .. } => {
-                            format!("logged · {}", crtsh_url)
-                        }
-                        tlschecker::ct::CtStatus::NotLogged => "not logged".to_string(),
-                        tlschecker::ct::CtStatus::Unknown => "unknown".to_string(),
-                    },
-                ));
+            // The explorer scrolls by line count, so it can't wrap: an
+            // Unknown's reason gets one line per `; `-separated part instead.
+            let revocation = revocation_label(cert);
+            if app.is_running(app.selected, OnDemand::Revocation) {
+                lines.push(kv_checking("Revocation"));
+            } else {
+                lines.push(kv_status("Revocation", &revocation));
+                if revocation.tone == Tone::Unverified {
+                    lines.extend(revocation.detail.into_iter().flat_map(reason_lines));
+                }
+            }
+            if app.is_running(app.selected, OnDemand::Ct) {
+                lines.push(kv_checking("CT (crt.sh)"));
+            } else if let Some(ct) = ct_label(tls) {
+                lines.push(kv_status("CT (crt.sh)", &ct));
+                if ct.tone == Tone::Unverified {
+                    lines.extend(ct.detail.into_iter().flat_map(reason_lines));
+                }
             }
 
             lines.push(section("Certificate"));
@@ -514,8 +650,11 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
 
             if !cert.scts.is_empty() {
                 lines.push(section(&format!("Embedded SCTs ({})", cert.scts.len())));
+                // Two lines each: a 64-hex log id plus a timestamp overflows
+                // the explorer, which cannot wrap.
                 for sct in &cert.scts {
-                    lines.push(kv("Log", format!("{} at {}", sct.log_id, sct.timestamp)));
+                    lines.push(kv("Log", sct.log_id.clone()));
+                    lines.push(kv("  Submitted", sct.timestamp.clone()));
                 }
             }
 
@@ -552,7 +691,10 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
             if let Some(scan) = &tls.scan {
                 lines.push(section("Protocol & Cipher Scan"));
                 for proto in &scan.protocols {
-                    if proto.supported {
+                    if !proto.tested {
+                        // This build's OpenSSL cannot offer it (e.g. SSLv3).
+                        lines.push(kv(proto.version.label(), "not tested"));
+                    } else if proto.supported {
                         lines.push(kv(proto.version.label(), "supported"));
                         for cipher in &proto.ciphers {
                             lines.push(Line::from(Span::raw(format!("      · {}", cipher))));
@@ -619,12 +761,15 @@ fn draw_explorer(frame: &mut Frame, app: &App) {
     draw_footer(
         frame,
         app,
-        " j/k scroll · g/G top/bottom · e export · esc back · q quit",
+        &format!(
+            " j/k scroll · g/G top/bottom · e export{} · esc back · q quit",
+            check_hints_text(app)
+        ),
         footer,
     );
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, base: &'static str, area: Rect) {
+fn draw_footer(frame: &mut Frame, app: &App, base: &str, area: Rect) {
     if let Some(flash) = &app.flash {
         let color = match flash.kind {
             FlashKind::Success => Color::Green,
@@ -741,6 +886,264 @@ mod tests {
         app
     }
 
+    /// A host whose requested revocation and CT checks both came back
+    /// `Unknown`, with the reasons the library records.
+    fn unverified_tls() -> TLS {
+        let mut tls = make_test_tls();
+        tls.certificate.revocation_status = tlschecker::RevocationStatus::Unknown;
+        tls.certificate.revocation_detail = Some(
+            "OCSP: http://ocsp.example.com: response signature verification failed; \
+             CRL: certificate lists no CRL distribution point"
+                .to_string(),
+        );
+        tls.apply_ct_lookup(Err(tlschecker::TLSError::Unknown(
+            "CT lookup returned HTTP 502 Bad Gateway".to_string(),
+        )));
+        tls
+    }
+
+    #[test]
+    fn test_unverified_checks_are_marked_and_explained() {
+        let mut ok = make_test_tls();
+        ok.certificate.revocation_status = tlschecker::RevocationStatus::Good;
+        let app = app_with(
+            vec![
+                (0, HostOutcome::Checked(Box::new(unverified_tls()))),
+                (1, HostOutcome::Checked(Box::new(ok))),
+            ],
+            &["outage.example", "good.example"],
+        );
+        let content = render(&app);
+
+        // Marked in the list and counted in the tally...
+        assert!(content.contains("outage.example  ?"));
+        assert!(!content.contains("good.example  ?"));
+        assert!(content.contains("? 1 unverified"));
+        // ...and explained in the detail pane, not just shown as "Unknown".
+        assert!(content.contains("Not verified"));
+        assert!(content.contains("? Revocation: OCSP: http://ocsp.example.com: response"));
+        assert!(content.contains("? CT: CT lookup returned HTTP 502 Bad Gateway"));
+    }
+
+    #[test]
+    fn test_verified_host_shows_no_unverified_marks() {
+        let mut ok = make_test_tls();
+        ok.certificate.revocation_status = tlschecker::RevocationStatus::Good;
+        let app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(ok)))],
+            &["verified.example"],
+        );
+        let content = render(&app);
+        assert!(!content.contains("Not verified"));
+        assert!(!content.contains("unverified"));
+    }
+
+    #[test]
+    fn test_explorer_lists_each_unverified_reason() {
+        let mut app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(unverified_tls())))],
+            &["unverified.example"],
+        );
+        app.open_detail();
+        let content = render_sized(&app, 110, 60);
+        assert!(content
+            .contains("↳ OCSP: http://ocsp.example.com: response signature verification failed"));
+        assert!(content.contains("↳ CRL: certificate lists no CRL distribution point"));
+        assert!(content.contains("↳ CT lookup returned HTTP 502 Bad Gateway"));
+    }
+
+    #[test]
+    fn test_detail_pane_shows_readable_revocation_and_ct() {
+        let mut tls = make_test_tls();
+        tls.certificate.revocation_status = tlschecker::RevocationStatus::Revoked(
+            "Revoked at Sep  1 12:00:00 2026 GMT".to_string(),
+        );
+        tls.apply_ct(tlschecker::ct::CtStatus::Logged {
+            crtsh_id: 1,
+            crtsh_url: "https://crt.sh/?id=1".to_string(),
+        });
+        let app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(tls)))],
+            &["revoked.example"],
+        );
+        let content = render(&app);
+        assert!(content.contains("Revocation Revoked (at Sep  1 12:00:00 2026 GMT)"));
+        assert!(!content.contains("Revoked(\""), "no Debug formatting");
+        assert!(content.contains(&format!("{:<11}Logged · https://crt.sh/?id=1", "CT")));
+    }
+
+    /// Foreground color of the first cell of `needle` on screen.
+    fn fg_of(app: &App, needle: &str) -> Color {
+        let backend = TestBackend::new(110, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        for y in 0..32 {
+            let row: String = (0..110)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(byte) = row.find(needle) {
+                let x = row[..byte].chars().count() as u16;
+                return buffer[(x, y)].fg;
+            }
+        }
+        panic!("{needle:?} not on screen");
+    }
+
+    #[test]
+    fn test_revocation_color_follows_its_tone() {
+        let mut revoked = make_test_tls();
+        revoked.certificate.revocation_status =
+            tlschecker::RevocationStatus::Revoked("Revoked via CRL".to_string());
+        let app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(revoked)))],
+            &["revoked.example"],
+        );
+        assert_eq!(fg_of(&app, "Revoked (via CRL)"), Color::Red);
+
+        let app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(unverified_tls())))],
+            &["unverified.example"],
+        );
+        assert_eq!(fg_of(&app, "Unknown"), Color::Yellow);
+    }
+
+    #[test]
+    fn test_detail_pane_values_share_one_column() {
+        let mut tls = make_test_tls();
+        tls.certificate.revocation_status = tlschecker::RevocationStatus::Good;
+        tls.apply_ct(tlschecker::ct::CtStatus::Unknown);
+        let app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(tls)))],
+            &["aligned.example"],
+        );
+        let content = render(&app);
+        let rows: Vec<String> = content
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(110)
+            .map(|r| r.iter().collect())
+            .collect();
+        // (key, first characters of its value) for every line of the facts block.
+        let facts = [
+            ("Protocol", "TLSv1.3"),
+            ("Issuer", "Test CA"),
+            ("Key", "RSA"),
+            ("Revocation", "Not revoked"),
+            ("CT", "Unknown"),
+            ("Trust", "unknown"),
+            ("SHA-256", "AB:CD:EF"),
+        ];
+        let columns: Vec<(&str, usize)> = facts
+            .iter()
+            .map(|(key, value)| {
+                let row = rows
+                    .iter()
+                    .find(|r| r.contains(&format!("│{key} ")))
+                    .unwrap_or_else(|| panic!("no {key} line"));
+                let byte = row
+                    .find(value)
+                    .unwrap_or_else(|| panic!("no {value} on {row}"));
+                (*key, row[..byte].chars().count())
+            })
+            .collect();
+        assert!(
+            columns.iter().all(|(_, col)| *col == columns[0].1),
+            "values must start in one column: {columns:?}"
+        );
+    }
+
+    #[test]
+    fn test_detail_pane_omits_ct_when_not_requested() {
+        let app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(make_test_tls())))],
+            &["plain.example"],
+        );
+        let content = render(&app);
+        assert!(content.contains("Revocation Not checked"));
+        assert!(!content.contains("│CT "));
+    }
+
+    #[test]
+    fn test_explorer_groups_trust_revocation_and_ct() {
+        let mut tls = unverified_tls();
+        tls.certificate.scts = vec![tlschecker::sct::Sct {
+            version: 0,
+            log_id: "ab".repeat(32),
+            timestamp_ms: 0,
+            timestamp: "2026-09-10T20:21:55Z".to_string(),
+        }];
+        let mut app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(tls)))],
+            &["unverified.example"],
+        );
+        app.open_detail();
+        let content = render_sized(&app, 110, 70);
+        let section = content
+            .split("── Trust & Revocation")
+            .nth(1)
+            .and_then(|rest| rest.split("── ").next())
+            .expect("a Trust & Revocation section");
+        for needle in ["Self-signed", "Trust", "Revocation", "CT (crt.sh)"] {
+            assert!(section.contains(needle), "{needle} belongs in the section");
+        }
+        let validity = content
+            .split("── Validity")
+            .nth(1)
+            .unwrap()
+            .split("── ")
+            .next()
+            .unwrap();
+        assert!(!validity.contains("Revocation"));
+        // SCT log id and timestamp on separate lines, so neither is cut off.
+        assert!(content.contains(&"ab".repeat(32)));
+        assert!(content.contains("2026-09-10T20:21:55Z"));
+    }
+
+    #[test]
+    fn test_footer_offers_checks_not_yet_run() {
+        let app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(make_test_tls())))],
+            &["plain.example"],
+        );
+        assert!(render(&app).contains("e export · r revocation · c CT · g/G first/last"));
+
+        let mut done = make_test_tls();
+        done.certificate.revocation_status = tlschecker::RevocationStatus::Good;
+        done.apply_ct(tlschecker::ct::CtStatus::Logged {
+            crtsh_id: 1,
+            crtsh_url: "https://crt.sh/?id=1".to_string(),
+        });
+        let app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(done)))],
+            &["done.example"],
+        );
+        let content = render(&app);
+        assert!(content.contains("e export · g/G first/last"));
+        assert!(!content.contains("r revocation"));
+    }
+
+    #[test]
+    fn test_running_checks_show_checking_in_pane_and_explorer() {
+        let mut app = app_with(
+            vec![(0, HostOutcome::Checked(Box::new(make_test_tls())))],
+            &["plain.example"],
+        );
+        app.begin_check(OnDemand::Revocation).unwrap();
+        app.begin_check(OnDemand::Ct).unwrap();
+
+        let content = render(&app);
+        assert!(content.contains(&format!("{:<11}checking…", "Revocation")));
+        assert!(content.contains(&format!("{:<11}checking…", "CT")));
+        // Nothing left to offer while both run.
+        assert!(!content.contains("r revocation"));
+
+        app.open_detail();
+        let content = render_sized(&app, 110, 60);
+        assert!(content.contains(&format!("  {:<22}checking…", "Revocation")));
+        assert!(content.contains(&format!("  {:<22}checking…", "CT (crt.sh)")));
+    }
+
     #[test]
     fn test_draw_pending_and_progress() {
         let app = app_with(vec![], &["example.com", "other.example"]);
@@ -827,6 +1230,7 @@ mod tests {
         tls.scan = Some(tlschecker::probe::TlsScan {
             protocols: vec![tlschecker::probe::ProtocolSupport {
                 version: tlschecker::probe::ProtoVersion::Tls1_3,
+                tested: true,
                 supported: true,
                 ciphers: vec!["TLS_AES_256_GCM_SHA384".to_string()],
             }],

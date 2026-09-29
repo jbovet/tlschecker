@@ -1,9 +1,11 @@
 //! Dashboard application state: the host list, selection, and the verdict
 //! logic that colors it.
 
+use std::collections::HashSet;
 use std::io::{ErrorKind, Write};
 
-use tlschecker::{RevocationStatus, TLS};
+use tlschecker::ct::CtStatus;
+use tlschecker::{RevocationStatus, TLSError, TLS};
 
 use crate::HostOutcome;
 
@@ -38,6 +40,38 @@ pub fn verdict(tls: &TLS) -> Verdict {
     } else {
         Verdict::Healthy
     }
+}
+
+/// A check the user asked for that ran but could not reach a verdict.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Unverified<'a> {
+    /// Which check ("Revocation" or "CT").
+    pub check: &'static str,
+    /// Why it could not complete, when the check recorded a reason.
+    pub reason: Option<&'a str>,
+}
+
+/// The requested checks that came back `Unknown` for this host.
+///
+/// Deliberately separate from [`verdict`]: an unreachable OCSP responder or a
+/// crt.sh outage says nothing bad about the certificate, so it must not turn a
+/// fleet Warning. But it must not read as a pass either — the user asked for
+/// the check — so the dashboard marks it on its own.
+pub fn unverified_checks(tls: &TLS) -> Vec<Unverified<'_>> {
+    let mut out = Vec::new();
+    if tls.certificate.revocation_status == RevocationStatus::Unknown {
+        out.push(Unverified {
+            check: "Revocation",
+            reason: tls.certificate.revocation_detail.as_deref(),
+        });
+    }
+    if tls.ct == Some(tlschecker::ct::CtStatus::Unknown) {
+        out.push(Unverified {
+            check: "CT",
+            reason: tls.ct_detail.as_deref(),
+        });
+    }
+    out
 }
 
 /// Builds the filename the export prompt is prefilled with.
@@ -105,6 +139,85 @@ pub struct App {
     /// Transient footer message reporting the last export attempt, replacing
     /// the key hints until the next keypress.
     pub flash: Option<Flash>,
+    /// On-demand checks in flight, by host index.
+    pub running: HashSet<(usize, OnDemand)>,
+}
+
+/// A check the dashboard can run on demand for the selected host — the ones
+/// that are opt-in on the command line because they cost network round trips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OnDemand {
+    Revocation,
+    Ct,
+}
+
+impl OnDemand {
+    fn name(self) -> &'static str {
+        match self {
+            OnDemand::Revocation => "Revocation",
+            OnDemand::Ct => "CT",
+        }
+    }
+}
+
+/// An on-demand check ready to run, carrying only what it needs so it can
+/// run on a worker thread while the dashboard keeps drawing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OnDemandJob {
+    /// Revocation for the chain the check kept — no new TLS connection.
+    Revocation { index: usize, pem: String },
+    /// crt.sh lookup by the leaf's SHA-256 fingerprint.
+    Ct { index: usize, sha256: String },
+}
+
+/// The outcome of an [`OnDemandJob`], applied with [`App::finish_check`].
+#[derive(Debug)]
+pub enum OnDemandResult {
+    Revocation(RevocationStatus, Option<String>),
+    Ct(Result<CtStatus, TLSError>),
+}
+
+impl OnDemandJob {
+    /// Runs the check. Blocking (OCSP/CRL/crt.sh requests): call it off the
+    /// UI thread.
+    pub fn run(self) -> (usize, OnDemandResult) {
+        match self {
+            OnDemandJob::Revocation { index, pem } => {
+                let (status, detail) = tlschecker::check_revocation_from_pem(&pem);
+                (index, OnDemandResult::Revocation(status, detail))
+            }
+            OnDemandJob::Ct { index, sha256 } => (
+                index,
+                OnDemandResult::Ct(tlschecker::ct::check_ct_status(&sha256)),
+            ),
+        }
+    }
+
+    /// The result to record if [`run`](Self::run) panicked, so the host
+    /// doesn't stay "checking…" forever.
+    pub fn failed(index: usize, kind: OnDemand, reason: &str) -> (usize, OnDemandResult) {
+        let reason = format!("internal error while checking: {reason}");
+        match kind {
+            OnDemand::Revocation => (
+                index,
+                OnDemandResult::Revocation(RevocationStatus::Unknown, Some(reason)),
+            ),
+            OnDemand::Ct => (index, OnDemandResult::Ct(Err(TLSError::Unknown(reason)))),
+        }
+    }
+
+    pub fn kind(&self) -> OnDemand {
+        match self {
+            OnDemandJob::Revocation { .. } => OnDemand::Revocation,
+            OnDemandJob::Ct { .. } => OnDemand::Ct,
+        }
+    }
+
+    pub fn index(&self) -> usize {
+        match self {
+            OnDemandJob::Revocation { index, .. } | OnDemandJob::Ct { index, .. } => *index,
+        }
+    }
 }
 
 /// The export overlay: the path being typed, plus why the last attempt failed.
@@ -164,6 +277,9 @@ pub struct Tally {
     pub critical: usize,
     pub failed: usize,
     pub pending: usize,
+    /// Checked hosts with at least one requested check left unverified
+    /// (counted independently of their verdict).
+    pub unverified: usize,
 }
 
 impl App {
@@ -176,7 +292,102 @@ impl App {
             detail_scroll: 0,
             export_prompt: None,
             flash: None,
+            running: HashSet::new(),
         }
+    }
+
+    /// Starts an on-demand check of the selected host, returning the job to
+    /// run off the UI thread — or `None`, with a flash saying why, when there
+    /// is nothing to check or the same check is already running.
+    pub fn begin_check(&mut self, kind: OnDemand) -> Option<OnDemandJob> {
+        let index = self.selected;
+        let tls = match self.slots.get(index) {
+            Some(Some(HostOutcome::Checked(tls))) => tls,
+            Some(Some(HostOutcome::Failed { .. })) => {
+                self.flash = Some(Flash::error("Nothing to check: host check failed"));
+                return None;
+            }
+            _ => {
+                self.flash = Some(Flash::error("Nothing to check: check still running"));
+                return None;
+            }
+        };
+        if self.running.contains(&(index, kind)) {
+            self.flash = Some(Flash::error(format!(
+                "{} check already running",
+                kind.name()
+            )));
+            return None;
+        }
+        let job = match kind {
+            // Results loaded without a live connection have no chain to check.
+            OnDemand::Revocation if tls.certificate.pem.is_empty() => {
+                self.flash = Some(Flash::error(
+                    "No certificate chain kept for this host: cannot check revocation",
+                ));
+                return None;
+            }
+            OnDemand::Revocation => OnDemandJob::Revocation {
+                index,
+                pem: tls.certificate.pem.clone(),
+            },
+            OnDemand::Ct => OnDemandJob::Ct {
+                index,
+                sha256: tls.certificate.cert_sha256.clone(),
+            },
+        };
+        self.running.insert((index, kind));
+        Some(job)
+    }
+
+    /// Applies a finished on-demand check to its host.
+    pub fn finish_check(&mut self, index: usize, result: OnDemandResult) {
+        let kind = match result {
+            OnDemandResult::Revocation(..) => OnDemand::Revocation,
+            OnDemandResult::Ct(_) => OnDemand::Ct,
+        };
+        self.running.remove(&(index, kind));
+        if let Some(Some(HostOutcome::Checked(tls))) = self.slots.get_mut(index) {
+            match result {
+                OnDemandResult::Revocation(status, detail) => tls.apply_revocation(status, detail),
+                OnDemandResult::Ct(lookup) => tls.apply_ct_lookup(lookup),
+            }
+            let label = self.labels.get(index).map(String::as_str).unwrap_or("");
+            self.flash = Some(Flash::success(format!(
+                "{} check finished for {}",
+                kind.name(),
+                label
+            )));
+        }
+    }
+
+    /// Whether `kind` is running for host `index`.
+    pub fn is_running(&self, index: usize, kind: OnDemand) -> bool {
+        self.running.contains(&(index, kind))
+    }
+
+    /// The on-demand checks worth offering for the selected host: those it
+    /// has no definitive answer for yet (never run, or `Unknown`) and that
+    /// are not already running.
+    pub fn check_hints(&self) -> Vec<OnDemand> {
+        let Some(Some(HostOutcome::Checked(tls))) = self.slots.get(self.selected) else {
+            return Vec::new();
+        };
+        let mut hints = Vec::new();
+        if matches!(
+            tls.certificate.revocation_status,
+            RevocationStatus::NotChecked | RevocationStatus::Unknown
+        ) && !tls.certificate.pem.is_empty()
+            && !self.is_running(self.selected, OnDemand::Revocation)
+        {
+            hints.push(OnDemand::Revocation);
+        }
+        if matches!(tls.ct, None | Some(CtStatus::Unknown))
+            && !self.is_running(self.selected, OnDemand::Ct)
+        {
+            hints.push(OnDemand::Ct);
+        }
+        hints
     }
 
     /// Opens the full-screen certificate explorer for the selected host.
@@ -345,11 +556,16 @@ impl App {
             match slot {
                 None => tally.pending += 1,
                 Some(HostOutcome::Failed { .. }) => tally.failed += 1,
-                Some(HostOutcome::Checked(tls)) => match verdict(tls) {
-                    Verdict::Healthy => tally.healthy += 1,
-                    Verdict::Warning => tally.warning += 1,
-                    Verdict::Critical => tally.critical += 1,
-                },
+                Some(HostOutcome::Checked(tls)) => {
+                    match verdict(tls) {
+                        Verdict::Healthy => tally.healthy += 1,
+                        Verdict::Warning => tally.warning += 1,
+                        Verdict::Critical => tally.critical += 1,
+                    }
+                    if !unverified_checks(tls).is_empty() {
+                        tally.unverified += 1;
+                    }
+                }
             }
         }
         tally
@@ -578,6 +794,203 @@ mod tests {
         let mut tls = make_test_tls();
         tls.certificate.is_expired = true;
         assert_eq!(verdict(&tls), Verdict::Critical);
+    }
+
+    #[test]
+    fn test_unverified_checks_do_not_change_verdict() {
+        let mut tls = make_test_tls();
+        tls.certificate.revocation_status = RevocationStatus::Unknown;
+        tls.certificate.revocation_detail = Some("OCSP: timeout".to_string());
+        tls.apply_ct(tlschecker::ct::CtStatus::Unknown);
+
+        assert_eq!(
+            unverified_checks(&tls),
+            vec![
+                Unverified {
+                    check: "Revocation",
+                    reason: Some("OCSP: timeout"),
+                },
+                Unverified {
+                    check: "CT",
+                    reason: None,
+                },
+            ]
+        );
+        // An outage says nothing bad about the certificate itself.
+        assert_eq!(verdict(&tls), Verdict::Healthy);
+
+        let mut app = App::new(&["a".to_string(), "b".to_string()]);
+        app.record(0, HostOutcome::Checked(Box::new(tls)));
+        app.record(1, HostOutcome::Checked(Box::new(make_test_tls())));
+        let tally = app.tally();
+        assert_eq!((tally.healthy, tally.unverified), (2, 1));
+    }
+
+    #[test]
+    fn test_not_checked_is_not_unverified() {
+        // Checks the user did not request are not "unverified".
+        let tls = make_test_tls(); // revocation NotChecked, ct None
+        assert!(unverified_checks(&tls).is_empty());
+    }
+
+    fn app_with_checked(tls: TLS) -> App {
+        let mut app = App::new(&["host.example".to_string()]);
+        app.record(0, HostOutcome::Checked(Box::new(tls)));
+        app
+    }
+
+    #[test]
+    fn test_begin_check_builds_jobs_and_refuses_duplicates() {
+        let tls = make_test_tls();
+        let (pem, sha256) = (
+            tls.certificate.pem.clone(),
+            tls.certificate.cert_sha256.clone(),
+        );
+        let mut app = app_with_checked(tls);
+
+        assert_eq!(
+            app.begin_check(OnDemand::Revocation),
+            Some(OnDemandJob::Revocation { index: 0, pem })
+        );
+        assert_eq!(
+            app.begin_check(OnDemand::Ct),
+            Some(OnDemandJob::Ct { index: 0, sha256 })
+        );
+        assert!(app.is_running(0, OnDemand::Revocation));
+
+        // Pressing the key again while it runs must not start a second one.
+        assert_eq!(app.begin_check(OnDemand::Revocation), None);
+        assert!(app.flash.as_ref().unwrap().text.contains("already running"));
+    }
+
+    #[test]
+    fn test_begin_check_needs_a_checked_host_with_a_chain() {
+        let mut app = App::new(&["pending.example".to_string(), "failed.example".to_string()]);
+        app.record(
+            1,
+            HostOutcome::Failed {
+                kind: "DNS",
+                detail: "no such host".to_string(),
+            },
+        );
+        assert_eq!(app.begin_check(OnDemand::Ct), None); // index 0 still pending
+        app.select_next();
+        assert_eq!(app.begin_check(OnDemand::Ct), None);
+        assert!(app
+            .flash
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("host check failed"));
+
+        let mut no_chain = make_test_tls();
+        no_chain.certificate.pem.clear();
+        let mut app = app_with_checked(no_chain);
+        assert_eq!(app.begin_check(OnDemand::Revocation), None);
+        assert!(app
+            .flash
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("No certificate chain"));
+        assert!(app.running.is_empty());
+    }
+
+    #[test]
+    fn test_finish_check_updates_host_verdict_and_grade() {
+        let mut tls = make_test_tls();
+        tls.grade = Some(tlschecker::grading::calculate_grade(
+            &tlschecker::grading::GradingInput {
+                protocol_version: "TLSv1.3".into(),
+                cipher_name: "TLS_AES_256_GCM_SHA384".into(),
+                cipher_bits: 256,
+                cert_key_bits: 2048,
+                cert_key_algorithm: "RSA".into(),
+                is_expired: false,
+                is_self_signed: false,
+                has_incomplete_chain: false,
+                has_weak_signature: false,
+                has_hostname_mismatch: false,
+                has_invalid_chain_signature: false,
+                supports_obsolete_protocol: false,
+                accepts_weak_cipher: false,
+                is_revoked: false,
+                is_untrusted: false,
+            },
+        ));
+        let mut app = app_with_checked(tls);
+        app.begin_check(OnDemand::Revocation).unwrap();
+
+        app.finish_check(
+            0,
+            OnDemandResult::Revocation(RevocationStatus::Revoked("Revoked via CRL".into()), None),
+        );
+
+        assert!(!app.is_running(0, OnDemand::Revocation));
+        let Some(Some(HostOutcome::Checked(tls))) = app.slots.first() else {
+            panic!("host should still be checked")
+        };
+        assert_eq!(verdict(tls), Verdict::Critical);
+        assert_eq!(tls.grade.as_ref().unwrap().grade, "F");
+        assert_eq!(
+            app.flash.as_ref().unwrap().text,
+            "Revocation check finished for host.example"
+        );
+    }
+
+    #[test]
+    fn test_finish_ct_check_keeps_the_failure_reason() {
+        let mut app = app_with_checked(make_test_tls());
+        app.begin_check(OnDemand::Ct).unwrap();
+        app.finish_check(
+            0,
+            OnDemandResult::Ct(Err(TLSError::Unknown("CT lookup returned HTTP 502".into()))),
+        );
+        let Some(Some(HostOutcome::Checked(tls))) = app.slots.first() else {
+            panic!("host should still be checked")
+        };
+        assert_eq!(tls.ct, Some(CtStatus::Unknown));
+        assert_eq!(
+            tls.ct_detail.as_deref(),
+            Some("CT lookup returned HTTP 502")
+        );
+    }
+
+    #[test]
+    fn test_check_hints_offer_only_undecided_checks() {
+        // Neither check requested on the command line: both offered.
+        let mut app = app_with_checked(make_test_tls());
+        assert_eq!(app.check_hints(), vec![OnDemand::Revocation, OnDemand::Ct]);
+
+        // Running: not offered again.
+        app.begin_check(OnDemand::Ct).unwrap();
+        assert_eq!(app.check_hints(), vec![OnDemand::Revocation]);
+
+        // Definitive answers: nothing left to offer...
+        let mut done = make_test_tls();
+        done.certificate.revocation_status = RevocationStatus::Good;
+        done.apply_ct(CtStatus::NotLogged);
+        assert!(app_with_checked(done).check_hints().is_empty());
+
+        // ...but Unknown can be retried.
+        let mut unknown = make_test_tls();
+        unknown.certificate.revocation_status = RevocationStatus::Unknown;
+        unknown.apply_ct(CtStatus::Unknown);
+        assert_eq!(
+            app_with_checked(unknown).check_hints(),
+            vec![OnDemand::Revocation, OnDemand::Ct]
+        );
+    }
+
+    #[test]
+    fn test_failed_job_result_is_unknown_with_reason() {
+        let (index, result) = OnDemandJob::failed(3, OnDemand::Revocation, "boom");
+        assert_eq!(index, 3);
+        assert!(matches!(
+            result,
+            OnDemandResult::Revocation(RevocationStatus::Unknown, Some(ref r))
+                if r == "internal error while checking: boom"
+        ));
     }
 
     #[test]
