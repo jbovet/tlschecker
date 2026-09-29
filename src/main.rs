@@ -10,7 +10,6 @@ mod metrics;
 mod tui;
 
 use clap::{Parser, ValueEnum};
-use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 
@@ -633,8 +632,7 @@ impl Formatter for SummaryFormat {
             // a TTY and a pipe, breaking tests) and mangles values like
             // hostnames and fingerprints mid-word. A wide table simply scrolls.
             .set_content_arrangement(ContentArrangement::Disabled)
-            .apply_modifier(UTF8_ROUND_CORNERS)
-            .load_preset(UTF8_FULL)
+            .load_style(UTF8_FULL)
             .set_header(header);
 
         for rs in tls {
