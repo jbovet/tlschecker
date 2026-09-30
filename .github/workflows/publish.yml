@@ -5,57 +5,107 @@ on:
     tags:
       - "*"
 
+# Build jobs only read the repository; the single release job below is the
+# only one allowed to write (attach assets to the release).
+permissions:
+  contents: read
+
 jobs:
-  publish:
-    name: Publish for ${{ matrix.name }}
+  build:
+    name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        # Linux builds link against glibc 2.17 through `cargo zigbuild` (the
+        # `.2.17` target suffix): built natively on ubuntu-latest, the binary
+        # required glibc >= 2.39 and failed on Debian 12, Ubuntu 22.04, and
+        # RHEL 8/9. 2.17 is the oldest glibc with aarch64 support, so both
+        # architectures share one floor. zigbuild also cross-compiles aarch64
+        # without a separate gcc toolchain.
         include:
           - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: target/x86_64-unknown-linux-gnu/release/tlschecker
+            glibc: "2.17"
             asset_name: tlschecker-linux-x86_64
           - name: linux-aarch64
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact_name: target/aarch64-unknown-linux-gnu/release/tlschecker
+            glibc: "2.17"
             asset_name: tlschecker-linux-aarch64
           - name: macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: target/x86_64-apple-darwin/release/tlschecker
             asset_name: tlschecker-macos-x86_64
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: target/aarch64-apple-darwin/release/tlschecker
             asset_name: tlschecker-macos-aarch64
 
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation dependencies (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+      - name: Install Zig
+        if: matrix.glibc
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
 
-      - name: Build
+      - name: Install cargo-zigbuild
+        if: matrix.glibc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build (Linux, glibc ${{ matrix.glibc }})
+        if: matrix.glibc
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}.${{ matrix.glibc }}
+
+      - name: Build (macOS)
+        if: ${{ !matrix.glibc }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Upload binaries to release
-        uses: actions/upload-artifact@v7
+      # A tarball keeps the executable bit and is the name the README's
+      # install instructions download.
+      - name: Package
+        shell: bash
+        env:
+          # macOS tar would otherwise store extended attributes (e.g.
+          # com.apple.provenance) as `._tlschecker` entries; GNU tar ignores it.
+          COPYFILE_DISABLE: "1"
+        run: |
+          staging="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/tlschecker" "$staging/"
+          tar -czf "${{ matrix.asset_name }}.tar.gz" -C "$staging" tlschecker
+          shasum -a 256 "${{ matrix.asset_name }}.tar.gz" > "${{ matrix.asset_name }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
-          path: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.asset_name }}.tar.gz
+            ${{ matrix.asset_name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  # One job attaches everything, so the four builds can't race to create the
+  # release, and only this job holds write access.
+  release:
+    name: Attach assets to the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
