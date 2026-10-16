@@ -423,6 +423,14 @@ tlschecker -o json --fail-on never --allow-unreachable --hosts-file hosts.txt \
   | jq -r '.results[] | select(.outcome == "error") | "\(.input): \(.error.message)"'
 ```
 
+### Versioning
+
+tlschecker follows [semantic versioning](https://semver.org) for its command
+line: flags, exit codes, the severity table and the JSON schema change
+incompatibly only in a major version. The Rust library API is not covered yet:
+it may still change in 3.x minor releases until the crate is published on
+crates.io.
+
 ## Examples
 
 Using custom ports:

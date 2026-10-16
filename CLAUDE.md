@@ -73,6 +73,8 @@ When adding logic that touches a live TLS connection or OCSP/CRL responder, pref
 
 ## Conventions
 
+- **Versioning (v3):** semver covers the command line — flags, exit codes, the severity table (see `verdict.rs`) and the JSON schema (see `json.rs`). The library API is deliberately *not* covered until the crate is published on crates.io (#21), so library-only breaks (e.g. #210's `cli` feature, #211's options type) can ship in 3.x; record them under the CHANGELOG's *Breaking* heading anyway.
+
 - Errors use `thiserror` (`TLSError` in `lib.rs`, `ConfigError` in `config.rs`); the binary uses `anyhow`. Map new failure modes onto an existing `TLSError` variant where possible.
 - Public items carry rustdoc; doc examples compile as part of `cargo test` (doc-tests), so keep `# Example` blocks valid.
 - Weak-algorithm detection (`is_weak_algorithm`) matches on substrings/OIDs of the signature algorithm string — extend the match list there rather than introducing a new mechanism.
