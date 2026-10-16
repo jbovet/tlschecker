@@ -1,12 +1,42 @@
 name: Security audit
+
+# Runs `cargo audit` against Cargo.lock and fails the check when a dependency
+# has a RustSec vulnerability. It deliberately does not open issues: the
+# previous `rustsec/audit-check` action opened one issue per advisory and never
+# closed them once Renovate bumped the crate, so the tracker filled up with
+# advisories that were already fixed. A red scheduled run notifies the
+# maintainer instead, and goes green on its own once the lockfile is fixed.
+# To accept an advisory that has no fix, list its ID under `[advisories] ignore`
+# in `.cargo/audit.toml` with a comment explaining why.
+
 on:
   schedule:
     - cron: '0 0 * * *'
+  push:
+    branches: [ "main" ]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.cargo/audit.toml'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.cargo/audit.toml'
+      - '.github/workflows/audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit
