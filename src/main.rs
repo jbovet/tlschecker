@@ -45,7 +45,7 @@ Exit status:
   4  Internal error after the run started
   When both apply, 1 wins over 3.";
 
-/// Experimental TLS/SSL certificate checker.
+/// Check TLS certificates: expiry, revocation, hostname and chain.
 ///
 /// Checks TLS certificates for multiple hosts, validates expiration dates, and
 /// optionally checks revocation status.
