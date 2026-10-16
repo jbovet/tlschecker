@@ -91,6 +91,10 @@ output* sections for the full rules.
 - The `tlschecker::verdict` library module and `SecurityWarning::message()`.
 - `tlschecker::rfc3339_from_unix`, and `valid_from_unix` / `valid_to_unix` on
   `Chain`.
+- A `weak-protocol` / `weak-cipher` finding (Warning) for a weak protocol or
+  cipher **negotiated** on the connection, without `--scan` (#217). A host
+  reachable only through the legacy-protocol retry used to read Healthy while
+  graded D.
 
 ### Changed
 
@@ -115,6 +119,9 @@ output* sections for the full rules.
 - A `tlschecker.toml` in the current directory that failed to parse was
   silently ignored, dropping its hosts and settings; its error is now reported
   (exit 2).
+- #221: a port written out that equals the scheme's default (`http://host:80`)
+  was ignored and the host was checked on 443. A written port is now always
+  used; a URL without a port (`http://host`) is still checked on 443.
 - Config errors now print the actual error, not only the usage hints.
 - `--fail-on-error` alone used to do nothing (it needed `--exit-code`).
 - `--exit-code 256` silently exited 0.

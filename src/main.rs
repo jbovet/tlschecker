@@ -56,7 +56,9 @@ Exit status:
 #[derive(Parser)]
 #[command(author, version, about, long_about, after_long_help = EXIT_STATUS_HELP)]
 struct Args {
-    /// Hosts to check, e.g. example.com example.com:8443
+    /// Hosts to check: host, host:port or a URL, e.g. example.com
+    /// example.com:8443 https://example.com:9443. A written port is always
+    /// used; without one, 443 is checked (also for http:// URLs).
     #[clap(value_parser)]
     addresses: Vec<String>,
 
@@ -1695,12 +1697,32 @@ fn should_grade(config_grade: bool, scan: bool) -> bool {
     config_grade || scan
 }
 
+/// The port of `address` when it was written out but equals the scheme's
+/// default (`http://host:80`, `https://host:443`).
+///
+/// `Url::port()` returns `None` for a scheme-default port, and `None` means
+/// "use 443" to the checker, so an explicit `http://host:80` was silently
+/// checked on 443 (#221). A scheme without any port (`http://host`) still
+/// returns `None`: tlschecker only speaks TLS, so 443 is the useful default
+/// for a pasted URL.
+fn written_default_port(address: &str, url: &Url) -> Option<u16> {
+    let default = url.port_or_known_default()?;
+    let (_, rest) = address.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    authority
+        .ends_with(&format!(":{default}"))
+        .then_some(default)
+}
+
 /// Parses a hostname/address specification that may include a port.
 ///
 /// Supports multiple input formats:
 /// - `example.com` → hostname, default port 443
 /// - `example.com:8443` → hostname with explicit port
 /// - `https://example.com:8443` → full URL (scheme ignored)
+/// - `http://example.com:80` → port 80: a written port is always kept, even
+///   the scheme's default ([`written_default_port`]); `http://example.com`
+///   with no port is checked on 443
 /// - `[::1]:443` → IPv6 address with port
 /// - `192.168.1.1:8443` → IPv4 address with port
 ///
@@ -1733,7 +1755,9 @@ fn parse_host_port(address: &str) -> Result<HostPort, String> {
         if let Some(host_str) = url.host_str() {
             return Ok(HostPort {
                 host: host_str.to_string(),
-                port: url.port(),
+                port: url
+                    .port()
+                    .or_else(|| written_default_port(&address_with_scheme, &url)),
             });
         }
     }
@@ -1971,6 +1995,52 @@ pub(crate) mod tests {
         assert_eq!(hp.port, Some(8080));
     }
 
+    // ── #221: an explicitly written port is honoured ──────────────────
+
+    #[test]
+    fn test_parse_host_port_http_url_explicit_port_80() {
+        let hp = parse_host_port("http://example.com:80").unwrap();
+        assert_eq!(hp.port, Some(80));
+    }
+
+    #[test]
+    fn test_parse_host_port_explicit_443() {
+        assert_eq!(
+            parse_host_port("https://example.com:443").unwrap().port,
+            Some(443)
+        );
+        assert_eq!(parse_host_port("example.com:443").unwrap().port, Some(443));
+    }
+
+    #[test]
+    fn test_parse_host_port_scheme_without_port_defaults_to_443() {
+        // No port written: None, which the checker turns into 443 — also for
+        // http://, since tlschecker only speaks TLS.
+        assert_eq!(parse_host_port("http://example.com").unwrap().port, None);
+        assert_eq!(parse_host_port("http://example.com/").unwrap().port, None);
+    }
+
+    #[test]
+    fn test_parse_host_port_default_port_lookalikes_in_path_or_userinfo() {
+        // ":80" outside the authority's port position is not a port.
+        assert_eq!(
+            parse_host_port("http://example.com/x:80").unwrap().port,
+            None
+        );
+        assert_eq!(
+            parse_host_port("http://example.com?p=:80").unwrap().port,
+            None
+        );
+        assert_eq!(
+            parse_host_port("http://user:80@example.com").unwrap().port,
+            None
+        );
+        assert_eq!(
+            parse_host_port("http://user@example.com:80/").unwrap().port,
+            Some(80)
+        );
+    }
+
     #[test]
     fn test_parse_host_port_ipv4_with_port() {
         let hp = parse_host_port("192.168.1.1:8443").unwrap();
@@ -1990,9 +2060,8 @@ pub(crate) mod tests {
         let hp = parse_host_port("[::1]:443").unwrap();
         // URL parser keeps brackets for IPv6 addresses
         assert_eq!(hp.host, "[::1]");
-        // url.port() returns None for scheme-default ports (443 for HTTPS),
-        // which is correct since the app defaults to 443 when port is None
-        assert_eq!(hp.port, None);
+        // A written port is kept even when it is the scheme default.
+        assert_eq!(hp.port, Some(443));
     }
 
     #[test]
