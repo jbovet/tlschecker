@@ -83,7 +83,8 @@ output* sections for the full rules.
 - The exit-status table in `--help`.
 - `port`, `target` and `input` in each JSON result and a `Port:` line in text
   output.
-- `-v` / `-vv` / `-q` to choose how much is shown on stderr, and `RUST_LOG`
+- `-v` / `-vv` / `-q` to choose how much is shown on stderr (`-v`/`-vv` raise
+  tlschecker's own messages; other crates stay at warnings), and `RUST_LOG`
   support (#209).
 - `error.hint` in JSON error entries: the same plain-language explanation
   stderr shows. The dashboard shows it above the raw error.
@@ -100,8 +101,8 @@ output* sections for the full rules.
   not be checked reads `error: <host>: <plain-language reason>` for common
   errors (wrong port, refused, DNS, timeout, handshake rejected, client
   certificate required, …); the raw error is shown with `-v`.
-- Running `tlschecker` with no arguments (and no config providing hosts)
-  prints the help instead of an error. The "no hosts" error is one line.
+- Running `tlschecker` with no arguments (and no `tlschecker.toml` in the
+  current directory) prints the help instead of an error. The "no hosts" error is one line.
 
 ### Fixed
 
@@ -111,6 +112,9 @@ output* sections for the full rules.
 - #207: checking several ports of one host printed identical `host` labels in
   the summary table and findings; they now read `host:port`.
 - #208: JSON silently dropped hosts that could not be checked.
+- A `tlschecker.toml` in the current directory that failed to parse was
+  silently ignored, dropping its hosts and settings; its error is now reported
+  (exit 2).
 - Config errors now print the actual error, not only the usage hints.
 - `--fail-on-error` alone used to do nothing (it needed `--exit-code`).
 - `--exit-code 256` silently exited 0.

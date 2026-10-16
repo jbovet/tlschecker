@@ -10,8 +10,9 @@
 //!   empty (<https://no-color.org>), so piped stderr and CI logs never carry
 //!   escape codes.
 //! - **Level:** warnings and errors by default; `-q` shows errors only, `-v`
-//!   adds info (e.g. the raw error behind a hint), `-vv` debug. A non-empty
-//!   `RUST_LOG` (`warn`, `tlschecker=debug,reqwest=warn`, …) overrides both.
+//!   adds tlschecker's info (e.g. the raw error behind a hint), `-vv` its
+//!   debug — third-party crates stay at warnings. A non-empty `RUST_LOG`
+//!   (`warn`, `tlschecker=debug,reqwest=warn`, …) overrides both.
 //!
 //! [`failure_hint`] turns the most common connection and handshake errors into
 //! a sentence a user can act on; the raw text stays available at `-v` and in
@@ -73,8 +74,18 @@ fn level(verbose: u8, quiet: bool) -> LevelFilter {
     }
 }
 
+/// `-v` / `-vv` raise tlschecker's own level only: third-party crates (hyper,
+/// reqwest, rustls, …) stay at warnings (errors with `-q`), or `-vv` would
+/// bury the useful lines in HTTP and TLS internals. `RUST_LOG` reaches them.
 fn default_filter(verbose: u8, quiet: bool) -> Targets {
-    Targets::new().with_default(level(verbose, quiet))
+    let others = if quiet {
+        LevelFilter::ERROR
+    } else {
+        LevelFilter::WARN
+    };
+    Targets::new()
+        .with_default(others)
+        .with_target("tlschecker", level(verbose, quiet))
 }
 
 /// Colour only for a terminal, and never when `NO_COLOR` is set to a
@@ -218,6 +229,20 @@ mod tests {
         assert!(f.would_enable("tlschecker", &Level::WARN));
         assert!(!f.would_enable("tlschecker", &Level::INFO));
         assert!(!f.would_enable("reqwest", &Level::INFO));
+    }
+
+    #[test]
+    fn test_verbose_raises_only_our_own_level() {
+        let f = default_filter(2, false);
+        assert!(f.would_enable("tlschecker", &Level::DEBUG));
+        assert!(f.would_enable("tlschecker::probe", &Level::DEBUG));
+        assert!(!f.would_enable("hyper", &Level::DEBUG));
+        assert!(f.would_enable("hyper", &Level::WARN));
+        // -q: errors only, everywhere.
+        let q = default_filter(0, true);
+        assert!(!q.would_enable("tlschecker", &Level::WARN));
+        assert!(!q.would_enable("reqwest", &Level::WARN));
+        assert!(q.would_enable("reqwest", &Level::ERROR));
     }
 
     #[test]

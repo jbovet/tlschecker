@@ -219,6 +219,23 @@ fn test_bare_invocation_prints_help() {
 }
 
 #[test]
+fn test_bare_invocation_with_broken_config_reports_it() {
+    // A tlschecker.toml in the CWD makes a bare run valid, so its error must
+    // be shown, not hidden behind the help.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("tlschecker.toml"), "hosts = [").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tlschecker"))
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run tlschecker");
+    assert_exit(&output, 2);
+    let err = stderr(&output);
+    assert!(err.contains("error: Parse Error"), "{err}");
+    assert!(!err.contains("Usage: tlschecker"), "{err}");
+}
+
+#[test]
 fn test_failure_is_a_plain_hint_on_stderr() {
     let refused = refused_host();
     let err = stderr(&check(&[&refused]));

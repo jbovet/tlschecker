@@ -166,8 +166,6 @@ fn status_text(label: &StatusLabel) -> String {
     }
 }
 
-/// One list row: state symbol + label + grade letter, plus a `?` when a
-/// requested check could not be verified.
 /// Why a host could not be checked: the plain-language hint for a common
 /// error (bold), then the raw error (dimmed), or just the raw error.
 fn failure_lines(detail: &str) -> Vec<Line<'static>> {
@@ -186,6 +184,8 @@ fn failure_lines(detail: &str) -> Vec<Line<'static>> {
     }
 }
 
+/// One list row: state symbol + label + grade letter, plus a `?` when a
+/// requested check could not be verified.
 fn host_row(app: &App, index: usize) -> Line<'_> {
     let label = app.labels[index].as_str();
     match &app.slots[index] {
