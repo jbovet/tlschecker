@@ -277,17 +277,46 @@ impl std::str::FromStr for OutFormat {
 /// One checked host as every non-interactive output sees it: the check
 /// result plus its status under the run's [`VerdictPolicy`].
 ///
-/// Serializes as the [`TLS`] fields plus a `status` object, so JSON stays an
-/// array that still deserializes as `Vec<TLS>`.
+/// Serializes as a `port` field, the [`TLS`] fields and a `status` object, so
+/// JSON stays an array that still deserializes as `Vec<TLS>`.
 #[derive(Serialize)]
 pub(crate) struct HostReport {
     /// The host exactly as the user supplied it.
     #[serde(skip)]
     pub label: String,
+    /// The port that was checked (443 when the input named none). `TLS` only
+    /// carries the hostname, so without it two ports of one host are
+    /// indistinguishable in every output.
+    pub port: u16,
     #[serde(flatten)]
     pub tls: TLS,
     /// Assessed once, when the report is built (see [`collect`]).
     pub status: Assessment,
+}
+
+impl HostReport {
+    /// How this host is named in every output: see [`display_target`].
+    pub(crate) fn target(&self) -> String {
+        display_target(&self.tls.certificate.hostname, self.port)
+    }
+}
+
+/// The port checked when an address names none (same default as
+/// [`TLS::from`]).
+const DEFAULT_TLS_PORT: u16 = 443;
+
+/// `host` on the default port, `host:port` otherwise (`[v6]:port` for IPv6
+/// literals), so two ports of the same host never share a label. An IPv6 host
+/// may arrive already bracketed (`parse_host_port` keeps the URL parser's
+/// `[::1]`), so brackets are only added when missing.
+pub(crate) fn display_target(host: &str, port: u16) -> String {
+    if port == DEFAULT_TLS_PORT {
+        host.to_string()
+    } else if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// Trait for formatting TLS certificate output.
@@ -443,6 +472,7 @@ impl Formatter for TextFormat {
             let cert = &rs.certificate;
             writeln!(output, "--------------------------------------").unwrap();
             writeln!(output, "Hostname: {}", cert.hostname).unwrap();
+            writeln!(output, "Port: {}", report.port).unwrap();
             writeln!(output, "Status: {}", report.status.verdict.label()).unwrap();
             writeln!(output, "Issued domain: {}", cert.subject.common_name).unwrap();
             writeln!(output, "Subject Name :").unwrap();
@@ -766,7 +796,7 @@ impl Formatter for SummaryFormat {
             };
 
             let mut row = vec![
-                Cell::new(&rs.certificate.hostname)
+                Cell::new(report.target())
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Green),
                 Cell::new(&rs.cipher.name)
@@ -846,7 +876,7 @@ impl Formatter for SummaryFormat {
                 writeln!(
                     output,
                     "\n  Host: {} ({})",
-                    report.tls.certificate.hostname,
+                    report.target(),
                     report.status.verdict.label()
                 )
                 .unwrap();
@@ -1483,8 +1513,16 @@ fn collect(
                 if tls.certificate.trust == TrustStatus::Unknown {
                     tally.trust_unknown += 1;
                 }
+                let label = labels.get(index).cloned().unwrap_or_default();
+                // A checked host's label already parsed once (an unparsable one
+                // is a `Failed` slot), so this recovers the port it used.
+                let port = parse_host_port(&label)
+                    .ok()
+                    .and_then(|hp| hp.port)
+                    .unwrap_or(DEFAULT_TLS_PORT);
                 reports.push(HostReport {
-                    label: labels.get(index).cloned().unwrap_or_default(),
+                    label,
+                    port,
                     tls: *tls,
                     status,
                 });
@@ -2330,6 +2368,89 @@ pub(crate) mod tests {
         assert!(output.contains("97"));
     }
 
+    // ── #207: two ports of one host must never share a label ──────────
+
+    /// Two checks of `test.example.com` on different ports, labelled as the
+    /// user would type them.
+    fn two_port_reports() -> Vec<HostReport> {
+        let mut critical = make_test_tls();
+        critical.certificate.is_expired = true;
+        let mut warning = make_test_tls();
+        warning.certificate.is_self_signed = true;
+        let labels = vec![
+            "test.example.com:8443".to_string(),
+            "https://test.example.com:9443".to_string(),
+        ];
+        let slots = vec![
+            Some(HostOutcome::Checked(Box::new(critical))),
+            Some(HostOutcome::Checked(Box::new(warning))),
+        ];
+        collect(slots, &labels, &VerdictPolicy::default()).0
+    }
+
+    #[test]
+    fn test_display_target() {
+        assert_eq!(display_target("example.com", 443), "example.com");
+        assert_eq!(display_target("example.com", 8443), "example.com:8443");
+        assert_eq!(display_target("::1", 8443), "[::1]:8443");
+        assert_eq!(display_target("::1", 443), "::1");
+        assert_eq!(display_target("[::1]", 8443), "[::1]:8443");
+    }
+
+    #[test]
+    fn test_collect_recovers_port_from_label() {
+        let reports = two_port_reports();
+        assert_eq!(
+            reports.iter().map(|r| r.port).collect::<Vec<_>>(),
+            vec![8443, 9443]
+        );
+        // No port in the label: the default the check used.
+        assert_eq!(
+            reports_with(vec![make_test_tls()], &VerdictPolicy::default())[0].port,
+            443
+        );
+    }
+
+    #[test]
+    fn test_summary_distinguishes_ports_of_one_host() {
+        let output = SummaryFormat.format(&two_port_reports());
+        assert!(output.contains("test.example.com:8443"), "{output}");
+        assert!(output.contains("test.example.com:9443"), "{output}");
+        // Findings headers too, each with its own verdict.
+        assert!(
+            output.contains("Host: test.example.com:8443 (Critical)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Host: test.example.com:9443 (Warning)"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn test_summary_omits_default_port() {
+        let output = SummaryFormat.format(&reports(vec![make_test_tls()]));
+        assert!(output.contains("test.example.com"));
+        assert!(!output.contains("test.example.com:443"));
+    }
+
+    #[test]
+    fn test_text_prints_port() {
+        let output = TextFormat.format(&two_port_reports());
+        assert!(output.contains("Port: 8443"));
+        assert!(output.contains("Port: 9443"));
+    }
+
+    #[test]
+    fn test_json_includes_port_and_still_deserializes() {
+        let output = JsonFormat.format(&two_port_reports());
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed[0]["port"], 8443);
+        assert_eq!(parsed[1]["port"], 9443);
+        // Additive: the array is still a valid `Vec<TLS>`.
+        assert!(serde_json::from_str::<Vec<TLS>>(&output).is_ok());
+    }
+
     #[test]
     fn test_json_format_empty_input() {
         let output = JsonFormat.format(&[]);
@@ -3038,7 +3159,7 @@ pub(crate) mod tests {
     #[test]
     fn test_text_format_shows_status_and_findings() {
         let output = TextFormat.format(&reports(vec![mismatch_tls()]));
-        assert!(output.contains("Hostname: test.example.com\nStatus: Critical\n"));
+        assert!(output.contains("Hostname: test.example.com\nPort: 443\nStatus: Critical\n"));
         assert!(output.contains("\nFindings:\n"));
         assert!(output.contains("[critical] HOSTNAME MISMATCH:"));
 

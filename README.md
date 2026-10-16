@@ -381,7 +381,7 @@ A `tlschecker_revocation_status` metric is exported with the following values:
 
 ##### Metric labels and the push grouping key
 
-Every pushed series carries only stable identity labels in the push **grouping key**: `job="tlschecker"` and `instance="<host>"`. This is deliberate — a `push_metrics` `PUT` replaces the series under its exact grouping key, so putting volatile values (grade, cipher, expired, …) in the key would leave the previous run's series orphaned in the gateway whenever one of those values changed.
+Every pushed series carries only stable identity labels in the push **grouping key**: `job="tlschecker"` and `instance="<host>"` (`"<host>:<port>"` when the port is not 443, so two ports of one host never overwrite each other). This is deliberate — a `push_metrics` `PUT` replaces the series under its exact grouping key, so putting volatile values (grade, cipher, expired, …) in the key would leave the previous run's series orphaned in the gateway whenever one of those values changed.
 
 Each host also gets `tlschecker_verdict` — its status as `0` healthy, `1` warning, `2` critical, by the same rules as the CLI status and exit code (including `--min-validity` and `--allow`). Alert on it to page on exactly what would fail a CI run:
 

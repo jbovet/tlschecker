@@ -19,8 +19,8 @@
 //!
 //! # Metric Labels
 //!
-//! Every metric carries the push **grouping key** — `job` and `instance` (the target
-//! host) — and nothing else. Only these stable identity labels belong in the grouping
+//! Every metric carries the push **grouping key** — `job` and `instance` (the target:
+//! `host`, or `host:port` when the port is not 443) — and nothing else. Only these stable identity labels belong in the grouping
 //! key: a `PUT` to the push gateway replaces series under the exact grouping key, so
 //! putting volatile labels (grade, expired, cipher, …) there would orphan the previous
 //! run's series every time one of those values changed. Descriptive, changeable labels
@@ -176,7 +176,7 @@ pub(crate) fn host_metric_families(
 ///
 /// # Metrics Exported
 ///
-/// For each certificate (one push per host, keyed by `instance=<host>`):
+/// For each certificate (one push per host, keyed by `instance=<target>`, i.e. `host` or `host:port`):
 /// - Days and hours until expiration
 /// - Revocation status (0-3, see module documentation)
 /// - Grade score (only when grading was performed)
@@ -194,7 +194,7 @@ pub(crate) fn host_metric_families(
 ///
 /// ```ignore
 /// // `reports` come from `collect` in main.rs: each checked host with its status.
-/// // `address` is the push gateway root — `/metrics/job/tlschecker/instance/<host>`
+/// // `address` is the push gateway root — `/metrics/job/tlschecker/instance/<target>`
 /// // is appended internally. `min_validity` (days, 0 = off) drives the
 /// // `tlschecker_below_min_validity` gauge.
 /// prometheus_metrics(&reports, "http://localhost:9091", 30);
@@ -205,13 +205,17 @@ pub fn prometheus_metrics(reports: &[HostReport], prometheus_address: &str, min_
         let metric_families = host_metric_families(tls, report.status.verdict, min_validity);
 
         // Grouping key = stable identity only. A push_metrics PUT replaces the series
-        // under this exact key, so `instance` = host is what lets each host own (and
-        // overwrite) its own series without orphaning previous runs. Volatile labels
-        // (grade, cipher, expired, …) are metric values or live on the info metric.
+        // under this exact key, so `instance` = target is what lets each host own (and
+        // overwrite) its own series without orphaning previous runs. The target
+        // carries the port when it is not 443; with the bare hostname, two ports of
+        // one host shared a key and each push replaced the other's series. Volatile
+        // labels (grade, cipher, expired, …) are metric values or live on the info
+        // metric.
+        let instance = report.target();
         let prometheus_client = prometheus::push_metrics(
             "tlschecker",
             labels! {
-                "instance".to_owned() => tls.certificate.hostname.to_owned(),
+                "instance".to_owned() => instance.clone(),
             },
             // Base URL only: push_metrics appends `/metrics/job/<job>/<label>/<value>…`
             // itself. Passing `<addr>/metrics/job` here doubled the path so the gateway
@@ -224,7 +228,7 @@ pub fn prometheus_metrics(reports: &[HostReport], prometheus_address: &str, min_
         if let Err(e) = prometheus_client {
             warn!(
                 "Failed to push metrics to prometheus for {}: {}",
-                tls.certificate.hostname, e
+                instance, e
             );
         }
     }
