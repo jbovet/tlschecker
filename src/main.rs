@@ -1644,16 +1644,14 @@ fn collect(
 /// replaced by the list read from stdin, followed by those in `--hosts-file`
 /// (`-` is stdin there too). Stdin is read at most once.
 fn cli_hosts(addresses: &[String], hosts_file: Option<&str>) -> Result<Vec<String>, ConfigError> {
-    let mut stdin_hosts: Option<Vec<String>> = None;
+    let mut stdin_read = false;
     let mut read_stdin = || -> Result<Vec<String>, ConfigError> {
-        if stdin_hosts.is_none() {
-            let text = std::io::read_to_string(std::io::stdin())
-                .map_err(|e| ConfigError::Io(format!("cannot read hosts from stdin: {e}")))?;
-            stdin_hosts = Some(parse_host_list(&text));
-            Ok(stdin_hosts.clone().unwrap_or_default())
-        } else {
-            Ok(Vec::new())
+        if std::mem::replace(&mut stdin_read, true) {
+            return Ok(Vec::new());
         }
+        let text = std::io::read_to_string(std::io::stdin())
+            .map_err(|e| ConfigError::Io(format!("cannot read hosts from stdin: {e}")))?;
+        Ok(parse_host_list(&text))
     };
 
     let mut hosts = Vec::new();
@@ -1677,9 +1675,12 @@ fn cli_hosts(addresses: &[String], hosts_file: Option<&str>) -> Result<Vec<Strin
 }
 
 /// Parses a host list: whitespace-separated hosts; blank lines and comments
-/// (`#` at the start of a line or after whitespace) are ignored.
+/// (`#` at the start of a line or after whitespace) are ignored. A leading
+/// UTF-8 byte-order mark (Windows editors, `Set-Content -Encoding UTF8`) is
+/// skipped, or it would be glued to the first host.
 fn parse_host_list(text: &str) -> Vec<String> {
-    text.lines()
+    text.trim_start_matches('\u{feff}')
+        .lines()
         .flat_map(|line| {
             let end = line
                 .char_indices()
@@ -2906,6 +2907,11 @@ pub(crate) mod tests {
                 // `#` inside a word is not a comment.
                 "https://c.example/#frag",
             ]
+        );
+        // CRLF line endings and a UTF-8 BOM, as Windows editors write them.
+        assert_eq!(
+            parse_host_list("\u{feff}a.example\r\nb.example # x\r\n"),
+            ["a.example", "b.example"]
         );
     }
 

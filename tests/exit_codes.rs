@@ -486,6 +486,7 @@ fn test_hosts_file_dash_reads_stdin_after_arguments() {
         ],
         &format!("{b}\n"),
     );
+    assert_exit(&output, 3);
     assert_eq!(json_inputs(&output), [a, b]);
 }
 

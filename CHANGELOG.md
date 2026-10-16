@@ -109,12 +109,12 @@ output* sections for the full rules.
   errors (wrong port, refused, DNS, timeout, handshake rejected, client
   certificate required, …); the raw error is shown with `-v`.
 - Running `tlschecker` with no arguments (and no `tlschecker.toml` in the
-  current directory) prints the help instead of an error.
+  current directory) prints the help instead of an error. The "no hosts" error is one line.
 - **Slimmer summary table** (#214): `Host | Days left | Issuer | Protocol |
   Revocation | Status` (+ Grade / CT). The Expired and Self-Signed columns are
   gone — the Status column and the Findings section say both, with the reason
   — and Cipher Suite / Hours left moved behind `--wide`. The Issuer column falls
-  back to the issuer's CN when it has no organization (it showed `None`). The "no hosts" error is one line.
+  back to the issuer's CN when it has no organization (it showed `None`).
 
 ### Fixed
 
