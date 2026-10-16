@@ -1,46 +1,20 @@
-//! Dashboard application state: the host list, selection, and the verdict
-//! logic that colors it.
+//! Dashboard application state: the host list, selection, and the run's
+//! verdict policy.
+//!
+//! Every on-screen verdict is [`App::verdict_of`] →
+//! `tlschecker::verdict::assess`, the same rules the CLI formatters,
+//! Prometheus and the exit code use.
 
 use std::collections::HashSet;
 use std::io::{ErrorKind, Write};
 
 use tlschecker::ct::CtStatus;
+use tlschecker::verdict::VerdictPolicy;
 use tlschecker::{RevocationStatus, TLSError, TLS};
 
 use crate::HostOutcome;
 
-/// Overall health verdict for a checked host.
-///
-/// Unlike the classic summary's Status column (which only reflected the
-/// expiry window), this verdict accounts for every signal the check produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    Healthy,
-    Warning,
-    Critical,
-}
-
-/// Computes the verdict for a completed check.
-///
-/// - Expired, revoked, or expiring within 15 days → `Critical`
-/// - Self-signed, any security warning, or expiring within 30 days → `Warning`
-/// - Otherwise → `Healthy`
-///
-/// The day thresholds match the classic summary table's Status column.
-pub fn verdict(tls: &TLS) -> Verdict {
-    let cert = &tls.certificate;
-    if cert.is_expired
-        || matches!(cert.revocation_status, RevocationStatus::Revoked(_))
-        || cert.validity_days <= 15
-    {
-        Verdict::Critical
-    } else if cert.is_self_signed || !cert.security_warnings.is_empty() || cert.validity_days <= 30
-    {
-        Verdict::Warning
-    } else {
-        Verdict::Healthy
-    }
-}
+pub use tlschecker::verdict::Verdict;
 
 /// A check the user asked for that ran but could not reach a verdict.
 #[derive(Debug, PartialEq, Eq)]
@@ -53,7 +27,7 @@ pub struct Unverified<'a> {
 
 /// The requested checks that came back `Unknown` for this host.
 ///
-/// Deliberately separate from [`verdict`]: an unreachable OCSP responder or a
+/// Deliberately separate from the verdict: an unreachable OCSP responder or a
 /// crt.sh outage says nothing bad about the certificate, so it must not turn a
 /// fleet Warning. But it must not read as a pass either — the user asked for
 /// the check — so the dashboard marks it on its own.
@@ -121,7 +95,8 @@ pub enum Screen {
     Detail,
 }
 
-/// Live dashboard state: one slot per host (input order), plus the selection.
+/// Live dashboard state: one slot per host (input order), plus the selection
+/// and the [`VerdictPolicy`] every on-screen verdict is computed under.
 pub struct App {
     /// Host labels exactly as the user supplied them.
     pub labels: Vec<String>,
@@ -141,6 +116,9 @@ pub struct App {
     pub flash: Option<Flash>,
     /// On-demand checks in flight, by host index.
     pub running: HashSet<(usize, OnDemand)>,
+    /// The run's policy (`--min-validity`, `--allow`), so the dashboard reads
+    /// the same verdicts as the CLI output and the exit code.
+    pub policy: VerdictPolicy,
 }
 
 /// A check the dashboard can run on demand for the selected host — the ones
@@ -283,7 +261,14 @@ pub struct Tally {
 }
 
 impl App {
+    /// An app with the default policy.
+    #[cfg(test)]
     pub fn new(labels: &[String]) -> Self {
+        Self::with_policy(labels, VerdictPolicy::default())
+    }
+
+    /// An app whose verdicts are computed under `policy`.
+    pub fn with_policy(labels: &[String], policy: VerdictPolicy) -> Self {
         App {
             labels: labels.to_vec(),
             slots: labels.iter().map(|_| None).collect(),
@@ -293,7 +278,14 @@ impl App {
             export_prompt: None,
             flash: None,
             running: HashSet::new(),
+            policy,
         }
+    }
+
+    /// The verdict for a checked host under this run's policy. Recomputed on
+    /// every call, so on-demand results are reflected immediately.
+    pub fn verdict_of(&self, tls: &TLS) -> Verdict {
+        tls.assess(&self.policy).verdict
     }
 
     /// Starts an on-demand check of the selected host, returning the job to
@@ -557,7 +549,7 @@ impl App {
                 None => tally.pending += 1,
                 Some(HostOutcome::Failed { .. }) => tally.failed += 1,
                 Some(HostOutcome::Checked(tls)) => {
-                    match verdict(tls) {
+                    match self.verdict_of(tls) {
                         Verdict::Healthy => tally.healthy += 1,
                         Verdict::Warning => tally.warning += 1,
                         Verdict::Critical => tally.critical += 1,
@@ -784,19 +776,6 @@ mod tests {
     }
 
     #[test]
-    fn test_verdict_healthy() {
-        let tls = make_test_tls(); // 365 days left, no warnings
-        assert_eq!(verdict(&tls), Verdict::Healthy);
-    }
-
-    #[test]
-    fn test_verdict_expired_is_critical() {
-        let mut tls = make_test_tls();
-        tls.certificate.is_expired = true;
-        assert_eq!(verdict(&tls), Verdict::Critical);
-    }
-
-    #[test]
     fn test_unverified_checks_do_not_change_verdict() {
         let mut tls = make_test_tls();
         tls.certificate.revocation_status = RevocationStatus::Unknown;
@@ -816,10 +795,10 @@ mod tests {
                 },
             ]
         );
-        // An outage says nothing bad about the certificate itself.
-        assert_eq!(verdict(&tls), Verdict::Healthy);
-
         let mut app = App::new(&["a".to_string(), "b".to_string()]);
+        // An outage says nothing bad about the certificate itself.
+        assert_eq!(app.verdict_of(&tls), Verdict::Healthy);
+
         app.record(0, HostOutcome::Checked(Box::new(tls)));
         app.record(1, HostOutcome::Checked(Box::new(make_test_tls())));
         let tally = app.tally();
@@ -930,7 +909,7 @@ mod tests {
         let Some(Some(HostOutcome::Checked(tls))) = app.slots.first() else {
             panic!("host should still be checked")
         };
-        assert_eq!(verdict(tls), Verdict::Critical);
+        assert_eq!(app.verdict_of(tls), Verdict::Critical);
         assert_eq!(tls.grade.as_ref().unwrap().grade, "F");
         assert_eq!(
             app.flash.as_ref().unwrap().text,
@@ -993,40 +972,52 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_verdict_revoked_is_critical() {
-        let mut tls = make_test_tls();
-        tls.certificate.revocation_status = RevocationStatus::Revoked("test".to_string());
-        assert_eq!(verdict(&tls), Verdict::Critical);
-    }
-
-    #[test]
-    fn test_verdict_expiring_soon() {
-        let mut tls = make_test_tls();
-        tls.certificate.validity_days = 10;
-        assert_eq!(verdict(&tls), Verdict::Critical);
-        tls.certificate.validity_days = 25;
-        assert_eq!(verdict(&tls), Verdict::Warning);
-        tls.certificate.validity_days = 31;
-        assert_eq!(verdict(&tls), Verdict::Healthy);
-    }
-
-    #[test]
-    fn test_verdict_warning_on_security_warning() {
+    fn mismatch_tls() -> TLS {
         let mut tls = make_test_tls();
         tls.certificate
             .security_warnings
             .push(tlschecker::SecurityWarning::HostnameMismatch(
                 "not valid".to_string(),
             ));
-        assert_eq!(verdict(&tls), Verdict::Warning);
+        tls
     }
 
     #[test]
-    fn test_verdict_warning_on_self_signed() {
+    fn test_tally_counts_hostname_mismatch_as_critical() {
+        let app = app_with_checked(mismatch_tls());
+        let tally = app.tally();
+        assert_eq!((tally.critical, tally.healthy), (1, 0));
+    }
+
+    #[test]
+    fn test_tally_respects_allowed_findings() {
+        let mut app = App::with_policy(
+            &["host.example".to_string()],
+            VerdictPolicy {
+                allow: vec![tlschecker::verdict::FindingCode::HostnameMismatch],
+                ..VerdictPolicy::default()
+            },
+        );
+        app.record(0, HostOutcome::Checked(Box::new(mismatch_tls())));
+        let tally = app.tally();
+        assert_eq!((tally.critical, tally.healthy), (0, 1));
+    }
+
+    #[test]
+    fn test_verdict_follows_min_validity() {
         let mut tls = make_test_tls();
-        tls.certificate.is_self_signed = true;
-        assert_eq!(verdict(&tls), Verdict::Warning);
+        tls.certificate.validity_days = 10;
+        // Default window: fewer than 15 days left is Critical.
+        assert_eq!(App::new(&[]).verdict_of(&tls), Verdict::Critical);
+        // An explicit --min-validity 7 replaces it; 10 days is only Warning.
+        let app = App::with_policy(
+            &[],
+            VerdictPolicy {
+                min_validity_days: Some(7),
+                ..VerdictPolicy::default()
+            },
+        );
+        assert_eq!(app.verdict_of(&tls), Verdict::Warning);
     }
 
     #[test]

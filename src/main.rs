@@ -6,13 +6,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 mod config;
+mod exit;
 mod metrics;
 mod tui;
 
 use clap::{Parser, ValueEnum};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
+use serde::Serialize;
 
+use tlschecker::verdict::{Assessment, Finding, FindingCode, Verdict, VerdictPolicy};
 use tlschecker::RevocationStatus;
 use tlschecker::TrustStatus;
 use tlschecker::TLS;
@@ -20,8 +23,22 @@ use url::Url;
 
 use anyhow::Result;
 use config::{Config, ConfigError};
+use exit::{FailOn, Gate, RunStatus, RunTally};
 use tlschecker::TLSError;
-use tracing::error;
+use tracing::{error, warn};
+
+/// The exit-status table appended to `--help`.
+const EXIT_STATUS_HELP: &str = "\
+Exit status:
+  0  OK: no checked host reached the --fail-on level and every host was checked
+     (with --allow-unreachable: at least one host was checked)
+  1  Certificate problem: a host's status is at or above --fail-on (default
+     critical: expired, revoked, hostname mismatch, or inside the critical
+     expiry window)
+  2  Usage or configuration error; nothing was checked
+  3  A host could not be checked (DNS, connection, handshake, invalid address)
+  4  Internal error after the run started
+  When both apply, 1 wins over 3.";
 
 /// Experimental TLS/SSL certificate checker.
 ///
@@ -32,7 +49,7 @@ use tracing::error;
 /// move, Enter inspect a host, q quit). Pipe the output, pass `-o <format>`, or
 /// use `--no-dashboard` for non-interactive JSON/text/summary output.
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(author, version, about, long_about, after_long_help = EXIT_STATUS_HELP)]
 struct Args {
     /// Hosts to check, e.g. example.com example.com:8443
     #[clap(value_parser)]
@@ -58,12 +75,41 @@ struct Args {
     #[arg(long)]
     no_dashboard: bool,
 
-    /// Exit with this code when expired or revoked certificates are found.
+    /// Deprecated: use --fail-on.
     ///
-    /// Defaults to 0 (always succeed). Set to 1 for CI/CD pipelines
-    /// that should fail on certificate issues.
-    #[arg(long)]
+    /// 0 maps to `--fail-on never`, 1 is the default and has no effect; any
+    /// other value is an error. Removed in tlschecker 4.
+    #[arg(long, hide = true, allow_negative_numbers = true)]
     exit_code: Option<i32>,
+
+    /// Status level that fails the run with exit code 1 [default: critical].
+    /// critical: expired, revoked, not valid for the checked name, or inside
+    /// the critical expiry window (see --min-validity). warning: also
+    /// self-signed, untrusted chain, any other security warning, or fewer than
+    /// 30 days left. never: report only; hosts that could not be checked still
+    /// exit 3.
+    #[arg(long, value_enum, value_name = "LEVEL")]
+    fail_on: Option<FailOn>,
+
+    /// Accept a finding: it is still reported (marked "allowed") but no
+    /// longer affects any host's status or the exit code. Comma-separated or
+    /// repeated. One of: hostname-mismatch, self-signed, untrusted,
+    /// invalid-chain-signature, incomplete-chain, invalid-chain-order,
+    /// weak-signature, expiring-intermediate, weak-protocol, weak-cipher,
+    /// misissuance, not-in-ct.
+    #[arg(
+        long,
+        value_name = "FINDING",
+        value_delimiter = ',',
+        value_parser = parse_allowed_finding
+    )]
+    allow: Vec<FindingCode>,
+
+    /// Do not fail (exit 3) when a host cannot be reached (DNS, connection,
+    /// handshake). The run still exits 3 if no host could be checked at all or
+    /// a host address is invalid.
+    #[arg(long)]
+    allow_unreachable: bool,
 
     /// Push certificate metrics to a Prometheus Push Gateway
     #[arg(long)]
@@ -88,12 +134,17 @@ struct Args {
     #[arg(long)]
     grade: bool,
 
-    /// Minimum number of days a certificate must remain valid.
-    ///
-    /// Certificates with fewer remaining days are treated as failures
-    /// for exit-code purposes. Set to 0 to disable (default).
-    /// Example: --min-validity 30 fails if any cert expires within 30 days.
-    #[arg(long)]
+    /// Certificates with fewer than DAYS days left are Critical (status and
+    /// exit code). Default: 15 days, or the last sixth of the certificate's
+    /// lifetime when that is shorter. 0 makes only expired certificates
+    /// Critical. Also drives the tlschecker_below_min_validity Prometheus gauge
+    /// (0 when unset).
+    #[arg(
+        long,
+        value_name = "DAYS",
+        allow_negative_numbers = true,
+        value_parser = clap::value_parser!(i32).range(0..)
+    )]
     min_validity: Option<i32>,
 
     /// Enumerate all supported TLS protocol versions and cipher suites.
@@ -112,14 +163,9 @@ struct Args {
     #[arg(long)]
     export_pem: bool,
 
-    /// Treat hosts that could not be checked at all as failures for
-    /// exit-code purposes.
-    ///
-    /// By default an unreachable host (DNS failure, refused connection,
-    /// handshake error, invalid address) is only logged and does not affect
-    /// the exit code. With this flag, any such error makes the run exit with
-    /// --exit-code, so CI pipelines can catch hosts that are down entirely.
-    #[arg(long)]
+    /// Deprecated no-op: hosts that could not be checked now exit 3 by
+    /// default (see --allow-unreachable). Removed in tlschecker 4.
+    #[arg(long, hide = true)]
     fail_on_error: bool,
 
     /// Seconds to spend connecting to each host before giving up [default: 30].
@@ -151,10 +197,24 @@ struct Args {
     /// modern browsers enforce for publicly-trusted certificates. Performs a
     /// network request to an external service, so it adds latency and is
     /// opt-in. Results appear in the dashboard's detail explorer and in
-    /// text/JSON output. A certificate absent from CT is reported as a security
-    /// warning but does not affect the grade.
+    /// text/JSON output. A certificate absent from CT is reported as an
+    /// informational finding: it affects neither the status nor the grade.
     #[arg(long)]
     ct_check: bool,
+}
+
+/// Parses one `--allow` value, rejecting findings that cannot be accepted.
+fn parse_allowed_finding(s: &str) -> Result<FindingCode, String> {
+    let code: FindingCode = s.parse()?;
+    if code.is_allowable() {
+        Ok(code)
+    } else if code == FindingCode::ExpiresSoon {
+        Err("'expires-soon' cannot be allowed; use --min-validity".to_string())
+    } else {
+        Err(format!(
+            "'{s}' cannot be allowed; use --fail-on never to report without failing"
+        ))
+    }
 }
 
 /// Output format for certificate information.
@@ -175,14 +235,11 @@ struct Args {
 /// - Expired, Self-Signed, Revocation Status
 /// - Days/Hours before expiration, Overall Status (Healthy/Warning/Critical)
 ///
-/// # Health Indicators
+/// # Status
 ///
-/// - **Healthy** (Green): > 30 days until expiration
-/// - **Warning** (Yellow): 15-30 days until expiration
-/// - **Critical** (Red): ≤ 15 days until expiration or expired
-///
-/// The dashboard applies a broader verdict (self-signed certs or any security
-/// warning also count as Warning); see `tui::state::verdict`.
+/// Status (Healthy/Warning/Critical) comes from `tlschecker::verdict::assess`,
+/// the same rules the dashboard, JSON, Prometheus and the exit code use; see
+/// README *Status & exit codes*.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum OutFormat {
     /// JSON format for programmatic parsing
@@ -217,42 +274,69 @@ impl std::str::FromStr for OutFormat {
     }
 }
 
+/// One checked host as every non-interactive output sees it: the check
+/// result plus its status under the run's [`VerdictPolicy`].
+///
+/// Serializes as the [`TLS`] fields plus a `status` object, so JSON stays an
+/// array that still deserializes as `Vec<TLS>`.
+#[derive(Serialize)]
+pub(crate) struct HostReport {
+    /// The host exactly as the user supplied it.
+    #[serde(skip)]
+    pub label: String,
+    #[serde(flatten)]
+    pub tls: TLS,
+    /// Assessed once, when the report is built (see [`collect`]).
+    pub status: Assessment,
+}
+
 /// Trait for formatting TLS certificate output.
 ///
 /// Implementations of this trait define how certificate data is presented
 /// to the user in different formats (Text, JSON, Summary).
 trait Formatter {
-    /// Formats the given TLS certificate data into a displayable string.
+    /// Formats the given host reports into a displayable string.
     ///
     /// # Arguments
     ///
-    /// * `tls` - Slice of TLS structs containing certificate information
+    /// * `reports` - Checked hosts with their status, in input order
     ///
     /// # Returns
     ///
     /// A formatted string ready for display.
-    fn format(&self, tls: &[TLS]) -> String;
+    fn format(&self, reports: &[HostReport]) -> String;
 }
 
 /// Returns the display label and message for a security warning.
 ///
-/// Single source of truth for all frontends (text, summary, dashboard) so a
-/// new `SecurityWarning` variant only needs one new arm here.
+/// Single source of truth for all frontends (text, summary, dashboard): the
+/// label is [`FindingCode::label`], so a new `SecurityWarning` variant only
+/// needs classifying in `tlschecker::verdict::classify`.
 pub(crate) fn warning_label(warning: &tlschecker::SecurityWarning) -> (&'static str, &str) {
-    use tlschecker::SecurityWarning::*;
-    match warning {
-        WeakSignatureAlgorithm(msg) => ("WEAK ALGORITHM", msg),
-        IncompleteChain(msg) => ("INCOMPLETE CHAIN", msg),
-        InvalidChainOrder(msg) => ("INVALID CHAIN ORDER", msg),
-        HostnameMismatch(msg) => ("HOSTNAME MISMATCH", msg),
-        ExpiringIntermediate(msg) => ("EXPIRING INTERMEDIATE", msg),
-        WeakProtocol(msg) => ("WEAK PROTOCOL", msg),
-        WeakCipher(msg) => ("WEAK CIPHER", msg),
-        NotInCertificateTransparency(msg) => ("NOT IN CT LOG", msg),
-        Untrusted(msg) => ("UNTRUSTED", msg),
-        CertificateMisissuance(msg) => ("MISISSUANCE", msg),
-        InvalidChainSignature(msg) => ("INVALID CHAIN SIGNATURE", msg),
+    (warning.code().label(), warning.message())
+}
+
+/// The bracketed tag a finding is printed with: its severity (`critical`,
+/// `warning`, `info`), prefixed with `allowed` when `--allow` accepted it.
+pub(crate) fn finding_tag(finding: &Finding) -> String {
+    if finding.allowed {
+        format!("allowed {}", finding.severity.label())
+    } else {
+        finding.severity.label().to_string()
     }
+}
+
+/// The summary table's Status cell for a verdict.
+fn verdict_cell(verdict: Verdict) -> Cell {
+    let color = match verdict {
+        Verdict::Healthy => Color::Green,
+        Verdict::Warning => Color::Yellow,
+        Verdict::Critical => Color::Red,
+    };
+    Cell::new(verdict.label())
+        .add_attribute(Attribute::Bold)
+        .fg(color)
+        .set_alignment(CellAlignment::Center)
 }
 
 /// How a status reads, independent of any frontend's palette.
@@ -350,14 +434,16 @@ struct JsonFormat;
 struct SummaryFormat;
 
 impl Formatter for TextFormat {
-    fn format(&self, tls: &[TLS]) -> String {
+    fn format(&self, reports: &[HostReport]) -> String {
         use std::fmt::Write;
         let mut output = String::new();
 
-        for rs in tls {
+        for report in reports {
+            let rs = &report.tls;
             let cert = &rs.certificate;
             writeln!(output, "--------------------------------------").unwrap();
             writeln!(output, "Hostname: {}", cert.hostname).unwrap();
+            writeln!(output, "Status: {}", report.status.verdict.label()).unwrap();
             writeln!(output, "Issued domain: {}", cert.subject.common_name).unwrap();
             writeln!(output, "Subject Name :").unwrap();
             writeln!(
@@ -484,11 +570,17 @@ impl Formatter for TextFormat {
             )
             .unwrap();
 
-            if !cert.security_warnings.is_empty() {
-                writeln!(output, "\nSecurity Warnings:").unwrap();
-                for warning in &cert.security_warnings {
-                    let (label, msg) = warning_label(warning);
-                    writeln!(output, "  {}: {}", label, msg).unwrap();
+            if !report.status.findings.is_empty() {
+                writeln!(output, "\nFindings:").unwrap();
+                for finding in &report.status.findings {
+                    writeln!(
+                        output,
+                        "  [{}] {}: {}",
+                        finding_tag(finding),
+                        finding.code.label(),
+                        finding.message
+                    )
+                    .unwrap();
                 }
             }
 
@@ -590,20 +682,20 @@ impl Formatter for TextFormat {
 
 /// Implement Formatter trait for SummaryFormat
 impl Formatter for SummaryFormat {
-    fn format(&self, tls: &[TLS]) -> String {
+    fn format(&self, reports: &[HostReport]) -> String {
         use std::fmt::Write;
 
-        if tls.is_empty() {
+        if reports.is_empty() {
             return String::new();
         }
 
         // Only show the Grade column when grading was actually performed for at
         // least one host; otherwise it would just be a column full of "-".
-        let show_grade = tls.iter().any(|t| t.grade.is_some());
+        let show_grade = reports.iter().any(|r| r.tls.grade.is_some());
 
         // Likewise, only show the CT column when a CT lookup was requested
         // (`--ct-check`) for at least one host. `ct.is_some()` ⇔ requested.
-        let show_ct = tls.iter().any(|t| t.ct.is_some());
+        let show_ct = reports.iter().any(|r| r.tls.ct.is_some());
 
         let mut output = String::new();
         let mut table = Table::new();
@@ -635,21 +727,9 @@ impl Formatter for SummaryFormat {
             .load_style(UTF8_FULL)
             .set_header(header);
 
-        for rs in tls {
-            let custom_cell: Cell = match rs.certificate.validity_days {
-                days if days <= 15 => Cell::new("Critical")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Red)
-                    .set_alignment(CellAlignment::Center),
-                days if days <= 30 => Cell::new("Warning")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Yellow)
-                    .set_alignment(CellAlignment::Center),
-                _ => Cell::new("Healthy")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Green)
-                    .set_alignment(CellAlignment::Center),
-            };
+        for report in reports {
+            let rs = &report.tls;
+            let status_cell = verdict_cell(report.status.verdict);
 
             let expired_cell = match rs.certificate.is_expired {
                 true => Cell::new("Yes")
@@ -703,7 +783,7 @@ impl Formatter for SummaryFormat {
                 revocation_cell,
                 Cell::new(rs.certificate.validity_days).set_alignment(CellAlignment::Center),
                 Cell::new(rs.certificate.validity_hours).set_alignment(CellAlignment::Center),
-                custom_cell,
+                status_cell,
             ];
 
             if show_grade {
@@ -753,19 +833,32 @@ impl Formatter for SummaryFormat {
         }
         writeln!(output, "{table}").unwrap();
 
-        // Display security warnings if any certificates have them
-        let certs_with_warnings: Vec<&TLS> = tls
+        // The findings behind each host's status (hosts that could not be
+        // checked are reported on stderr, not here).
+        let with_findings: Vec<&HostReport> = reports
             .iter()
-            .filter(|t| !t.certificate.security_warnings.is_empty())
+            .filter(|r| !r.status.findings.is_empty())
             .collect();
 
-        if !certs_with_warnings.is_empty() {
-            writeln!(output, "\nSecurity Warnings:").unwrap();
-            for rs in certs_with_warnings {
-                writeln!(output, "\n  Host: {}", rs.certificate.hostname).unwrap();
-                for warning in &rs.certificate.security_warnings {
-                    let (label, msg) = warning_label(warning);
-                    writeln!(output, "    - {}: {}", label, msg).unwrap();
+        if !with_findings.is_empty() {
+            writeln!(output, "\nFindings:").unwrap();
+            for report in with_findings {
+                writeln!(
+                    output,
+                    "\n  Host: {} ({})",
+                    report.tls.certificate.hostname,
+                    report.status.verdict.label()
+                )
+                .unwrap();
+                for finding in &report.status.findings {
+                    writeln!(
+                        output,
+                        "    [{}] {}: {}",
+                        finding_tag(finding),
+                        finding.code.label(),
+                        finding.message
+                    )
+                    .unwrap();
                 }
             }
         }
@@ -775,8 +868,8 @@ impl Formatter for SummaryFormat {
 
 /// Implement Formatter trait for JsonFormat
 impl Formatter for JsonFormat {
-    fn format(&self, tls: &[TLS]) -> String {
-        serde_json::to_string_pretty(&tls).expect("Failed to format certificates as JSON")
+    fn format(&self, reports: &[HostReport]) -> String {
+        serde_json::to_string_pretty(reports).expect("Failed to format certificates as JSON")
     }
 }
 /// Factory for creating formatter instances.
@@ -829,12 +922,17 @@ struct FinalConfig {
     /// file `output` key) rather than defaulted — an explicit choice opts out
     /// of the TTY dashboard.
     output_explicit: bool,
-    exit_code: i32,
+    /// Status level that fails the run (exit 1).
+    fail_on: FailOn,
     prometheus: bool,
     prometheus_address: String,
     check_revocation: bool,
     grade: bool,
-    min_validity: i32,
+    /// Explicit `--min-validity` / `min_validity`; `None` uses the default
+    /// expiry windows.
+    min_validity: Option<u32>,
+    /// Deprecation warnings for `main` to log (legacy `exit_code`).
+    deprecations: Vec<String>,
 }
 
 impl FinalConfig {
@@ -854,6 +952,61 @@ impl FinalConfig {
             .parse::<OutFormat>()
             .map_err(ConfigError::Validation)?;
 
+        let min_validity = match config.min_validity {
+            None => None,
+            Some(n) if n < 0 => {
+                return Err(ConfigError::Validation(format!(
+                    "min_validity must be 0 or greater (got {n})"
+                )))
+            }
+            Some(n) => Some(n as u32),
+        };
+
+        // The legacy key is validated even when `fail_on` overrides it: a value
+        // that tlschecker 2 honored as a custom exit code must not be silently
+        // dropped.
+        if let Some(n) = config.exit_code {
+            if n != 0 && n != 1 {
+                return Err(ConfigError::Validation(format!(
+                    "exit_code {n} is no longer supported: tlschecker 3 uses fixed exit codes \
+                     (0 ok, 1 certificate problem, 2 usage, 3 host not checked, 4 internal); \
+                     use fail_on / --fail-on"
+                )));
+            }
+        }
+
+        // The new key always beats the legacy one, whatever layer each came from.
+        let mut deprecations = Vec::new();
+        let fail_on = match (config.fail_on, config.exit_code) {
+            (Some(fail_on), Some(_)) => {
+                deprecations.push(
+                    "exit_code / --exit-code is ignored because fail_on / --fail-on is set; \
+                     remove it"
+                        .to_string(),
+                );
+                fail_on
+            }
+            (Some(fail_on), None) => fail_on,
+            (None, Some(0)) => {
+                deprecations.push(
+                    "exit_code = 0 / --exit-code 0 is deprecated: use fail_on = \"never\" / \
+                     --fail-on never (hosts that cannot be checked still exit 3; add \
+                     --allow-unreachable)"
+                        .to_string(),
+                );
+                FailOn::Never
+            }
+            // Only 1 gets here: other values were rejected above.
+            (None, Some(_)) => {
+                deprecations.push(
+                    "exit_code = 1 / --exit-code 1 is deprecated and now the default; remove it"
+                        .to_string(),
+                );
+                FailOn::Critical
+            }
+            (None, None) => FailOn::Critical,
+        };
+
         let prometheus_config = config
             .prometheus
             .unwrap_or_else(|| config::PrometheusConfig {
@@ -868,14 +1021,15 @@ impl FinalConfig {
             // defaults seed `output` with Some("summary")); `load_config`
             // overrides this from the file/CLI sources.
             output_explicit: false,
-            exit_code: config.exit_code.unwrap_or(0),
+            fail_on,
             prometheus: prometheus_config.enabled.unwrap_or(false),
             prometheus_address: prometheus_config
                 .address
                 .unwrap_or_else(|| "http://localhost:9091".to_string()),
             check_revocation: config.check_revocation.unwrap_or(false),
             grade: config.grade.unwrap_or(false),
-            min_validity: config.min_validity.unwrap_or(0),
+            min_validity,
+            deprecations,
         })
     }
 }
@@ -998,6 +1152,10 @@ enum HostOutcome {
     },
 }
 
+/// Failure class of a host whose address is unusable — a host-list typo
+/// rather than a network problem, so `--allow-unreachable` never excuses it.
+const KIND_INVALID: &str = "invalid";
+
 /// Maps a check error onto a short failure class for compact display.
 fn error_kind(err: &TLSError) -> &'static str {
     match err {
@@ -1005,7 +1163,7 @@ fn error_kind(err: &TLSError) -> &'static str {
         TLSError::Connection(_) => "connection",
         TLSError::Handshake(_) => "handshake",
         TLSError::Certificate(_) => "certificate",
-        TLSError::Validation(_) => "invalid",
+        TLSError::Validation(_) => KIND_INVALID,
         _ => "error",
     }
 }
@@ -1058,8 +1216,8 @@ fn spawn_checks_with(
                     // Certificates come from arbitrary servers, so a parsing
                     // bug must cost one failed row rather than the worker: an
                     // unwound worker never sends, leaving the slot `None`,
-                    // which reads as "not checked" and escapes
-                    // --fail-on-error.
+                    // which reads as "not finished" and escapes the
+                    // not-checked exit status (3).
                     Ok(host_port) => match panic::catch_unwind(|| check(&host_port, opts)) {
                         Ok(Ok(tls)) => HostOutcome::Checked(Box::new(tls)),
                         Ok(Err(err)) => HostOutcome::Failed {
@@ -1075,7 +1233,7 @@ fn spawn_checks_with(
                         },
                     },
                     Err(msg) => HostOutcome::Failed {
-                        kind: "invalid",
+                        kind: KIND_INVALID,
                         detail: msg,
                     },
                 };
@@ -1137,15 +1295,30 @@ fn use_dashboard(
     stdout_is_tty && !output_explicit && !export_pem && !no_dashboard
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     // Initialize tracing. Diagnostics (errors, warnings) go to stderr so stdout
     // stays a clean machine-readable stream — e.g. `-o json ... | jq` is not
     // corrupted by log lines. (While the dashboard runs, they are discarded —
     // see `tracing_writer`.)
     tracing_subscriber::fmt().with_writer(tracing_writer).init();
 
+    // clap exits on its own: 2 for usage errors, 0 for --help / --version.
     let cli = Args::parse();
+    match run(cli) {
+        Ok(status) => status.into(),
+        Err(e) => {
+            error!("{e:#}");
+            RunStatus::Internal.into()
+        }
+    }
+}
 
+/// Runs the CLI and returns its exit status (see [`exit`]).
+///
+/// Usage and configuration errors return `Ok(RunStatus::Usage)` before any
+/// check runs; an `Err` is a failure after the run started (e.g. a dashboard
+/// terminal error), which `main` reports as [`RunStatus::Internal`].
+fn run(cli: Args) -> Result<RunStatus> {
     // Handle config generation
     if cli.generate_config {
         println!("# TLSChecker Configuration File");
@@ -1154,21 +1327,44 @@ fn main() -> Result<()> {
         );
         println!();
         println!("{}", Config::example_toml());
-        return Ok(());
+        return Ok(RunStatus::Ok);
     }
 
     // Load configuration
     let final_config = match load_config(&cli) {
         Ok(config) => config,
-        Err(_e) => {
+        Err(e) => {
+            error!("{e}");
             error!("Try running with --help for usage information");
             error!("Or use --generate-config to create a sample configuration file");
-            std::process::exit(1);
+            return Ok(RunStatus::Usage);
+        }
+    };
+    for deprecation in &final_config.deprecations {
+        warn!("{deprecation}");
+    }
+    if cli.fail_on_error {
+        warn!(
+            "--fail-on-error is now the default and has no effect; it will be removed in \
+             tlschecker 4 (use --allow-unreachable to opt out)"
+        );
+    }
+
+    let connect_timeout = match resolve_connect_timeout(cli.connect_timeout) {
+        Ok(timeout) => timeout,
+        Err(msg) => {
+            error!("{}", msg);
+            return Ok(RunStatus::Usage);
         }
     };
 
-    let exit_code = final_config.exit_code;
-    let mut failed_result = false;
+    let concurrency = match resolve_concurrency(cli.concurrency) {
+        Ok(n) => n,
+        Err(msg) => {
+            error!("{}", msg);
+            return Ok(RunStatus::Usage);
+        }
+    };
 
     // The dashboard is the default on a TTY; explicit output selection, PEM
     // export, or piped stdout keep the classic formatters.
@@ -1178,6 +1374,16 @@ fn main() -> Result<()> {
         cli.export_pem,
         cli.no_dashboard,
     );
+
+    // One policy for every frontend and the exit status.
+    let policy = VerdictPolicy {
+        min_validity_days: final_config.min_validity,
+        allow: cli.allow.clone(),
+    };
+    let gate = Gate {
+        fail_on: final_config.fail_on,
+        allow_unreachable: cli.allow_unreachable,
+    };
 
     // Parse hosts and ports. Invalid addresses stay in the job list so they
     // surface as failed rows (dashboard) / logged errors (CLI) in input order.
@@ -1189,22 +1395,6 @@ fn main() -> Result<()> {
         .enumerate()
         .collect();
     let hosts_len = jobs.len();
-
-    let connect_timeout = match resolve_connect_timeout(cli.connect_timeout) {
-        Ok(timeout) => timeout,
-        Err(msg) => {
-            error!("{}", msg);
-            std::process::exit(1);
-        }
-    };
-
-    let concurrency = match resolve_concurrency(cli.concurrency) {
-        Ok(n) => n,
-        Err(msg) => {
-            error!("{}", msg);
-            std::process::exit(1);
-        }
-    };
 
     let opts = CheckOptions {
         connect_timeout,
@@ -1222,10 +1412,9 @@ fn main() -> Result<()> {
 
     // Collect into index-order slots so the output order matches the input
     // order regardless of which worker handled which host.
-    let mut error_count: usize = 0;
     let slots: Vec<Option<HostOutcome>> = if dashboard {
         TUI_ACTIVE.store(true, Ordering::Relaxed);
-        let outcome = tui::run(&labels, rx);
+        let outcome = tui::run(&labels, rx, policy.clone());
         TUI_ACTIVE.store(false, Ordering::Relaxed);
         outcome?
     } else {
@@ -1239,66 +1428,74 @@ fn main() -> Result<()> {
         slots
     };
 
-    let mut results: Vec<TLS> = Vec::with_capacity(hosts_len);
-    for slot in slots {
-        match slot {
-            Some(HostOutcome::Checked(tls_result)) => results.push(*tls_result),
-            // Error already reported by the frontend that observed it.
-            Some(HostOutcome::Failed { .. }) => error_count += 1,
-            // The dashboard was quit before this host finished; deliberately
-            // not counted as an error.
-            None => {}
-        }
-    }
-
-    let any_expired = results.iter().any(|c| c.certificate.is_expired);
-    let any_revoked = results.iter().any(|c| {
-        matches!(
-            c.certificate.revocation_status,
-            RevocationStatus::Revoked(_)
-        )
-    });
-    if any_expired || any_revoked {
-        failed_result = true;
-    }
-
-    // With --fail-on-error, hosts that could not be checked at all (invalid
-    // address, DNS failure, connection/handshake error) count as failures.
-    if cli.fail_on_error && error_count > 0 {
-        failed_result = true;
-    }
-
-    // Check certificates below minimum validity threshold
-    if final_config.min_validity > 0 {
-        let below_min_validity = results.iter().any(|c| {
-            !c.certificate.is_expired && c.certificate.validity_days < final_config.min_validity
-        });
-        if below_min_validity {
-            failed_result = true;
-        }
-    }
+    let (reports, tally) = collect(slots, &labels, &policy);
 
     if cli.export_pem {
         // Print the presented certificate chain(s) as PEM instead of a report.
-        for r in &results {
-            print!("{}", r.certificate.pem);
+        for r in &reports {
+            print!("{}", r.tls.certificate.pem);
         }
     } else if !dashboard {
         // The dashboard already presented the results interactively.
         let formatter = FormatterFactory::new_formatter(&final_config.output);
-        print!("{}", formatter.format(&results));
+        print!("{}", formatter.format(&reports));
     }
 
     if final_config.prometheus {
-        metrics::prom::prometheus_metrics(
-            results,
-            final_config.prometheus_address,
-            final_config.min_validity,
-        );
+        // The gauge is explicit-only: 0 (off) when --min-validity is unset.
+        let min_validity = final_config
+            .min_validity
+            .map_or(0, |n| i32::try_from(n).unwrap_or(i32::MAX));
+        metrics::prom::prometheus_metrics(&reports, &final_config.prometheus_address, min_validity);
     }
 
-    exit(exit_code, failed_result);
-    Ok(())
+    let status = exit::exit_status(&tally, gate);
+    for line in exit::explain(&reports, &tally, gate, status) {
+        error!("{line}");
+    }
+    for line in exit::notes(&tally, gate, status) {
+        warn!("{line}");
+    }
+    Ok(status)
+}
+
+/// Turns the collected outcomes into reports (input order, assessed once
+/// under `policy`) and the tally the exit status is computed from.
+///
+/// Hosts still pending when the dashboard was quit are counted as `pending`
+/// and deliberately not as errors.
+fn collect(
+    slots: Vec<Option<HostOutcome>>,
+    labels: &[String],
+    policy: &VerdictPolicy,
+) -> (Vec<HostReport>, RunTally) {
+    let mut reports = Vec::with_capacity(slots.len());
+    let mut tally = RunTally::default();
+    for (index, slot) in slots.into_iter().enumerate() {
+        match slot {
+            Some(HostOutcome::Checked(tls)) => {
+                let status = tls.assess(policy);
+                match status.verdict {
+                    Verdict::Healthy => tally.healthy += 1,
+                    Verdict::Warning => tally.warning += 1,
+                    Verdict::Critical => tally.critical += 1,
+                }
+                if tls.certificate.trust == TrustStatus::Unknown {
+                    tally.trust_unknown += 1;
+                }
+                reports.push(HostReport {
+                    label: labels.get(index).cloned().unwrap_or_default(),
+                    tls: *tls,
+                    status,
+                });
+            }
+            // Errors were already reported by the frontend that observed them.
+            Some(HostOutcome::Failed { kind, .. }) if kind == KIND_INVALID => tally.invalid += 1,
+            Some(HostOutcome::Failed { .. }) => tally.unreachable += 1,
+            None => tally.pending += 1,
+        }
+    }
+    (reports, tally)
 }
 
 /// Loads and merges configuration from multiple sources.
@@ -1363,6 +1560,7 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
         cli.check_revocation.then_some(true),
         cli.grade.then_some(true),
         cli.min_validity,
+        cli.fail_on,
     );
 
     config = config.merge_with(cli_config);
@@ -1371,27 +1569,6 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
     let mut final_config = FinalConfig::from_merged_config(config)?;
     final_config.output_explicit = output_explicit;
     Ok(final_config)
-}
-
-/// Exits the program with the appropriate exit code.
-///
-/// This function implements conditional exit behavior based on whether
-/// any certificates failed validation (expired or revoked).
-///
-/// # Arguments
-///
-/// * `exit_code` - The exit code to use when failures are detected
-/// * `failed_result` - Whether any certificate checks failed
-///
-/// # Behavior
-///
-/// - If `failed_result` is `true` and `exit_code` is non-zero, exits with `exit_code`
-/// - Otherwise, exits normally with code 0
-/// - Useful for CI/CD pipelines where exit code indicates build success/failure
-fn exit(exit_code: i32, failed_result: bool) {
-    if exit_code != 0 && failed_result {
-        std::process::exit(exit_code)
-    }
 }
 
 /// Whether a TLS grade should be computed for this run.
@@ -1834,7 +2011,8 @@ pub(crate) mod tests {
         let config = Config {
             hosts: None,
             output: Some("summary".to_string()),
-            exit_code: Some(0),
+            fail_on: None,
+            exit_code: None,
             check_revocation: Some(false),
             prometheus: None,
             grade: Some(false),
@@ -1849,7 +2027,8 @@ pub(crate) mod tests {
         let config = Config {
             hosts: Some(vec![]),
             output: Some("summary".to_string()),
-            exit_code: Some(0),
+            fail_on: None,
+            exit_code: None,
             check_revocation: Some(false),
             prometheus: None,
             grade: Some(false),
@@ -1864,7 +2043,8 @@ pub(crate) mod tests {
         let config = Config {
             hosts: Some(vec!["example.com".to_string()]),
             output: Some("xml".to_string()),
-            exit_code: Some(0),
+            fail_on: None,
+            exit_code: None,
             check_revocation: Some(false),
             prometheus: None,
             grade: Some(false),
@@ -1874,25 +2054,42 @@ pub(crate) mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_final_config_defaults() {
-        let config = Config {
+    /// A merged config with one host and nothing else set.
+    fn host_only_config() -> Config {
+        Config {
             hosts: Some(vec!["example.com".to_string()]),
             output: None,
+            fail_on: None,
             exit_code: None,
             check_revocation: None,
             prometheus: None,
             grade: None,
             min_validity: None,
-        };
-        let final_config = FinalConfig::from_merged_config(config).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_final_config_defaults() {
+        let final_config = FinalConfig::from_merged_config(host_only_config()).unwrap();
         assert_eq!(final_config.output, OutFormat::Summary);
-        assert_eq!(final_config.exit_code, 0);
+        assert_eq!(final_config.fail_on, FailOn::Critical);
         assert!(!final_config.check_revocation);
         assert!(!final_config.prometheus);
         assert!(!final_config.grade);
         assert_eq!(final_config.prometheus_address, "http://localhost:9091");
-        assert_eq!(final_config.min_validity, 0);
+        assert_eq!(final_config.min_validity, None);
+        assert!(final_config.deprecations.is_empty());
+    }
+
+    #[test]
+    fn test_final_config_defaults_through_config_default() {
+        // `Config::default()` must not seed the legacy key or an explicit
+        // min_validity, or every run would log a deprecation.
+        let config = Config::default().merge_with(host_only_config());
+        let final_config = FinalConfig::from_merged_config(config).unwrap();
+        assert_eq!(final_config.fail_on, FailOn::Critical);
+        assert_eq!(final_config.min_validity, None);
+        assert!(final_config.deprecations.is_empty());
     }
 
     #[test]
@@ -1900,7 +2097,8 @@ pub(crate) mod tests {
         let config = Config {
             hosts: Some(vec!["a.com".to_string(), "b.com".to_string()]),
             output: Some("json".to_string()),
-            exit_code: Some(2),
+            fail_on: Some(FailOn::Warning),
+            exit_code: None,
             check_revocation: Some(true),
             prometheus: Some(config::PrometheusConfig {
                 enabled: Some(true),
@@ -1912,59 +2110,89 @@ pub(crate) mod tests {
         let final_config = FinalConfig::from_merged_config(config).unwrap();
         assert_eq!(final_config.addresses, vec!["a.com", "b.com"]);
         assert_eq!(final_config.output, OutFormat::Json);
-        assert_eq!(final_config.exit_code, 2);
+        assert_eq!(final_config.fail_on, FailOn::Warning);
         assert!(final_config.check_revocation);
         assert!(final_config.prometheus);
         assert_eq!(final_config.prometheus_address, "http://prom:9091");
         assert!(final_config.grade);
-        assert_eq!(final_config.min_validity, 30);
+        assert_eq!(final_config.min_validity, Some(30));
+        assert!(final_config.deprecations.is_empty());
+    }
+
+    // ── fail_on / legacy exit_code resolution ───────────────────────
+
+    fn resolve(
+        fail_on: Option<FailOn>,
+        exit_code: Option<i32>,
+    ) -> Result<FinalConfig, ConfigError> {
+        FinalConfig::from_merged_config(Config {
+            fail_on,
+            exit_code,
+            ..host_only_config()
+        })
+    }
+
+    #[test]
+    fn test_final_config_legacy_exit_code_zero_means_never() {
+        let final_config = resolve(None, Some(0)).unwrap();
+        assert_eq!(final_config.fail_on, FailOn::Never);
+        assert_eq!(final_config.deprecations.len(), 1);
+        assert!(final_config.deprecations[0].contains("fail_on = \"never\""));
+    }
+
+    #[test]
+    fn test_final_config_legacy_exit_code_one_is_the_default() {
+        let final_config = resolve(None, Some(1)).unwrap();
+        assert_eq!(final_config.fail_on, FailOn::Critical);
+        assert_eq!(final_config.deprecations.len(), 1);
+        assert!(final_config.deprecations[0].contains("now the default"));
+    }
+
+    #[test]
+    fn test_final_config_rejects_other_legacy_exit_codes() {
+        for code in [5, 256, -1] {
+            match resolve(None, Some(code)) {
+                Err(ConfigError::Validation(msg)) => {
+                    assert!(msg.contains(&format!("exit_code {code} is no longer supported")))
+                }
+                other => panic!(
+                    "exit_code {code}: expected a validation error, got {:?}",
+                    other.err()
+                ),
+            }
+            // Still rejected when fail_on would override it.
+            assert!(resolve(Some(FailOn::Never), Some(code)).is_err());
+        }
+    }
+
+    #[test]
+    fn test_final_config_fail_on_beats_legacy_exit_code() {
+        let final_config = resolve(Some(FailOn::Warning), Some(0)).unwrap();
+        assert_eq!(final_config.fail_on, FailOn::Warning);
+        assert_eq!(final_config.deprecations.len(), 1);
+        assert!(final_config.deprecations[0].contains("is ignored"));
     }
 
     // ── min_validity FinalConfig tests ──────────────────────────────
 
     #[test]
-    fn test_final_config_min_validity_default_is_zero() {
-        let config = Config {
-            hosts: Some(vec!["example.com".to_string()]),
-            output: None,
-            exit_code: None,
-            check_revocation: None,
-            prometheus: None,
-            grade: None,
-            min_validity: None,
+    fn test_final_config_min_validity() {
+        let with = |min_validity| {
+            FinalConfig::from_merged_config(Config {
+                min_validity,
+                ..host_only_config()
+            })
         };
-        let final_config = FinalConfig::from_merged_config(config).unwrap();
-        assert_eq!(final_config.min_validity, 0);
-    }
-
-    #[test]
-    fn test_final_config_min_validity_explicit_value() {
-        let config = Config {
-            hosts: Some(vec!["example.com".to_string()]),
-            output: None,
-            exit_code: None,
-            check_revocation: None,
-            prometheus: None,
-            grade: None,
-            min_validity: Some(60),
-        };
-        let final_config = FinalConfig::from_merged_config(config).unwrap();
-        assert_eq!(final_config.min_validity, 60);
-    }
-
-    #[test]
-    fn test_final_config_min_validity_zero_means_disabled() {
-        let config = Config {
-            hosts: Some(vec!["example.com".to_string()]),
-            output: None,
-            exit_code: None,
-            check_revocation: None,
-            prometheus: None,
-            grade: None,
-            min_validity: Some(0),
-        };
-        let final_config = FinalConfig::from_merged_config(config).unwrap();
-        assert_eq!(final_config.min_validity, 0);
+        assert_eq!(with(None).unwrap().min_validity, None);
+        // 0 is kept, distinct from unset: it disables the critical window.
+        assert_eq!(with(Some(0)).unwrap().min_validity, Some(0));
+        assert_eq!(with(Some(60)).unwrap().min_validity, Some(60));
+        match with(Some(-1)) {
+            Err(ConfigError::Validation(msg)) => {
+                assert!(msg.contains("min_validity must be 0 or greater (got -1)"))
+            }
+            other => panic!("expected a validation error, got {:?}", other.err()),
+        }
     }
 
     // ── FormatterFactory tests ───────────────────────────────────────
@@ -2052,12 +2280,27 @@ pub(crate) mod tests {
         }
     }
 
+    /// Reports for formatter tests, assessed under the default policy.
+    pub(crate) fn reports(v: Vec<TLS>) -> Vec<HostReport> {
+        reports_with(v, &VerdictPolicy::default())
+    }
+
+    /// Reports assessed under `policy`, labelled by hostname.
+    pub(crate) fn reports_with(v: Vec<TLS>, policy: &VerdictPolicy) -> Vec<HostReport> {
+        let labels: Vec<String> = v.iter().map(|t| t.certificate.hostname.clone()).collect();
+        let slots = v
+            .into_iter()
+            .map(|t| Some(HostOutcome::Checked(Box::new(t))))
+            .collect();
+        collect(slots, &labels, policy).0
+    }
+
     #[test]
     fn test_text_format_without_chain_does_not_panic() {
         // Regression: the `chain: None` arm used to be `todo!()`.
         let mut tls = make_test_tls();
         tls.certificate.chain = None;
-        let output = TextFormat.format(&[tls]);
+        let output = TextFormat.format(&reports(vec![tls]));
         assert!(output.contains("Hostname: test.example.com"));
         assert!(!output.contains("Additional Certificates"));
     }
@@ -2065,7 +2308,7 @@ pub(crate) mod tests {
     #[test]
     fn test_json_format_output() {
         let tls = vec![make_test_tls()];
-        let output = JsonFormat.format(&tls);
+        let output = JsonFormat.format(&reports(tls));
         assert!(output.contains("test.example.com"));
         assert!(output.contains("TLS_AES_256_GCM_SHA384"));
         assert!(output.contains("\"bits\": 256"));
@@ -2081,7 +2324,7 @@ pub(crate) mod tests {
             score: 97,
             categories: vec![],
         });
-        let output = JsonFormat.format(&[tls_entry]);
+        let output = JsonFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("\"grade\""));
         assert!(output.contains("\"A+\""));
         assert!(output.contains("97"));
@@ -2102,7 +2345,7 @@ pub(crate) mod tests {
     #[test]
     fn test_text_format_contains_all_fields() {
         let tls = vec![make_test_tls()];
-        let output = TextFormat.format(&tls);
+        let output = TextFormat.format(&reports(tls));
         assert!(output.contains("Hostname: test.example.com"));
         assert!(output.contains("Issued domain: test.example.com"));
         assert!(output.contains("Organization: Example Inc"));
@@ -2123,7 +2366,7 @@ pub(crate) mod tests {
     #[test]
     fn test_summary_format_contains_host_data() {
         let tls = vec![make_test_tls()];
-        let output = SummaryFormat.format(&tls);
+        let output = SummaryFormat.format(&reports(tls));
         assert!(output.contains("test.example.com"));
         assert!(output.contains("TLS_AES_256_GCM_SHA384"));
         assert!(output.contains("TLSv1.3"));
@@ -2139,9 +2382,9 @@ pub(crate) mod tests {
             tlschecker::SecurityWarning::IncompleteChain("Missing intermediate".to_string()),
             tlschecker::SecurityWarning::InvalidChainOrder("Wrong order".to_string()),
         ];
-        let output = TextFormat.format(&[tls_entry]);
-        assert!(output.contains("Security Warnings:"));
-        assert!(output.contains("WEAK ALGORITHM: SHA1"));
+        let output = TextFormat.format(&reports(vec![tls_entry]));
+        assert!(output.contains("Findings:"));
+        assert!(output.contains("[warning] WEAK ALGORITHM: SHA1"));
         assert!(output.contains("INCOMPLETE CHAIN: Missing intermediate"));
         assert!(output.contains("INVALID CHAIN ORDER: Wrong order"));
     }
@@ -2153,21 +2396,21 @@ pub(crate) mod tests {
             tlschecker::SecurityWarning::HostnameMismatch("not valid for evil.com".to_string()),
             tlschecker::SecurityWarning::ExpiringIntermediate("Int CA expires soon".to_string()),
         ];
-        let output = TextFormat.format(&[tls_entry]);
+        let output = TextFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("HOSTNAME MISMATCH: not valid for evil.com"));
         assert!(output.contains("EXPIRING INTERMEDIATE: Int CA expires soon"));
     }
 
     #[test]
     fn test_text_format_includes_fingerprints() {
-        let output = TextFormat.format(&[make_test_tls()]);
+        let output = TextFormat.format(&reports(vec![make_test_tls()]));
         assert!(output.contains("SHA-256 Fingerprint: AB:CD:EF"));
         assert!(output.contains("SHA-1 Fingerprint: 12:34:56"));
     }
 
     #[test]
     fn test_text_format_includes_issuer_and_revocation_urls() {
-        let output = TextFormat.format(&[make_test_tls()]);
+        let output = TextFormat.format(&reports(vec![make_test_tls()]));
         assert!(output.contains("OCSP responders: http://ocsp.example.com"));
         assert!(output.contains("CA Issuers: http://i.example.com/ca.crt"));
         assert!(output.contains("CRL distribution points: http://c.example.com/ca.crl"));
@@ -2179,7 +2422,7 @@ pub(crate) mod tests {
         tls_entry.certificate.ocsp_urls.clear();
         tls_entry.certificate.ca_issuer_urls.clear();
         tls_entry.certificate.crl_urls.clear();
-        let output = TextFormat.format(&[tls_entry]);
+        let output = TextFormat.format(&reports(vec![tls_entry]));
         assert!(!output.contains("OCSP responders:"));
         assert!(!output.contains("CA Issuers:"));
         assert!(!output.contains("CRL distribution points:"));
@@ -2210,7 +2453,7 @@ pub(crate) mod tests {
                 },
             ],
         });
-        let output = TextFormat.format(&[tls_entry]);
+        let output = TextFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("Supported Protocols & Ciphers:"));
         assert!(output.contains("TLSv1.3: supported"));
         assert!(output.contains("- TLS_AES_256_GCM_SHA384"));
@@ -2231,7 +2474,7 @@ pub(crate) mod tests {
                 ciphers: vec!["ECDHE-RSA-AES256-GCM-SHA384".to_string()],
             }],
         });
-        let output = JsonFormat.format(&[tls_entry]);
+        let output = JsonFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("\"scan\""));
         assert!(output.contains("TLSv1.2"));
         // fingerprints serialize; pem is skipped.
@@ -2241,7 +2484,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_json_format_omits_scan_when_absent() {
-        let output = JsonFormat.format(&[make_test_tls()]);
+        let output = JsonFormat.format(&reports(vec![make_test_tls()]));
         assert!(!output.contains("\"scan\""));
     }
 
@@ -2257,7 +2500,7 @@ pub(crate) mod tests {
                 reason: "TLS 1.2".to_string(),
             }],
         });
-        let output = TextFormat.format(&[tls_entry]);
+        let output = TextFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("TLS Configuration Grade: B (Score: 75/100)"));
         assert!(output.contains("Category Breakdown:"));
         assert!(output.contains("Protocol: 80/100 - TLS 1.2"));
@@ -2268,7 +2511,7 @@ pub(crate) mod tests {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.is_expired = true;
         tls_entry.certificate.validity_days = -10;
-        let output = SummaryFormat.format(&[tls_entry]);
+        let output = SummaryFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("Critical"));
     }
 
@@ -2276,7 +2519,7 @@ pub(crate) mod tests {
     fn test_summary_format_warning_threshold() {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.validity_days = 20;
-        let output = SummaryFormat.format(&[tls_entry]);
+        let output = SummaryFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("Warning"));
     }
 
@@ -2284,7 +2527,7 @@ pub(crate) mod tests {
     fn test_summary_format_critical_threshold() {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.validity_days = 10;
-        let output = SummaryFormat.format(&[tls_entry]);
+        let output = SummaryFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("Critical"));
     }
 
@@ -2293,15 +2536,19 @@ pub(crate) mod tests {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.revocation_status =
             RevocationStatus::Revoked("Key compromise".to_string());
-        let output = SummaryFormat.format(&[tls_entry]);
+        let output = SummaryFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("Revoked"));
+        // 365 days left, but revoked: the status must not read Healthy.
+        assert!(output.contains("Critical"));
+        assert!(!output.contains("Healthy"));
+        assert!(output.contains("[critical] REVOKED: Certificate is revoked: Key compromise"));
     }
 
     #[test]
     fn test_summary_format_self_signed() {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.is_self_signed = true;
-        let output = SummaryFormat.format(&[tls_entry]);
+        let output = SummaryFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("Yes")); // self-signed = Yes
     }
 
@@ -2313,7 +2560,7 @@ pub(crate) mod tests {
             score: 0,
             categories: vec![],
         });
-        let output = SummaryFormat.format(&[tls_entry]);
+        let output = SummaryFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("F"));
         // When a grade is present, the Grade column header is shown.
         assert!(output.contains("Grade"));
@@ -2323,7 +2570,7 @@ pub(crate) mod tests {
     fn test_summary_format_hides_grade_column_when_no_grade() {
         // Default (ungraded) run: the Grade column should be omitted entirely
         // rather than rendered as a column of "-".
-        let output = SummaryFormat.format(&[make_test_tls()]); // grade: None
+        let output = SummaryFormat.format(&reports(vec![make_test_tls()])); // grade: None
         assert!(
             !output.contains("Grade"),
             "Grade column should be hidden when no result has a grade"
@@ -2341,7 +2588,7 @@ pub(crate) mod tests {
             score: 98,
             categories: vec![],
         });
-        let output = SummaryFormat.format(&[ungraded, graded]);
+        let output = SummaryFormat.format(&reports(vec![ungraded, graded]));
         assert!(output.contains("Grade"));
         assert!(output.contains("A+"));
     }
@@ -2353,9 +2600,10 @@ pub(crate) mod tests {
             vec![tlschecker::SecurityWarning::WeakSignatureAlgorithm(
                 "SHA1 detected".to_string(),
             )];
-        let output = SummaryFormat.format(&[tls_entry]);
-        assert!(output.contains("Security Warnings:"));
-        assert!(output.contains("WEAK ALGORITHM: SHA1 detected"));
+        let output = SummaryFormat.format(&reports(vec![tls_entry]));
+        assert!(output.contains("Findings:"));
+        assert!(output.contains("Host: test.example.com (Warning)"));
+        assert!(output.contains("[warning] WEAK ALGORITHM: SHA1 detected"));
     }
 
     // ── Certificate Transparency (--ct-check) rendering ────────────
@@ -2366,7 +2614,7 @@ pub(crate) mod tests {
             crtsh_id: 12345,
             crtsh_url: "https://crt.sh/?id=12345".to_string(),
         });
-        let output = TextFormat.format(&[tls_entry]);
+        let output = TextFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("Certificate Transparency:"));
         assert!(output.contains("Logged: yes"));
         assert!(output.contains("crt.sh: https://crt.sh/?id=12345"));
@@ -2377,7 +2625,7 @@ pub(crate) mod tests {
         // "Could not check" must render as unknown and produce NO warning.
         let mut tls_entry = make_test_tls();
         tls_entry.apply_ct(tlschecker::ct::CtStatus::Unknown);
-        let output = TextFormat.format(&[tls_entry]);
+        let output = TextFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("Logged: unknown"));
         assert!(!output.contains("NOT IN CT LOG"));
     }
@@ -2391,7 +2639,7 @@ pub(crate) mod tests {
         tls_entry.apply_ct_lookup(Err(TLSError::Unknown(
             "CT lookup returned HTTP 502 Bad Gateway".to_string(),
         )));
-        let output = TextFormat.format(&[tls_entry]);
+        let output = TextFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains(
             "Revocation Status: Unknown (OCSP: certificate lists no OCSP responder; CRL: HTTP 404)"
         ));
@@ -2403,16 +2651,16 @@ pub(crate) mod tests {
         let mut revoked = make_test_tls();
         revoked.certificate.revocation_status =
             RevocationStatus::Revoked("Revoked at Sep  1 12:00:00 2026 GMT".to_string());
-        let text = TextFormat.format(&[revoked.clone()]);
+        let text = TextFormat.format(&reports(vec![revoked.clone()]));
         // One "Revoked", not "Revoked (Revoked at …)".
         assert!(text.contains("Revocation Status: Revoked (at Sep  1 12:00:00 2026 GMT)"));
 
         let mut good = make_test_tls();
         good.certificate.revocation_status = RevocationStatus::Good;
         assert!(TextFormat
-            .format(&[good.clone()])
+            .format(&reports(vec![good.clone()]))
             .contains("Revocation Status: Not revoked"));
-        let summary = SummaryFormat.format(&[good]);
+        let summary = SummaryFormat.format(&reports(vec![good]));
         // "Valid" read as "the certificate is valid"; Good only means "not revoked".
         assert!(summary.contains("Not revoked"));
         assert!(!summary.contains("Valid"));
@@ -2423,11 +2671,15 @@ pub(crate) mod tests {
         let mut tls_entry = make_test_tls();
         // A certificate absent from CT logs is reported as a warning.
         tls_entry.apply_ct(tlschecker::ct::CtStatus::NotLogged);
-        let text = TextFormat.format(&[tls_entry.clone()]);
+        let text = TextFormat.format(&reports(vec![tls_entry.clone()]));
         assert!(text.contains("NOT IN CT LOG"));
         assert!(text.contains("Logged: no"));
-        let summary = SummaryFormat.format(&[tls_entry]);
+        let summary = SummaryFormat.format(&reports(vec![tls_entry]));
         assert!(summary.contains("NOT IN CT LOG"));
+        // Informational: it does not change the status.
+        assert!(summary.contains("Healthy"));
+        assert!(summary.contains("[info] NOT IN CT LOG"));
+        assert!(text.contains("Status: Healthy"));
     }
 
     // ── Embedded SCTs (offline, always-on) ────────────────────────
@@ -2444,7 +2696,7 @@ pub(crate) mod tests {
     fn test_text_format_shows_embedded_scts() {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.scts = vec![sample_sct()];
-        let output = TextFormat.format(&[tls_entry]);
+        let output = TextFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains("Embedded SCTs (Certificate Transparency): 1"));
         assert!(output.contains(&"ab".repeat(32)));
         assert!(output.contains("2009-02-13T23:31:30Z"));
@@ -2452,7 +2704,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_text_format_omits_sct_block_when_none() {
-        let output = TextFormat.format(&[make_test_tls()]); // scts empty
+        let output = TextFormat.format(&reports(vec![make_test_tls()])); // scts empty
         assert!(!output.contains("Embedded SCTs"));
     }
 
@@ -2462,7 +2714,7 @@ pub(crate) mod tests {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.scts = vec![sample_sct()];
         tls_entry.apply_ct(tlschecker::ct::CtStatus::Unknown);
-        let output = TextFormat.format(&[tls_entry]);
+        let output = TextFormat.format(&reports(vec![tls_entry]));
         assert!(output.contains(
             "Logged: unknown (the certificate carries 1 embedded SCT(s), so it was submitted to CT logs)"
         ));
@@ -2476,7 +2728,7 @@ pub(crate) mod tests {
             crtsh_id: 1,
             crtsh_url: "https://crt.sh/?id=1".to_string(),
         });
-        let output = SummaryFormat.format(&[logged]);
+        let output = SummaryFormat.format(&reports(vec![logged]));
         // Column header present, and the logged ✓ marker rendered for a cert
         // that produces no warning (the summary-positive-case gap, now fixed).
         assert!(output.contains("CT"));
@@ -2486,7 +2738,7 @@ pub(crate) mod tests {
     #[test]
     fn test_summary_hides_ct_column_when_not_checked() {
         // Without --ct-check, ct is None and the column is omitted.
-        let output = SummaryFormat.format(&[make_test_tls()]);
+        let output = SummaryFormat.format(&reports(vec![make_test_tls()]));
         assert!(
             !output.contains(" CT "),
             "CT column should be hidden when no host was CT-checked"
@@ -2521,102 +2773,296 @@ pub(crate) mod tests {
         assert!(!use_dashboard(true, false, false, true));
     }
 
-    // ── min_validity exit logic tests ──────────────────────────────
+    // ── Status & exit codes (#205 / #206) ──────────────────────────
 
-    #[test]
-    fn test_min_validity_below_threshold_triggers_failure() {
-        // Cert with 20 days left, threshold 30 → should be below min validity
+    fn mismatch_tls() -> TLS {
         let mut tls = make_test_tls();
-        tls.certificate.validity_days = 20;
-        tls.certificate.is_expired = false;
-        let results = [tls];
+        tls.certificate
+            .security_warnings
+            .push(tlschecker::SecurityWarning::HostnameMismatch(
+                "Certificate is not valid for 'test.example.com'".to_string(),
+            ));
+        tls
+    }
 
-        let min_validity = 30;
-        let below = results
-            .iter()
-            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
-        assert!(below);
+    fn try_parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("tlschecker").chain(args.iter().copied()))
+    }
+
+    // 24
+    #[test]
+    fn test_cli_fail_on_and_allow() {
+        let err = try_parse(&["--fail-on", "bogus", "x"]).err().unwrap();
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(
+            try_parse(&["--fail-on", "warning", "x"]).unwrap().fail_on,
+            Some(FailOn::Warning)
+        );
+        assert_eq!(try_parse(&["x"]).unwrap().fail_on, None);
+
+        let cli = try_parse(&["--allow", "untrusted,hostname-mismatch", "x"]).unwrap();
+        assert_eq!(
+            cli.allow,
+            vec![FindingCode::Untrusted, FindingCode::HostnameMismatch]
+        );
+        let cli = try_parse(&["--allow", "untrusted", "--allow", "self-signed", "x"]).unwrap();
+        assert_eq!(
+            cli.allow,
+            vec![FindingCode::Untrusted, FindingCode::SelfSigned]
+        );
+
+        for (value, hint) in [
+            ("expired", "--fail-on never"),
+            ("revoked", "--fail-on never"),
+            ("expires-soon", "--min-validity"),
+            ("bogus", "valid findings"),
+        ] {
+            let err = try_parse(&["--allow", value, "x"]).err().unwrap();
+            assert_eq!(err.exit_code(), 2);
+            assert!(err.to_string().contains(hint), "{value}: {err}");
+        }
+
+        assert!(
+            try_parse(&["--allow-unreachable", "x"])
+                .unwrap()
+                .allow_unreachable
+        );
     }
 
     #[test]
-    fn test_min_validity_above_threshold_no_failure() {
-        // Cert with 365 days left, threshold 30 → should be above min validity
-        let tls = make_test_tls(); // validity_days = 365
-        let results = [tls];
-
-        let min_validity = 30;
-        let below = results
-            .iter()
-            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
-        assert!(!below);
+    fn test_cli_min_validity_range() {
+        assert!(try_parse(&["--min-validity", "-1", "x"]).is_err());
+        assert_eq!(
+            try_parse(&["--min-validity", "0", "x"])
+                .unwrap()
+                .min_validity,
+            Some(0)
+        );
+        assert_eq!(
+            try_parse(&["--min-validity", "30", "x"])
+                .unwrap()
+                .min_validity,
+            Some(30)
+        );
     }
 
     #[test]
-    fn test_min_validity_exact_threshold_no_failure() {
-        // Cert with exactly 30 days left, threshold 30 → not below, so no failure
+    fn test_cli_deprecated_flags_still_parse() {
+        let cli = try_parse(&["--fail-on-error", "--exit-code", "1", "x"]).unwrap();
+        assert!(cli.fail_on_error);
+        assert_eq!(cli.exit_code, Some(1));
+        // Rejected later (exit 2), not by clap, so the message can explain why.
+        assert_eq!(
+            try_parse(&["--exit-code", "-1", "x"]).unwrap().exit_code,
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn test_long_help_documents_exit_status_but_not_deprecated_flags() {
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        assert!(help.contains("Exit status:"));
+        assert!(help.contains("--fail-on"));
+        assert!(help.contains("--allow-unreachable"));
+        assert!(!help.contains("--exit-code"), "{help}");
+        assert!(!help.contains("--fail-on-error"), "{help}");
+    }
+
+    #[test]
+    fn test_load_config_passes_cli_fail_on() {
+        let cli = try_parse(&["--fail-on", "never", "--exit-code", "1", "x"]).unwrap();
+        let final_config = load_config(&cli).unwrap();
+        assert_eq!(final_config.fail_on, FailOn::Never);
+        assert_eq!(final_config.deprecations.len(), 1);
+    }
+
+    // 25
+    #[test]
+    fn test_collect_tallies_every_outcome() {
+        let labels: Vec<String> = [
+            "ok.example",
+            "dns.example",
+            "bad:99999",
+            "pending",
+            "mismatch",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let slots = vec![
+            Some(HostOutcome::Checked(Box::new(make_test_tls()))),
+            Some(HostOutcome::Failed {
+                kind: "DNS",
+                detail: "no such host".to_string(),
+            }),
+            Some(HostOutcome::Failed {
+                kind: KIND_INVALID,
+                detail: "Invalid port".to_string(),
+            }),
+            None,
+            Some(HostOutcome::Checked(Box::new(mismatch_tls()))),
+        ];
+        let (reports, tally) = collect(slots, &labels, &VerdictPolicy::default());
+        assert_eq!(
+            tally,
+            RunTally {
+                healthy: 1,
+                critical: 1,
+                unreachable: 1,
+                invalid: 1,
+                pending: 1,
+                // make_test_tls has TrustStatus::Unknown.
+                trust_unknown: 2,
+                ..RunTally::default()
+            }
+        );
+        let report_labels: Vec<&str> = reports.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(report_labels, vec!["ok.example", "mismatch"]);
+        assert_eq!(reports[0].status.verdict, Verdict::Healthy);
+        assert_eq!(reports[1].status.verdict, Verdict::Critical);
+    }
+
+    #[test]
+    fn test_collect_counts_internal_failures_as_unreachable() {
+        let slots = vec![Some(HostOutcome::Failed {
+            kind: "internal",
+            detail: "panic".to_string(),
+        })];
+        let (_, tally) = collect(slots, &["a".to_string()], &VerdictPolicy::default());
+        assert_eq!((tally.unreachable, tally.invalid), (1, 0));
+    }
+
+    /// Runs the pool with an injected check and returns the exit status the
+    /// CLI would report.
+    fn run_status(hosts: usize, check: CheckFn, gate: Gate) -> RunStatus {
+        let labels: Vec<String> = (0..hosts).map(|i| format!("h{i}.example")).collect();
+        let mut slots: Vec<Option<HostOutcome>> = (0..hosts).map(|_| None).collect();
+        for (index, outcome) in spawn_checks_with(host_jobs(hosts), test_check_options(), check) {
+            slots[index] = Some(outcome);
+        }
+        let (_, tally) = collect(slots, &labels, &VerdictPolicy::default());
+        exit::exit_status(&tally, gate)
+    }
+
+    // 26
+    #[test]
+    fn test_all_unreachable_exits_3() {
+        // #206: every host failing DNS used to exit 0.
+        fn dns_failure(_: &HostPort, _: CheckOptions) -> Result<TLS, TLSError> {
+            Err(TLSError::DNS("no such host".to_string()))
+        }
+        let default = Gate {
+            fail_on: FailOn::Critical,
+            allow_unreachable: false,
+        };
+        assert_eq!(run_status(3, dns_failure, default), RunStatus::Unchecked);
+        // Nothing checked: --allow-unreachable cannot turn this into success.
+        let allow = Gate {
+            allow_unreachable: true,
+            ..default
+        };
+        assert_eq!(run_status(3, dns_failure, allow), RunStatus::Unchecked);
+    }
+
+    #[test]
+    fn test_hostname_mismatch_exits_1() {
+        fn mismatch_check(_: &HostPort, _: CheckOptions) -> Result<TLS, TLSError> {
+            Ok(mismatch_tls())
+        }
+        let default = Gate {
+            fail_on: FailOn::Critical,
+            allow_unreachable: false,
+        };
+        assert_eq!(
+            run_status(2, mismatch_check, default),
+            RunStatus::CertificateProblem
+        );
+        let never = Gate {
+            fail_on: FailOn::Never,
+            ..default
+        };
+        assert_eq!(run_status(2, mismatch_check, never), RunStatus::Ok);
+    }
+
+    // 27
+    #[test]
+    fn test_summary_status_uses_the_verdict() {
+        // #205: a mismatch with a year left used to read Healthy.
+        let output = SummaryFormat.format(&reports(vec![mismatch_tls()]));
+        assert!(output.contains("Critical"));
+        assert!(!output.contains("Healthy"));
+        assert!(output.contains("Host: test.example.com (Critical)"));
+        assert!(output.contains("[critical] HOSTNAME MISMATCH:"));
+
+        let mut self_signed = make_test_tls();
+        self_signed.certificate.is_self_signed = true;
+        let output = SummaryFormat.format(&reports(vec![self_signed]));
+        assert!(output.contains("Warning"));
+        assert!(!output.contains("Healthy"));
+        assert!(output.contains("[warning] SELF-SIGNED: Certificate is self-signed"));
+
+        let mut untrusted = make_test_tls();
+        untrusted.certificate.trust = TrustStatus::Untrusted {
+            reason: "self-signed certificate".to_string(),
+        };
+        untrusted
+            .certificate
+            .security_warnings
+            .push(tlschecker::SecurityWarning::Untrusted(
+                "Certificate chain is not trusted: self-signed certificate".to_string(),
+            ));
+        let output = SummaryFormat.format(&reports(vec![untrusted.clone()]));
+        assert!(output.contains("Warning"));
+        assert!(!output.contains("Healthy"));
+
+        // An allowed finding is listed but no longer counts.
+        let policy = VerdictPolicy {
+            allow: vec![FindingCode::Untrusted],
+            ..VerdictPolicy::default()
+        };
+        let output = SummaryFormat.format(&reports_with(vec![untrusted], &policy));
+        assert!(output.contains("Healthy"));
+        assert!(output.contains("[allowed warning] UNTRUSTED"));
+    }
+
+    #[test]
+    fn test_summary_lists_expiry_findings() {
         let mut tls = make_test_tls();
-        tls.certificate.validity_days = 30;
-        tls.certificate.is_expired = false;
-        let results = [tls];
-
-        let min_validity = 30;
-        let below = results
-            .iter()
-            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
-        assert!(!below);
+        tls.certificate.validity_days = 10;
+        let output = SummaryFormat.format(&reports(vec![tls]));
+        assert!(output.contains("[critical] EXPIRES SOON: 10 days left (below 15 days)"));
     }
 
+    // 28
     #[test]
-    fn test_min_validity_disabled_when_zero() {
-        // Even with low validity, when min_validity is 0 (disabled), no check
-        let mut tls = make_test_tls();
-        tls.certificate.validity_days = 5;
-        tls.certificate.is_expired = false;
-        let results = [tls];
+    fn test_text_format_shows_status_and_findings() {
+        let output = TextFormat.format(&reports(vec![mismatch_tls()]));
+        assert!(output.contains("Hostname: test.example.com\nStatus: Critical\n"));
+        assert!(output.contains("\nFindings:\n"));
+        assert!(output.contains("[critical] HOSTNAME MISMATCH:"));
 
-        let min_validity = 0;
-        // The exit logic only checks when min_validity > 0
-        let would_check = min_validity > 0;
-        assert!(!would_check);
-
-        // Even if we checked, the result wouldn't matter since the check is skipped
-        let below = results
-            .iter()
-            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
-        // 5 < 0 is false, so even without the guard the logic is safe
-        assert!(!below);
+        let healthy = TextFormat.format(&reports(vec![make_test_tls()]));
+        assert!(healthy.contains("Status: Healthy"));
+        assert!(!healthy.contains("Findings:"));
     }
 
+    // 29
     #[test]
-    fn test_min_validity_ignores_already_expired_certs() {
-        // Already expired cert with negative days — should NOT trigger min_validity
-        // (expired certs are handled by the expired check, not min_validity)
-        let mut tls = make_test_tls();
-        tls.certificate.validity_days = -10;
-        tls.certificate.is_expired = true;
-        let results = [tls];
-
-        let min_validity = 30;
-        let below = results
-            .iter()
-            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
-        assert!(!below); // is_expired = true, so filtered out
-    }
-
-    #[test]
-    fn test_min_validity_multiple_certs_one_below() {
-        // Two certs: one healthy (365 days), one close to expiry (10 days)
-        let tls_healthy = make_test_tls(); // 365 days
-        let mut tls_expiring = make_test_tls();
-        tls_expiring.certificate.validity_days = 10;
-        tls_expiring.certificate.is_expired = false;
-        let results = [tls_healthy, tls_expiring];
-
-        let min_validity = 30;
-        let below = results
-            .iter()
-            .any(|c| !c.certificate.is_expired && c.certificate.validity_days < min_validity);
-        assert!(below); // one cert is below threshold
+    fn test_json_format_includes_status() {
+        let output = JsonFormat.format(&reports(vec![mismatch_tls()]));
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let status = &value[0]["status"];
+        assert_eq!(status["verdict"], "critical");
+        assert_eq!(status["findings"][0]["code"], "hostname-mismatch");
+        assert_eq!(status["findings"][0]["severity"], "critical");
+        assert_eq!(status["findings"][0]["allowed"], false);
+        // Additive: the TLS fields stay at the top level of each element...
+        assert_eq!(value[0]["certificate"]["hostname"], "test.example.com");
+        // ...so the output still deserializes as v2's `Vec<TLS>`.
+        let parsed: Vec<TLS> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].certificate.hostname, "test.example.com");
     }
 
     // ── Integration test (network-dependent) ─────────────────────────

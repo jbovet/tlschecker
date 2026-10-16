@@ -11,14 +11,38 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use tlschecker::TLS;
+use tlschecker::verdict::{classify, Severity};
+use tlschecker::{SecurityWarning, TLS};
 
-use super::state::{
-    unverified_checks, verdict, App, ExportPrompt, FlashKind, OnDemand, Screen, Verdict,
-};
+use super::state::{unverified_checks, App, ExportPrompt, FlashKind, OnDemand, Screen, Verdict};
 use crate::{ct_label, revocation_label, warning_label, HostOutcome, StatusLabel, Tone};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
+
+/// The mark a warning line starts with, by the severity of its finding.
+fn severity_mark(severity: Severity) -> (&'static str, Style) {
+    match severity {
+        Severity::Critical => ("✗", Style::new().fg(Color::Red)),
+        Severity::Warning => ("⚠", Style::new().fg(Color::Yellow)),
+        Severity::Info => ("·", DIM),
+    }
+}
+
+/// One "Warnings" line: severity mark and label, the message, and an
+/// `(allowed)` note when `--allow` accepted the finding. `indent` is the
+/// explorer's left margin (the fleet pane has none).
+fn warning_line(app: &App, warning: &SecurityWarning, indent: &str) -> Line<'static> {
+    let (kind, msg) = warning_label(warning);
+    let (mark, style) = severity_mark(classify(warning).1);
+    let mut spans = vec![
+        Span::styled(format!("{indent}{mark} {kind}: "), style),
+        Span::raw(msg.to_string()),
+    ];
+    if app.policy.allow.contains(&warning.code()) {
+        spans.push(Span::styled(" (allowed)", DIM));
+    }
+    Line::from(spans)
+}
 
 fn verdict_color(verdict: Verdict) -> Color {
     match verdict {
@@ -154,7 +178,7 @@ fn host_row(app: &App, index: usize) -> Line<'_> {
             Span::styled(format!("  ({})", kind), Style::new().fg(Color::Red)),
         ]),
         Some(HostOutcome::Checked(tls)) => {
-            let v = verdict(tls);
+            let v = app.verdict_of(tls);
             let color = verdict_color(v);
             let grade = tls
                 .grade
@@ -287,12 +311,12 @@ fn lifetime_consumed(tls: &TLS) -> f64 {
 
 fn draw_checked_detail(frame: &mut Frame, app: &App, tls: &TLS, label: &str, area: Rect) {
     let checking = |kind| app.is_running(app.selected, kind);
-    let v = verdict(tls);
+    let v = app.verdict_of(tls);
     let color = verdict_color(v);
     let cert = &tls.certificate;
 
     let block = Block::bordered().title(format!(" {} ", label)).title(
-        Line::from(format!(" {} {:?} ", verdict_symbol(v), v))
+        Line::from(format!(" {} {} ", verdict_symbol(v), v.label()))
             .style(Style::new().fg(color).add_modifier(Modifier::BOLD))
             .right_aligned(),
     );
@@ -427,11 +451,7 @@ fn draw_checked_detail(frame: &mut Frame, app: &App, tls: &TLS, label: &str, are
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )));
         for warning in &cert.security_warnings {
-            let (kind, msg) = warning_label(warning);
-            lines.push(Line::from(vec![
-                Span::styled(format!("⚠ {}: ", kind), Style::new().fg(Color::Yellow)),
-                Span::raw(msg.to_string()),
-            ]));
+            lines.push(warning_line(app, warning, ""));
         }
     }
     if !lines.is_empty() {
@@ -506,11 +526,11 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
         }
         Some(HostOutcome::Checked(tls)) => {
             let cert = &tls.certificate;
-            let v = verdict(tls);
+            let v = app.verdict_of(tls);
             let color = verdict_color(v);
 
             let mut headline = vec![Span::styled(
-                format!("{} {:?}", verdict_symbol(v), v),
+                format!("{} {}", verdict_symbol(v), v.label()),
                 Style::new().fg(color).add_modifier(Modifier::BOLD),
             )];
             if let Some(grade) = &tls.grade {
@@ -711,11 +731,7 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                     cert.security_warnings.len()
                 )));
                 for warning in &cert.security_warnings {
-                    let (kind, msg) = warning_label(warning);
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  ⚠ {}: ", kind), Style::new().fg(Color::Yellow)),
-                        Span::raw(msg.to_string()),
-                    ]));
+                    lines.push(warning_line(app, warning, "  "));
                 }
             }
         }
@@ -1303,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn test_draw_warning_host_shows_warnings() {
+    fn test_draw_mismatch_host_is_critical() {
         let mut tls = make_test_tls();
         tls.certificate
             .security_warnings
@@ -1315,8 +1331,147 @@ mod tests {
             &["wrong.example"],
         );
         let content = render(&app);
-        assert!(content.contains("HOSTNAME MISMATCH"));
-        assert!(content.contains("1 warning"));
+        // The warning line carries the critical mark, and so does the row.
+        assert!(content.contains("✗ HOSTNAME MISMATCH: not valid for host"));
+        assert!(content.contains("✗ wrong.example"));
+        assert!(content.contains("1 critical"));
+        assert!(content.contains("0 warning"));
+        assert!(content.contains("✗ Critical"));
+    }
+
+    /// Every frontend reads one status (#205). Lives here because the
+    /// dashboard's renderer is private to `tui`, while the CLI formatters,
+    /// `collect` and the Prometheus families are visible crate-wide.
+    #[test]
+    fn test_every_frontend_agrees_on_the_status() {
+        use crate::{Formatter, JsonFormat, SummaryFormat};
+        use tlschecker::verdict::{FindingCode, VerdictPolicy};
+
+        let mut self_signed = make_test_tls();
+        self_signed.certificate.is_self_signed = true;
+        let mut mismatch = make_test_tls();
+        mismatch
+            .certificate
+            .security_warnings
+            .push(tlschecker::SecurityWarning::HostnameMismatch(
+                "not valid for this name".to_string(),
+            ));
+        let mut not_in_ct = make_test_tls();
+        not_in_ct.apply_ct(tlschecker::ct::CtStatus::NotLogged);
+        let default = VerdictPolicy::default();
+        let allow_mismatch = VerdictPolicy {
+            allow: vec![FindingCode::HostnameMismatch],
+            ..VerdictPolicy::default()
+        };
+
+        let fixtures = [
+            ("healthy", make_test_tls(), &default, Verdict::Healthy),
+            ("self-signed", self_signed, &default, Verdict::Warning),
+            ("mismatch", mismatch.clone(), &default, Verdict::Critical),
+            ("not-in-ct only", not_in_ct, &default, Verdict::Healthy),
+            (
+                "allowed mismatch",
+                mismatch,
+                &allow_mismatch,
+                Verdict::Healthy,
+            ),
+        ];
+
+        for (name, tls, policy, expected) in fixtures {
+            let label = "fixture.example".to_string();
+
+            // Library.
+            let verdict = tls.assess(policy).verdict;
+            assert_eq!(verdict, expected, "{name}: assess");
+
+            // Summary table.
+            let (reports, tally) = crate::collect(
+                vec![Some(HostOutcome::Checked(Box::new(tls.clone())))],
+                std::slice::from_ref(&label),
+                policy,
+            );
+            let summary = SummaryFormat.format(&reports);
+            let shown: Vec<&str> = ["Healthy", "Warning", "Critical"]
+                .into_iter()
+                .filter(|status| summary.contains(status))
+                .collect();
+            assert_eq!(shown, vec![verdict.label()], "{name}: summary\n{summary}");
+
+            // JSON.
+            let json: serde_json::Value =
+                serde_json::from_str(&JsonFormat.format(&reports)).unwrap();
+            assert_eq!(
+                json[0]["status"]["verdict"],
+                verdict.label().to_lowercase(),
+                "{name}: json"
+            );
+
+            // Dashboard: row symbol and detail-pane title.
+            let mut app = App::with_policy(std::slice::from_ref(&label), policy.clone());
+            app.record(0, HostOutcome::Checked(Box::new(tls)));
+            let content = render(&app);
+            let symbol = verdict_symbol(verdict);
+            assert!(
+                content.contains(&format!("{symbol} {label}")),
+                "{name}: dashboard row"
+            );
+            assert!(
+                content.contains(&format!("{symbol} {}", verdict.label())),
+                "{name}: dashboard title"
+            );
+
+            // Prometheus.
+            let families = crate::metrics::prom::host_metric_families(
+                &reports[0].tls,
+                reports[0].status.verdict,
+                0,
+            );
+            let gauge = families
+                .iter()
+                .find(|f| f.name() == "tlschecker_verdict")
+                .unwrap()
+                .get_metric()[0]
+                .get_gauge()
+                .value();
+            let expected_gauge = match verdict {
+                Verdict::Healthy => 0.0,
+                Verdict::Warning => 1.0,
+                Verdict::Critical => 2.0,
+            };
+            assert_eq!(gauge, expected_gauge, "{name}: prometheus");
+
+            // Exit status input.
+            assert_eq!(tally.worst(), Some(verdict), "{name}: exit tally");
+        }
+    }
+
+    #[test]
+    fn test_warning_lines_carry_severity_and_allowed_marks() {
+        let mut tls = make_test_tls();
+        tls.certificate.security_warnings = vec![
+            tlschecker::SecurityWarning::IncompleteChain("issuer missing".to_string()),
+            tlschecker::SecurityWarning::NotInCertificateTransparency("not logged".to_string()),
+        ];
+        let mut app = App::with_policy(
+            &["chain.example".to_string()],
+            tlschecker::verdict::VerdictPolicy {
+                allow: vec![tlschecker::verdict::FindingCode::IncompleteChain],
+                ..Default::default()
+            },
+        );
+        app.record(0, HostOutcome::Checked(Box::new(tls)));
+
+        let content = render(&app);
+        assert!(content.contains("⚠ INCOMPLETE CHAIN: issuer missing (allowed)"));
+        assert!(content.contains("· NOT IN CT LOG: not logged"));
+        assert!(!content.contains("not logged (allowed)"));
+        // Allowed and Info findings leave the host Healthy.
+        assert!(content.contains("1 healthy"));
+
+        app.open_detail();
+        let explorer = render_sized(&app, 110, 70);
+        assert!(explorer.contains("  ⚠ INCOMPLETE CHAIN: issuer missing (allowed)"));
+        assert!(explorer.contains("  · NOT IN CT LOG: not logged"));
     }
 
     #[test]

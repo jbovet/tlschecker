@@ -15,7 +15,7 @@
 //! ```toml
 //! hosts = ["example.com", "example.com:8443"]
 //! output = "summary"
-//! exit_code = 1
+//! fail_on = "critical"
 //! check_revocation = true
 //!
 //! [prometheus]
@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+use crate::exit::FailOn;
+
 /// Main configuration structure for TLSChecker.
 ///
 /// All fields are optional to support partial configuration and merging.
@@ -37,7 +39,9 @@ pub struct Config {
     pub hosts: Option<Vec<String>>,
     /// Output format: json, text, summary
     pub output: Option<String>,
-    /// Exit code to use when certificates are expired/revoked
+    /// Status level that fails the run: "critical" (default), "warning" or "never"
+    pub fail_on: Option<FailOn>,
+    /// Deprecated (v3): use `fail_on`. 0 = never, 1 = default; other values are rejected.
     pub exit_code: Option<i32>,
     /// Enable certificate revocation checking
     pub check_revocation: Option<bool>,
@@ -45,7 +49,9 @@ pub struct Config {
     pub prometheus: Option<PrometheusConfig>,
     /// Enable TLS configuration grading
     pub grade: Option<bool>,
-    /// Minimum number of days a certificate must remain valid (0 = disabled)
+    /// Certificates with fewer days left than this are Critical. Unset uses the
+    /// default windows (15 days, or the last sixth of a short-lived
+    /// certificate's lifetime); 0 makes only expired certificates Critical.
     pub min_validity: Option<i32>,
 }
 
@@ -97,10 +103,14 @@ impl Config {
     ///
     /// - `hosts`: None (must be provided)
     /// - `output`: "summary"
-    /// - `exit_code`: 0 (don't fail on expired certificates)
+    /// - `fail_on`: None (resolves to "critical")
+    /// - `exit_code`: None (deprecated; see `fail_on`)
     /// - `check_revocation`: false
     /// - `prometheus.enabled`: false
     /// - `prometheus.address`: "http://localhost:9091"
+    /// - `grade`: false
+    /// - `min_validity`: None (the default expiry windows; must stay
+    ///   distinguishable from an explicit 0)
     ///
     /// # Returns
     ///
@@ -109,14 +119,15 @@ impl Config {
         Config {
             hosts: None,
             output: Some("summary".to_string()),
-            exit_code: Some(0),
+            fail_on: None,
+            exit_code: None,
             check_revocation: Some(false),
             prometheus: Some(PrometheusConfig {
                 enabled: Some(false),
                 address: Some("http://localhost:9091".to_string()),
             }),
             grade: Some(false),
-            min_validity: Some(0),
+            min_validity: None,
         }
     }
 
@@ -147,6 +158,9 @@ impl Config {
         }
         if other.output.is_some() {
             self.output = other.output;
+        }
+        if other.fail_on.is_some() {
+            self.fail_on = other.fail_on;
         }
         if other.exit_code.is_some() {
             self.exit_code = other.exit_code;
@@ -185,12 +199,13 @@ impl Config {
     ///
     /// * `addresses` - List of hosts to check
     /// * `output` - Output format (json, text, summary)
-    /// * `exit_code` - Exit code for failures
+    /// * `exit_code` - Deprecated `--exit-code` (0 or 1; see `fail_on`)
     /// * `prometheus` - Enable Prometheus metrics
     /// * `prometheus_address` - Prometheus push gateway address
     /// * `check_revocation` - Enable certificate revocation checking
     /// * `grade` - Enable TLS configuration grading
-    /// * `min_validity` - Minimum days a certificate must remain valid (0 = disabled)
+    /// * `min_validity` - Days below which a certificate is Critical
+    /// * `fail_on` - Status level that fails the run
     ///
     /// # Returns
     ///
@@ -205,10 +220,12 @@ impl Config {
         check_revocation: Option<bool>,
         grade: Option<bool>,
         min_validity: Option<i32>,
+        fail_on: Option<FailOn>,
     ) -> Self {
         Config {
             hosts: addresses,
             output,
+            fail_on,
             exit_code,
             check_revocation,
             prometheus: Some(PrometheusConfig {
@@ -246,7 +263,9 @@ impl Config {
                 "expired.badssl.com".to_string(),
             ]),
             output: Some("summary".to_string()),
-            exit_code: Some(1),
+            fail_on: Some(FailOn::Critical),
+            // Deprecated: deliberately not advertised in the template.
+            exit_code: None,
             check_revocation: Some(true),
             prometheus: Some(PrometheusConfig {
                 enabled: Some(true),
@@ -329,6 +348,7 @@ mod tests {
         let base_config = Config {
             hosts: Some(vec!["base.com".to_string()]),
             output: Some("text".to_string()),
+            fail_on: None,
             exit_code: Some(0),
             check_revocation: Some(false),
             prometheus: Some(PrometheusConfig {
@@ -342,6 +362,7 @@ mod tests {
         let override_config = Config {
             hosts: Some(vec!["override.com".to_string()]),
             output: None,
+            fail_on: None,
             exit_code: Some(1),
             check_revocation: Some(true),
             prometheus: Some(PrometheusConfig {
@@ -372,7 +393,11 @@ mod tests {
 
         assert_eq!(config.hosts, None);
         assert_eq!(config.output, Some("summary".to_string()));
-        assert_eq!(config.exit_code, Some(0));
+        // None, not Some(0): a default must never read as the deprecated key
+        // being set, nor as an explicit min_validity of 0.
+        assert_eq!(config.exit_code, None);
+        assert_eq!(config.fail_on, None);
+        assert_eq!(config.min_validity, None);
         assert_eq!(config.check_revocation, Some(false));
 
         let prometheus = config.prometheus.unwrap();
@@ -394,6 +419,7 @@ mod tests {
             Some(true),
             Some(true),
             Some(45),
+            Some(FailOn::Warning),
         );
 
         assert_eq!(config.hosts, Some(vec!["cli.com".to_string()]));
@@ -402,6 +428,7 @@ mod tests {
         assert_eq!(config.check_revocation, Some(true));
         assert_eq!(config.grade, Some(true));
         assert_eq!(config.min_validity, Some(45));
+        assert_eq!(config.fail_on, Some(FailOn::Warning));
 
         let prometheus = config.prometheus.unwrap();
         assert_eq!(prometheus.enabled, Some(true));
@@ -476,6 +503,7 @@ mod tests {
         let base = Config {
             hosts: Some(vec!["base.com".to_string()]),
             output: Some("json".to_string()),
+            fail_on: None,
             exit_code: Some(1),
             check_revocation: Some(true),
             prometheus: Some(PrometheusConfig {
@@ -488,6 +516,7 @@ mod tests {
         let empty_override = Config {
             hosts: None,
             output: None,
+            fail_on: None,
             exit_code: None,
             check_revocation: None,
             prometheus: None,
@@ -509,6 +538,7 @@ mod tests {
         let base = Config {
             hosts: None,
             output: None,
+            fail_on: None,
             exit_code: None,
             check_revocation: None,
             prometheus: None,
@@ -518,6 +548,7 @@ mod tests {
         let with_prom = Config {
             hosts: None,
             output: None,
+            fail_on: None,
             exit_code: None,
             check_revocation: None,
             prometheus: Some(PrometheusConfig {
@@ -572,7 +603,7 @@ mod tests {
     #[test]
     fn test_config_default_min_validity() {
         let config = Config::default();
-        assert_eq!(config.min_validity, Some(0));
+        assert_eq!(config.min_validity, None);
     }
 
     #[test]
@@ -581,6 +612,7 @@ mod tests {
         let override_config = Config {
             hosts: None,
             output: None,
+            fail_on: None,
             exit_code: None,
             check_revocation: None,
             prometheus: None,
@@ -614,6 +646,53 @@ mod tests {
 
         let config = Config::from_file(temp_file.path()).unwrap();
         assert_eq!(config.min_validity, None);
+    }
+
+    // ── fail_on config tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_config_from_toml_with_fail_on() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file
+            .write_all(b"hosts = [\"example.com\"]\nfail_on = \"warning\"\n")
+            .unwrap();
+        let config = Config::from_file(temp_file.path()).unwrap();
+        assert_eq!(config.fail_on, Some(FailOn::Warning));
+    }
+
+    #[test]
+    fn test_config_from_toml_with_invalid_fail_on_is_parse_error() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file
+            .write_all(b"hosts = [\"example.com\"]\nfail_on = \"bogus\"\n")
+            .unwrap();
+        match Config::from_file(temp_file.path()) {
+            Err(ConfigError::Parse(_)) => {}
+            other => panic!("Expected ParseError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_config_merge_fail_on_last_some_wins() {
+        let with = |fail_on| Config {
+            fail_on,
+            ..Config::default()
+        };
+        let merged = with(Some(FailOn::Never)).merge_with(with(Some(FailOn::Warning)));
+        assert_eq!(merged.fail_on, Some(FailOn::Warning));
+        let merged = with(Some(FailOn::Never)).merge_with(with(None));
+        assert_eq!(merged.fail_on, Some(FailOn::Never));
+    }
+
+    #[test]
+    fn test_example_toml_uses_fail_on_not_exit_code() {
+        let example = Config::example_toml();
+        assert!(example.contains("fail_on = \"critical\""), "{example}");
+        assert!(!example.contains("exit_code"), "{example}");
+        let parsed: Config = toml::from_str(&example).unwrap();
+        assert_eq!(parsed.fail_on, Some(FailOn::Critical));
+        assert_eq!(parsed.exit_code, None);
+        assert_eq!(parsed.min_validity, Some(30));
     }
 
     #[test]
@@ -661,6 +740,7 @@ mod tests {
         let fully_populated = Config {
             hosts: Some(vec!["example.com".to_string()]),
             output: Some("summary".to_string()),
+            fail_on: Some(FailOn::Critical),
             exit_code: Some(1),
             check_revocation: Some(true),
             prometheus: Some(PrometheusConfig {
@@ -671,7 +751,10 @@ mod tests {
             min_validity: Some(30),
         };
 
-        let expected = toml_key_paths(&toml::to_string(&fully_populated).unwrap());
+        let mut expected = toml_key_paths(&toml::to_string(&fully_populated).unwrap());
+        // The deprecated `exit_code` is deliberately left out of the template:
+        // `fail_on` replaces it.
+        assert!(expected.remove("exit_code"));
         let example = toml_key_paths(&Config::example_toml());
 
         let missing: Vec<&String> = expected.difference(&example).collect();
