@@ -7,6 +7,7 @@
 //! - Checking certificate revocation status via OCSP and CRL
 //! - Detecting self-signed certificates
 //! - Extracting certificate chain information
+//! - Assessing one overall status per host ([`verdict::assess`])
 //!
 //! # Example
 //!
@@ -31,6 +32,7 @@ mod der;
 pub mod grading;
 pub mod probe;
 pub mod sct;
+pub mod verdict;
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -124,12 +126,34 @@ pub enum SecurityWarning {
     /// The certificate chain did not build to a trusted system root
     Untrusted(String),
     /// The certificate deviates from issuance best practice (e.g. CA:TRUE on a
-    /// leaf, missing serverAuth EKU, over-long validity). Informational — it
-    /// does not affect the grade.
+    /// leaf, missing serverAuth EKU, over-long validity). Does not affect the
+    /// grade.
     CertificateMisissuance(String),
     /// A link in the presented chain is not cryptographically signed by the
-    /// certificate that follows it. Informational — it does not affect the grade.
+    /// certificate that follows it. Caps the grade at C.
     InvalidChainSignature(String),
+}
+
+impl SecurityWarning {
+    /// The human-readable detail every variant carries.
+    ///
+    /// The variant's display label and severity come from
+    /// [`verdict::classify`] / [`verdict::FindingCode::label`].
+    pub fn message(&self) -> &str {
+        match self {
+            SecurityWarning::WeakSignatureAlgorithm(msg)
+            | SecurityWarning::IncompleteChain(msg)
+            | SecurityWarning::InvalidChainOrder(msg)
+            | SecurityWarning::HostnameMismatch(msg)
+            | SecurityWarning::ExpiringIntermediate(msg)
+            | SecurityWarning::WeakProtocol(msg)
+            | SecurityWarning::WeakCipher(msg)
+            | SecurityWarning::NotInCertificateTransparency(msg)
+            | SecurityWarning::Untrusted(msg)
+            | SecurityWarning::CertificateMisissuance(msg)
+            | SecurityWarning::InvalidChainSignature(msg) => msg,
+        }
+    }
 }
 
 /// Represents a certificate in the certificate chain.
@@ -2606,7 +2630,7 @@ mod tests {
 
     /// Creates a synthetic TLS struct for offline testing.
     /// No network connection needed — all fields are populated with realistic data.
-    fn make_test_tls() -> TLS {
+    pub(crate) fn make_test_tls() -> TLS {
         TLS {
             cipher: Cipher {
                 name: "TLS_AES_256_GCM_SHA384".to_string(),

@@ -61,6 +61,18 @@ spec:
             summary: "TLS certificate for {{ $labels.instance }} is REVOKED"
             description: "{{ $labels.instance }} (issuer {{ $labels.issuer }}) reported revoked via OCSP/CRL."
 
+        # Same rules as the CLI status and exit code (expired, revoked, not valid
+        # for the checked name, or inside the critical expiry window), including
+        # the run's --min-validity and --allow.
+        - alert: TLSHostCritical
+          expr: tlschecker_verdict{job="tlschecker"} == 2
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: "TLS host {{ $labels.instance }} is Critical"
+            description: "tlschecker rates {{ $labels.instance }} Critical: the certificate is expired, revoked, not valid for this name, or about to expire. Run tlschecker against it for the findings."
+
         - alert: TLSGradeLow
           expr: tlschecker_grade_score{job="tlschecker"} < 50
           for: 6h

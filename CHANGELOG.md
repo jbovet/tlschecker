@@ -4,6 +4,86 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+One status for every frontend (#205) and meaningful exit codes (#206). See the
+README's *Status & exit codes* section for the full rules.
+
+### Breaking
+
+1. **tlschecker fails by default.** It exits 1 when any host is Critical and 3
+   when a host could not be checked. v2 exited 0 unless `--exit-code` was set.
+2. **Fixed exit codes:** 0 ok, 1 certificate problem, 2 usage/config, 3 host(s)
+   not checked, 4 internal. Precedence: 1 beats 3.
+   - Config and validation errors, and out-of-range `--connect-timeout` /
+     `--concurrency`, move from 1 to 2.
+   - Runtime and dashboard terminal errors move from 1 to 4.
+3. **One status everywhere (#205).** The summary Status column, text, JSON, the
+   dashboard, Prometheus and the exit code all use
+   `tlschecker::verdict::assess`.
+   - The summary now shows Critical for hostname mismatch and revoked
+     certificates (v2 showed Healthy), and Warning for self-signed, untrusted
+     or any warning.
+   - The dashboard now shows hostname mismatch as Critical (was Warning).
+   - A host whose only finding is not-in-CT is now Healthy, because that
+     finding is Info (was Warning).
+4. **Expiry windows are now "fewer than".**
+   - Critical below 15 days (was ≤ 15); Warning below 30 days (was ≤ 30).
+   - Certificates with a lifetime under 90 days use the last sixth (Critical)
+     or third (Warning) of their lifetime.
+   - `--min-validity N` now also makes the status Critical below N days, with
+     exactly v2's `< N`, and replaces the default critical window. 0 means only
+     expired certificates are Critical.
+5. **`--exit-code` / `exit_code` are deprecated.** 1 is a no-op (it is the
+   default). 0 means `--fail-on never`, and unreachable hosts still exit 3. Any
+   other value is an error (exit 2).
+6. **`--fail-on-error` is a deprecated no-op.** Use `--allow-unreachable` to
+   opt out.
+7. **`--export-pem` follows the same exit rules.** Extraction scripts need
+   `--fail-on never`.
+
+### Added
+
+- `--fail-on <critical|warning|never>` and the `fail_on` config key.
+- `--allow <finding>` to accept a finding: it is still reported, marked
+  `allowed`, but no longer affects the status or the exit code.
+- `--allow-unreachable` to tolerate hosts that cannot be reached, as long as at
+  least one host was checked.
+- A `status` object in each JSON element: `{"verdict": "critical",
+  "findings": [{"code", "severity", "allowed", "message"}]}`. Additive: the
+  output still deserializes as `Vec<TLS>`.
+- A `Status:` line and a "Findings" block in text output; a "Findings" footer
+  in the summary table.
+- The `tlschecker_verdict` Prometheus gauge (0 healthy, 1 warning, 2 critical).
+- A stderr explanation of every non-zero exit, naming the findings, the counts
+  and the flag that changes the outcome.
+- The exit-status table in `--help`.
+- The `tlschecker::verdict` library module and `SecurityWarning::message()`.
+
+### Fixed
+
+- #205: the summary table, dashboard and exit code disagreed about the same
+  host.
+- #206: a run where every host was unreachable exited 0.
+- Config errors now print the actual error, not only the usage hints.
+- `--fail-on-error` alone used to do nothing (it needed `--exit-code`).
+- `--exit-code 256` silently exited 0.
+
+### Migration
+
+| v2 | v3 |
+|---|---|
+| `--exit-code 1` | drop it |
+| `--exit-code 1 --fail-on-error` | drop both |
+| relied on exit 0 / monitoring cron / Prometheus | `--fail-on never` (add `--allow-unreachable` to also ignore down hosts) |
+| config `exit_code = 0` | `fail_on = "never"` |
+| config `exit_code = 1` | delete it |
+| `--exit-code N` with `$? -eq N` | test for 1 |
+| matched 1 for config errors | match 2 |
+| check by IP without IP SANs | `--allow hostname-mismatch` or check by name |
+| short-lived certs with a fixed SLO | `--min-validity` |
+| export chains from broken hosts | `--export-pem --fail-on never` |
+
 ## [2.0.2] - 2026-09-29
 
 ### Added

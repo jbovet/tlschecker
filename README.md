@@ -87,9 +87,10 @@ default. Hosts stream in as they are checked:
 
 **Fleet list.** Every host with its verdict and grade:
 
-- `✓` healthy · `⚠` warning (self-signed, any security warning, or ≤ 30 days
-  left) · `✗` critical (expired, revoked, or ≤ 15 days left). A host that could
-  not be checked shows why, e.g. `✗ host (DNS)`.
+- `✓` healthy · `⚠` warning · `✗` critical — the same status the summary
+  table, JSON, Prometheus and the exit code report (see
+  [*Status & exit codes*](#status--exit-codes)). A host that could not be
+  checked shows why, e.g. `✗ host (DNS)`.
 - A yellow `?` after the grade means a revocation or CT check you asked for
   could not reach a verdict (see *Not verified* below). It does not change the
   verdict: an unreachable OCSP responder or a crt.sh outage says nothing bad
@@ -109,7 +110,9 @@ unverified checks.
 - **Not verified** — why a requested revocation or CT check came back
   `Unknown`, e.g. `OCSP: http://ocsp.example: response signature verification
   failed; CRL: certificate lists no CRL distribution point`.
-- **Warnings** — every security warning for the host.
+- **Warnings** — every security warning for the host, marked by severity
+  (`✗` critical, `⚠` warning, `·` info) and `(allowed)` when accepted with
+  `--allow`.
 
 **Certificate explorer.** Press `Enter` on a host for the full report: subject
 and issuer, validity, **Trust & Revocation** (self-signed, trust, revocation
@@ -129,7 +132,7 @@ the certificate up in Certificate Transparency. The footer offers each one only
 while the host has no definitive answer yet (never checked, or `Unknown`, so a
 failed check can be retried). The pane shows `checking…` meanwhile; the verdict
 and grade update when the result arrives, and a revocation found this way
-counts toward `--exit-code`.
+counts toward the exit status.
 
 **Keys:**
 
@@ -161,6 +164,116 @@ whenever stdout is piped or redirected, and can always be forced with
 format) — so scripts, CI pipelines, and `tlschecker -o json | jq` behave
 exactly as before.
 
+### Status & exit codes
+
+Every host gets one status — **Healthy**, **Warning** or **Critical** — computed
+by a single function (`tlschecker::verdict::assess`). The summary table's
+Status column, the text `Status:` line, the JSON `status` object, the dashboard,
+the `tlschecker_verdict` Prometheus gauge and the exit code all read it, so
+they always agree.
+
+- **Critical** — every validating client rejects the certificate now or very
+  soon, whatever trust store it uses.
+- **Warning** — the outcome depends on the client or its trust store, or
+  security is weakened. Private CAs are legitimate, so untrusted and
+  self-signed certificates are Warning, not Critical.
+- **Info** — reported, never affects the status.
+
+The status is the highest severity among the host's findings (Healthy when
+there are none):
+
+| Finding | Code (`--allow`) | Severity | Label | Allowable |
+|---|---|---|---|---|
+| Certificate expired | `expired` | Critical | `EXPIRED` | no |
+| Certificate revoked (OCSP/CRL) | `revoked` | Critical | `REVOKED` | no |
+| Inside the critical expiry window | `expires-soon` | Critical | `EXPIRES SOON` | no |
+| Inside the warning expiry window | `expires-soon` | Warning | `EXPIRES SOON` | no |
+| Not valid for the checked name | `hostname-mismatch` | Critical | `HOSTNAME MISMATCH` | yes |
+| Self-signed certificate | `self-signed` | Warning | `SELF-SIGNED` | yes |
+| Chain does not build to a system root | `untrusted` | Warning | `UNTRUSTED` | yes |
+| Chain link not signed by its issuer | `invalid-chain-signature` | Warning | `INVALID CHAIN SIGNATURE` | yes |
+| Issuer missing from the chain | `incomplete-chain` | Warning | `INCOMPLETE CHAIN` | yes |
+| Chain not in issuer order | `invalid-chain-order` | Warning | `INVALID CHAIN ORDER` | yes |
+| SHA-1 / MD5 signature | `weak-signature` | Warning | `WEAK ALGORITHM` | yes |
+| Intermediate expired or expiring | `expiring-intermediate` | Warning | `EXPIRING INTERMEDIATE` | yes |
+| Obsolete protocol supported (`--scan`) | `weak-protocol` | Warning | `WEAK PROTOCOL` | yes |
+| Weak cipher accepted (`--scan`) | `weak-cipher` | Warning | `WEAK CIPHER` | yes |
+| Issuance best-practice violation | `misissuance` | Warning | `MISISSUANCE` | yes |
+| Not in public CT logs (`--ct-check`) | `not-in-ct` | Info | `NOT IN CT LOG` | yes |
+
+**Never a finding**, at any level: a revocation or CT check that came back
+`Unknown` (or was not requested), trust `Unknown` (no system CA bundle), and the
+grade. An unreachable OCSP responder or a crt.sh outage says nothing bad about
+the certificate, and the grade measures configuration quality, not validity.
+
+**Expiry windows** are "fewer than N" everywhere:
+
+- Certificates with a lifetime of 90 days or more (Let's Encrypt's 90-day
+  certificates included): Critical below 15 days left, Warning below 30.
+- Shorter-lived certificates scale with their lifetime — Critical in its last
+  sixth, Warning in its last third — with no step at 90 days:
+
+  | Lifetime | Critical | Warning |
+  |---|---|---|
+  | ≥ 90 days | < 15 days | < 30 days |
+  | 47 days | < 188 hours | < 376 hours |
+  | 6 days | < 24 hours | < 48 hours |
+  | 24 hours | < 4 hours | < 8 hours |
+
+- `--min-validity N` (or `min_validity = N`) replaces the critical window with
+  your own threshold: fewer than N days left is Critical. `0` leaves only
+  expired certificates Critical. The warning window still applies.
+
+**Exit codes:**
+
+| Code | Name | When |
+|---|---|---|
+| 0 | OK | No checked host is at or above the `--fail-on` level, and every host was checked. With `--allow-unreachable`, unreachable hosts are tolerated as long as at least one host was checked. Also returned by `--help`, `--version`, `--generate-config`, and a dashboard quit while hosts were still pending (pending hosts are never errors). |
+| 1 | Certificate problem | A checked host's status is at or above `--fail-on` (default `critical`). |
+| 2 | Usage / config | Nothing was checked: invalid flags or values, a missing or unparsable config file, no hosts, a negative `min_validity`, a legacy `exit_code` other than 0 or 1, or `--connect-timeout` / `--concurrency` out of range. |
+| 3 | Host(s) not checked | A host failed: DNS, connection, handshake, certificate retrieval, an internal error while checking it, or an invalid address. Unreachable hosts are exempt under `--allow-unreachable` when at least one host was checked; invalid addresses never are (they are a host-list typo, not a flaky network). |
+| 4 | Internal | The run failed after it started, e.g. a dashboard terminal error. |
+
+Precedence is 2 > 4 > 1 > 3 > 0: a definitive certificate problem is never
+hidden behind a flaky-network code. The two controls are independent —
+`--fail-on` decides only exit 1, `--allow-unreachable` only exit 3 — and a run
+where hosts were attempted but none could be checked never exits 0. Every
+non-zero exit is explained on stderr (stdout stays clean for `| jq`): the
+findings that caused it, the counts, and the flag that changes the outcome.
+
+**Controls:**
+
+- `--fail-on critical|warning|never` (config `fail_on`) — the status that fails
+  the run. `never` reports only; hosts that could not be checked still exit 3.
+- `--allow <finding>` — accept one finding (comma-separated or repeated). It is
+  still reported, marked `allowed`, but no longer affects the status or the exit
+  code. `expired`, `revoked` and `expires-soon` cannot be allowed: use
+  `--fail-on never` to report them without failing, or `--min-validity` to tune
+  the window.
+- `--allow-unreachable` — do not exit 3 for hosts that cannot be reached, as
+  long as at least one host was checked.
+
+Recipes:
+
+```sh
+# CI gate (the default): fail on expired, revoked, wrong-name or expiring certs
+tlschecker -o json example.com api.example.com
+
+# Strict: also fail on self-signed, untrusted, chain defects, < 30 days left
+tlschecker --fail-on warning example.com
+
+# Report only (monitoring cron, Prometheus): never exit 1, ignore down hosts
+tlschecker --fail-on never --allow-unreachable --prometheus example.com
+
+# Private CA: trust your CA explicitly, or accept the finding
+SSL_CERT_FILE=/etc/ssl/bundle-with-my-ca.pem tlschecker internal.example.com
+tlschecker --allow untrusted internal.example.com
+```
+
+The severity table is part of the public contract: raising a severity, or
+adding a Critical finding, is a breaking change; lowering a severity, or adding
+a Warning or Info finding, is a minor change.
+
 ## Examples
 
 Basic usage:
@@ -187,7 +300,9 @@ TLSChecker verifies that the presented certificate chain builds to a trusted roo
 - **Untrusted (reason)**: the chain does not verify — the reason is the underlying error, e.g. `self-signed certificate`, `unable to get local issuer certificate`, or `certificate has expired`
 - **Unknown**: no system trust store was available, so trust could not be determined (never reported as a problem)
 
-An untrusted chain adds an `UNTRUSTED` security warning and caps the configuration grade at C. Because verification happens *after* inspection, expired and self-signed certificates are still fully reported rather than rejected at the handshake.
+An untrusted chain adds an `UNTRUSTED` finding (Warning: shown everywhere, fails the run only with `--fail-on warning`) and caps the configuration grade at C. Because verification happens *after* inspection, expired and self-signed certificates are still fully reported rather than rejected at the handshake.
+
+To make hosts behind a private CA read as Trusted, point `SSL_CERT_FILE` at a bundle that contains the system roots plus your CA (it replaces the system bundle, so include both).
 
 ### Certificate Metadata
 
@@ -199,11 +314,12 @@ connection details:
 - **Validation Level** — `DV` / `OV` / `EV` / `IV`, derived from the CA/Browser-Forum policy OIDs.
 - **Key Usage / Extended Key Usage / Basic Constraints** — what the certificate is authorized for.
 
-It also raises **informational warnings** (which do *not* affect the grade, so
-legitimate private/internal certificates are never penalized) for issuance
-problems: a leaf asserting `CA:TRUE`, a missing `serverAuth` EKU, a low-entropy
-serial, an over-long (> 398-day) validity period, or a chain link whose
-signature does not cryptographically verify.
+It also raises `MISISSUANCE` warnings (Warning severity; they do *not* affect
+the grade, so legitimate private/internal certificates are never penalized)
+for issuance problems: a leaf asserting `CA:TRUE`, a missing `serverAuth` EKU, a
+low-entropy serial, or an over-long (> 398-day) validity period. A chain link
+whose signature does not cryptographically verify is reported separately as
+`INVALID CHAIN SIGNATURE` and caps the grade at C.
 
 ### Certificate Revocation Checking
 
@@ -266,6 +382,14 @@ A `tlschecker_revocation_status` metric is exported with the following values:
 ##### Metric labels and the push grouping key
 
 Every pushed series carries only stable identity labels in the push **grouping key**: `job="tlschecker"` and `instance="<host>"`. This is deliberate — a `push_metrics` `PUT` replaces the series under its exact grouping key, so putting volatile values (grade, cipher, expired, …) in the key would leave the previous run's series orphaned in the gateway whenever one of those values changed.
+
+Each host also gets `tlschecker_verdict` — its status as `0` healthy, `1` warning, `2` critical, by the same rules as the CLI status and exit code (including `--min-validity` and `--allow`). Alert on it to page on exactly what would fail a CI run:
+
+```promql
+tlschecker_verdict{job="tlschecker"} == 2
+```
+
+`tlschecker_below_min_validity` is unchanged: it is driven only by an explicit `--min-validity` and is `0` when that is unset.
 
 Descriptive, changeable metadata therefore lives on a dedicated info metric, `tlschecker_certificate_info` (constant value `1`), with labels `cipher`, `cipher_protocol_version`, `issuer`, and `grade` (`N/A` when grading did not run). Join it to the numeric metrics on `instance` in your queries, e.g.:
 
@@ -350,26 +474,28 @@ Modern browsers reject publicly-trusted certificates that are not logged in [Cer
 This performs a network request to an external service (crt.sh), so it is opt-in and adds latency. The result is **tri-state**, like revocation status:
 
 - **Logged** — the exact certificate was found in CT. The `text`/`json` output include a direct `crt.sh` link; the summary table shows `✓`.
-- **Not logged** — crt.sh has no record of the certificate *and* it carries no embedded SCTs, so absence from CT is plausible. Reported as a security warning (see below) and shown as `✗` in the summary. A publicly-trusted certificate that is not logged will be rejected by modern browsers.
+- **Not logged** — crt.sh has no record of the certificate *and* it carries no embedded SCTs, so absence from CT is plausible. Reported as an informational `NOT IN CT LOG` finding (see below) and shown as `✗` in the summary. A publicly-trusted certificate that is not logged will be rejected by modern browsers.
 - **Unknown** — crt.sh was unreachable or rate-limited, or it has no record of a certificate that carries embedded SCTs (crt.sh is an aggregator and misses some certificates the logs do include), so the status could not be determined (`?` in the summary). This is kept distinct from "not logged" so an outage is never mistaken for a problem. The reason — together with any embedded-SCT evidence — is logged to **stderr** (stdout stays clean for `… -o json | jq`), kept in JSON as `ct_detail`, and shown in `text` output and the dashboard.
 
-When `--ct-check` is used, the summary table gains a `CT` column (`✓`/`✗`/`?`); without it the column is hidden. Being absent from CT does **not** affect the grade — many legitimate internal/private certificates are intentionally absent from public CT logs, so what that means is left to you rather than the grade.
+When `--ct-check` is used, the summary table gains a `CT` column (`✓`/`✗`/`?`); without it the column is hidden. Being absent from CT does **not** affect the status or the grade — many legitimate internal/private certificates are intentionally absent from public CT logs, so what that means is left to you rather than the grade.
 
 ### Security Warnings
 
-In addition to revocation and grading, tlschecker surfaces certificate problems as security warnings in all output formats:
+In addition to revocation and grading, tlschecker surfaces certificate problems as security warnings in all output formats. Each is a finding with a severity (see [*Status & exit codes*](#status--exit-codes)):
 
-- **Weak signature algorithm** — the certificate or a chain certificate is signed with SHA-1 or MD5
-- **Incomplete chain** — the certificate's issuer was not found in the presented chain
-- **Invalid chain order** — the chain is not in issuer order (each certificate should be followed by the one that issued it)
-- **Hostname mismatch** — the certificate is not valid for the hostname you checked (no matching SAN, with wildcard support, or Common Name)
-- **Invalid chain signature** — a presented certificate is not validly signed by the issuer found for it in the chain (forged or corrupted certificate)
-- **Expiring intermediate** — an intermediate certificate in the chain has expired or expires within 30 days
-- **Weak protocol** (`--scan`) — the server still supports an obsolete (SSLv3) or deprecated (TLS 1.0/1.1) protocol version
-- **Weak cipher** (`--scan`) — the server accepts a weak cipher suite (RC4, DES/3DES, NULL, EXPORT, anonymous, ...)
-- **Not in CT log** (`--ct-check`) — the presented certificate was not found in any public Certificate Transparency log
+- **Hostname mismatch** (Critical) — the certificate is not valid for the hostname you checked (no matching SAN, with wildcard support, or Common Name)
+- **Untrusted** (Warning) — the chain does not build to a system root (see *Trust Validation*)
+- **Weak signature algorithm** (Warning) — the certificate or a chain certificate is signed with SHA-1 or MD5
+- **Incomplete chain** (Warning) — the certificate's issuer was not found in the presented chain
+- **Invalid chain order** (Warning) — the chain is not in issuer order (each certificate should be followed by the one that issued it)
+- **Invalid chain signature** (Warning) — a presented certificate is not validly signed by the issuer found for it in the chain (forged or corrupted certificate); caps the grade at C
+- **Expiring intermediate** (Warning) — an intermediate certificate in the chain has expired or expires within 30 days
+- **Weak protocol** (Warning, `--scan`) — the server still supports an obsolete (SSLv3) or deprecated (TLS 1.0/1.1) protocol version
+- **Weak cipher** (Warning, `--scan`) — the server accepts a weak cipher suite (RC4, DES/3DES, NULL, EXPORT, anonymous, ...)
+- **Misissuance** (Warning) — the leaf deviates from issuance best practice (see *Certificate Metadata*)
+- **Not in CT log** (Info, `--ct-check`) — the presented certificate was not found in any public Certificate Transparency log
 
-A hostname mismatch, an invalid chain signature, support for an obsolete protocol (SSLv3/TLS 1.0), or acceptance of a weak cipher each cap the TLS grade at C, the same as a self-signed certificate.
+A hostname mismatch, an untrusted chain, an invalid chain signature, support for an obsolete protocol (SSLv3/TLS 1.0), or acceptance of a weak cipher (scanned or negotiated) each cap the TLS grade at C, the same as a self-signed certificate.
 
 ### Troubleshooting Connection Issues
 
@@ -403,7 +529,7 @@ hosts = [
 
 # Optional settings
 output = "summary"
-exit_code = 1
+fail_on = "critical"   # or "warning", "never"
 check_revocation = true
 grade = false
 min_validity = 30

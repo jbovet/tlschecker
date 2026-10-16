@@ -6,6 +6,10 @@
 //! an explicit `-o`/config `output` bypasses this entirely (see
 //! `use_dashboard` in `main.rs`), so scripts keep the classic formatters.
 //!
+//! Every verdict on screen comes from `tlschecker::verdict::assess` under the
+//! run's [`VerdictPolicy`] (see `App::verdict_of`) — the same status the CLI
+//! formatters, Prometheus and the exit code read.
+//!
 //! While the dashboard owns the terminal, tracing output is discarded via the
 //! `TUI_ACTIVE` flag so log lines cannot corrupt the alternate screen.
 //! `ratatui::init` installs a panic hook that restores the terminal, so even a
@@ -18,6 +22,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use tlschecker::verdict::VerdictPolicy;
 
 use crate::HostOutcome;
 use state::{App, OnDemand, OnDemandJob, OnDemandResult, Screen};
@@ -89,11 +94,14 @@ fn spawn_on_demand(job: OnDemandJob, tx: Sender<(usize, OnDemandResult)>) {
 /// stream in over `rx`.
 ///
 /// Returns the outcomes in input order; hosts still pending when the user
-/// quits remain `None` (the caller treats those as "not checked", not as
-/// failures).
+/// quits remain `None` (the caller counts those as "not finished", not as
+/// failures). Verdicts are computed under `policy` on every frame, so a
+/// revocation or CT result fetched on demand (`r` / `c`) is reflected at once
+/// and, being kept in the returned outcomes, counts toward the exit status.
 pub fn run(
     labels: &[String],
     rx: Receiver<(usize, HostOutcome)>,
+    policy: VerdictPolicy,
 ) -> std::io::Result<Vec<Option<HostOutcome>>> {
     let mut terminal = ratatui::init();
     // Worker panics are caught and rendered as failed rows (`spawn_checks`),
@@ -105,7 +113,7 @@ pub fn run(
             ratatui_hook(info);
         }
     }));
-    let mut app = App::new(labels);
+    let mut app = App::with_policy(labels, policy);
     let mut channel_open = true;
     // Results of checks started from the dashboard (`r` / `c`).
     let (check_tx, check_rx) = std::sync::mpsc::channel::<(usize, OnDemandResult)>();
