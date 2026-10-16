@@ -6,8 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-One status for every frontend (#205) and meaningful exit codes (#206). See the
-README's *Status & exit codes* section for the full rules.
+One status for every frontend (#205), meaningful exit codes (#206) and a
+versioned JSON schema (#208). See the README's *Status & exit codes* and *JSON
+output* sections for the full rules.
 
 ### Breaking
 
@@ -45,6 +46,25 @@ README's *Status & exit codes* section for the full rules.
    `example.com:8443` instead of `example.com`. Hosts on 443 keep their series.
    Before, two ports of one host shared a grouping key and each push replaced
    the other's series.
+9. **New JSON schema (#208).** `-o json` prints
+   `{"schema_version": 1, "results": [...]}` instead of a bare array of the
+   library's `TLS` structs:
+   - Hosts that could not be checked are listed (`"outcome": "error"` with an
+     `error` object) instead of being missing from the output.
+   - Missing values are `null`, never the string `"None"`; every key is always
+     present.
+   - Dates are RFC 3339 (`not_before` / `not_after`) with the Unix seconds
+     alongside, also for each `chain` entry.
+   - Fields are grouped and renamed, e.g. `certificate.validity_days` →
+     `certificate.days_remaining`, `certificate.issued` → `certificate.issuer`,
+     `cipher.name` / `cipher.version` → `connection.cipher` /
+     `connection.protocol`, `cert_ver` "2" → `version` 3, `cert_sha256` →
+     `fingerprints.sha256`, `revocation_status` / `revocation_detail` →
+     `revocation.status` / `revocation.detail`, `ct_detail` → `ct.detail`.
+   - `security_warnings` is gone: every warning is a finding in `status`, with
+     its code and severity.
+   From schema version 1 on, changes are additive; anything else bumps
+   `schema_version`.
 
 ### Added
 
@@ -53,17 +73,19 @@ README's *Status & exit codes* section for the full rules.
   `allowed`, but no longer affects the status or the exit code.
 - `--allow-unreachable` to tolerate hosts that cannot be reached, as long as at
   least one host was checked.
-- A `status` object in each JSON element: `{"verdict": "critical",
-  "findings": [{"code", "severity", "allowed", "message"}]}`. Additive: the
-  output still deserializes as `Vec<TLS>`.
+- A `status` object in each JSON result: `{"verdict": "critical",
+  "findings": [{"code", "severity", "allowed", "message"}]}`.
 - A `Status:` line and a "Findings" block in text output; a "Findings" footer
   in the summary table.
 - The `tlschecker_verdict` Prometheus gauge (0 healthy, 1 warning, 2 critical).
 - A stderr explanation of every non-zero exit, naming the findings, the counts
   and the flag that changes the outcome.
 - The exit-status table in `--help`.
-- A `port` field in each JSON element and a `Port:` line in text output.
+- `port`, `target` and `input` in each JSON result and a `Port:` line in text
+  output.
 - The `tlschecker::verdict` library module and `SecurityWarning::message()`.
+- `tlschecker::rfc3339_from_unix`, and `valid_from_unix` / `valid_to_unix` on
+  `Chain`.
 
 ### Fixed
 
@@ -72,6 +94,7 @@ README's *Status & exit codes* section for the full rules.
 - #206: a run where every host was unreachable exited 0.
 - #207: checking several ports of one host printed identical `host` labels in
   the summary table and findings; they now read `host:port`.
+- #208: JSON silently dropped hosts that could not be checked.
 - Config errors now print the actual error, not only the usage hints.
 - `--fail-on-error` alone used to do nothing (it needed `--exit-code`).
 - `--exit-code 256` silently exited 0.
@@ -90,6 +113,11 @@ README's *Status & exit codes* section for the full rules.
 | check by IP without IP SANs | `--allow hostname-mismatch` or check by name |
 | short-lived certs with a fixed SLO | `--min-validity` |
 | export chains from broken hosts | `--export-pem --fail-on never` |
+| `jq '.[]'` | `jq '.results[]'` (and `select(.outcome == "checked")` to skip failed hosts) |
+| `.certificate.validity_days` / `.certificate.issued` | `.certificate.days_remaining` / `.certificate.issuer` |
+| `.cipher.name` / `.cipher.version` | `.connection.cipher` / `.connection.protocol` |
+| `.certificate.cert_sha256` | `.certificate.fingerprints.sha256` |
+| `.certificate.security_warnings` | `.status.findings` |
 
 ## [2.0.2] - 2026-09-29
 

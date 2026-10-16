@@ -7,13 +7,13 @@ use std::thread;
 use std::time::Duration;
 mod config;
 mod exit;
+mod json;
 mod metrics;
 mod tui;
 
 use clap::{Parser, ValueEnum};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
-use serde::Serialize;
 
 use tlschecker::verdict::{Assessment, Finding, FindingCode, Verdict, VerdictPolicy};
 use tlschecker::RevocationStatus;
@@ -277,21 +277,34 @@ impl std::str::FromStr for OutFormat {
 /// One checked host as every non-interactive output sees it: the check
 /// result plus its status under the run's [`VerdictPolicy`].
 ///
-/// Serializes as a `port` field, the [`TLS`] fields and a `status` object, so
-/// JSON stays an array that still deserializes as `Vec<TLS>`.
-#[derive(Serialize)]
+/// JSON output does not serialize this type directly: it goes through the
+/// versioned schema in [`json`], so internal changes cannot reshape it.
 pub(crate) struct HostReport {
+    /// Position of the host in the input list.
+    pub index: usize,
     /// The host exactly as the user supplied it.
-    #[serde(skip)]
     pub label: String,
     /// The port that was checked (443 when the input named none). `TLS` only
     /// carries the hostname, so without it two ports of one host are
     /// indistinguishable in every output.
     pub port: u16,
-    #[serde(flatten)]
     pub tls: TLS,
     /// Assessed once, when the report is built (see [`collect`]).
     pub status: Assessment,
+}
+
+/// A host that could not be checked at all (DNS, connection, handshake,
+/// invalid address, …). Text and summary report these on stderr; JSON lists
+/// them as `"outcome": "error"` entries.
+pub(crate) struct HostFailure {
+    /// Position of the host in the input list.
+    pub index: usize,
+    /// The host exactly as the user supplied it.
+    pub label: String,
+    /// Failure class (see [`error_kind`]).
+    pub kind: &'static str,
+    /// Full error message.
+    pub detail: String,
 }
 
 impl HostReport {
@@ -334,6 +347,13 @@ trait Formatter {
     ///
     /// A formatted string ready for display.
     fn format(&self, reports: &[HostReport]) -> String;
+
+    /// Formats a whole run: the checked hosts plus the ones that could not be
+    /// checked. Only JSON lists failures (text and summary leave them to
+    /// stderr), so by default this is [`Formatter::format`].
+    fn format_run(&self, reports: &[HostReport], _failures: &[HostFailure]) -> String {
+        self.format(reports)
+    }
 }
 
 /// Returns the display label and message for a security warning.
@@ -899,7 +919,11 @@ impl Formatter for SummaryFormat {
 /// Implement Formatter trait for JsonFormat
 impl Formatter for JsonFormat {
     fn format(&self, reports: &[HostReport]) -> String {
-        serde_json::to_string_pretty(reports).expect("Failed to format certificates as JSON")
+        json::render(reports, &[])
+    }
+
+    fn format_run(&self, reports: &[HostReport], failures: &[HostFailure]) -> String {
+        json::render(reports, failures)
     }
 }
 /// Factory for creating formatter instances.
@@ -1458,7 +1482,7 @@ fn run(cli: Args) -> Result<RunStatus> {
         slots
     };
 
-    let (reports, tally) = collect(slots, &labels, &policy);
+    let (reports, failures, tally) = collect(slots, &labels, &policy);
 
     if cli.export_pem {
         // Print the presented certificate chain(s) as PEM instead of a report.
@@ -1468,7 +1492,7 @@ fn run(cli: Args) -> Result<RunStatus> {
     } else if !dashboard {
         // The dashboard already presented the results interactively.
         let formatter = FormatterFactory::new_formatter(&final_config.output);
-        print!("{}", formatter.format(&reports));
+        print!("{}", formatter.format_run(&reports, &failures));
     }
 
     if final_config.prometheus {
@@ -1498,8 +1522,9 @@ fn collect(
     slots: Vec<Option<HostOutcome>>,
     labels: &[String],
     policy: &VerdictPolicy,
-) -> (Vec<HostReport>, RunTally) {
+) -> (Vec<HostReport>, Vec<HostFailure>, RunTally) {
     let mut reports = Vec::with_capacity(slots.len());
+    let mut failures = Vec::new();
     let mut tally = RunTally::default();
     for (index, slot) in slots.into_iter().enumerate() {
         match slot {
@@ -1521,19 +1546,32 @@ fn collect(
                     .and_then(|hp| hp.port)
                     .unwrap_or(DEFAULT_TLS_PORT);
                 reports.push(HostReport {
+                    index,
                     label,
                     port,
                     tls: *tls,
                     status,
                 });
             }
-            // Errors were already reported by the frontend that observed them.
-            Some(HostOutcome::Failed { kind, .. }) if kind == KIND_INVALID => tally.invalid += 1,
-            Some(HostOutcome::Failed { .. }) => tally.unreachable += 1,
+            // Errors were already reported by the frontend that observed them;
+            // kept here for the JSON output.
+            Some(HostOutcome::Failed { kind, detail }) => {
+                if kind == KIND_INVALID {
+                    tally.invalid += 1;
+                } else {
+                    tally.unreachable += 1;
+                }
+                failures.push(HostFailure {
+                    index,
+                    label: labels.get(index).cloned().unwrap_or_default(),
+                    kind,
+                    detail,
+                });
+            }
             None => tally.pending += 1,
         }
     }
-    (reports, tally)
+    (reports, failures, tally)
 }
 
 /// Loads and merges configuration from multiple sources.
@@ -2287,6 +2325,8 @@ pub(crate) mod tests {
                     issuer: "Test CA Root".to_string(),
                     valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
                     valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                    valid_from_unix: 1_735_689_600,
+                    valid_to_unix: 1_798_761_599,
                     signature_algorithm: "sha256WithRSAEncryption".to_string(),
                 }]),
                 revocation_status: RevocationStatus::NotChecked,
@@ -2347,11 +2387,16 @@ pub(crate) mod tests {
     fn test_json_format_output() {
         let tls = vec![make_test_tls()];
         let output = JsonFormat.format(&reports(tls));
-        assert!(output.contains("test.example.com"));
-        assert!(output.contains("TLS_AES_256_GCM_SHA384"));
-        assert!(output.contains("\"bits\": 256"));
-        // grade should be absent when None (skip_serializing_if)
-        assert!(!output.contains("\"grade\""));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(v["schema_version"], json::SCHEMA_VERSION);
+        let r = &v["results"][0];
+        assert_eq!(r["outcome"], "checked");
+        assert_eq!(r["host"], "test.example.com");
+        assert_eq!(r["connection"]["cipher"], "TLS_AES_256_GCM_SHA384");
+        assert_eq!(r["connection"]["cipher_bits"], 256);
+        // Every key is present; what does not apply is null.
+        assert!(r["grade"].is_null() && r.get("grade").is_some());
+        assert!(r["error"].is_null());
     }
 
     #[test]
@@ -2363,9 +2408,80 @@ pub(crate) mod tests {
             categories: vec![],
         });
         let output = JsonFormat.format(&reports(vec![tls_entry]));
-        assert!(output.contains("\"grade\""));
-        assert!(output.contains("\"A+\""));
-        assert!(output.contains("97"));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(v["results"][0]["grade"]["grade"], "A+");
+        assert_eq!(v["results"][0]["grade"]["score"], 97);
+    }
+
+    // ── #208: schema v1 details ───────────────────────────────────────
+
+    #[test]
+    fn test_json_lists_failed_hosts_in_input_order() {
+        let labels = vec![
+            "ok.example".to_string(),
+            "down.example:8443".to_string(),
+            "bad:99999".to_string(),
+        ];
+        let slots = vec![
+            Some(HostOutcome::Checked(Box::new(make_test_tls()))),
+            Some(HostOutcome::Failed {
+                kind: "DNS",
+                detail: "failed to lookup address information".to_string(),
+            }),
+            Some(HostOutcome::Failed {
+                kind: KIND_INVALID,
+                detail: "Invalid port '99999'".to_string(),
+            }),
+        ];
+        let (reports, failures, _) = collect(slots, &labels, &VerdictPolicy::default());
+        let output = JsonFormat.format_run(&reports, &failures);
+        let r = &serde_json::from_str::<serde_json::Value>(&output).unwrap()["results"];
+
+        assert_eq!(r.as_array().unwrap().len(), 3);
+        assert_eq!(r[0]["outcome"], "checked");
+
+        assert_eq!(r[1]["outcome"], "error");
+        assert_eq!(r[1]["error"]["kind"], "dns");
+        assert_eq!(r[1]["target"], "down.example:8443");
+        assert_eq!(r[1]["port"], 8443);
+        for key in ["status", "connection", "certificate"] {
+            assert!(r[1][key].is_null(), "{key}");
+        }
+
+        // An invalid address has no host, port or target.
+        assert_eq!(r[2]["error"]["kind"], "invalid");
+        assert_eq!(r[2]["input"], "bad:99999");
+        assert!(r[2]["host"].is_null() && r[2]["port"].is_null() && r[2]["target"].is_null());
+    }
+
+    #[test]
+    fn test_json_uses_null_not_none_strings() {
+        // The library stores a missing name attribute as the literal "None".
+        let mut tls = make_test_tls();
+        tls.certificate.subject.locality = "None".to_string();
+        tls.certificate.issued.organization = "None".to_string();
+        let output = JsonFormat.format(&reports(vec![tls]));
+        assert!(!output.contains("\"None\""), "{output}");
+        let cert = &serde_json::from_str::<serde_json::Value>(&output).unwrap()["results"][0]
+            ["certificate"];
+        assert!(cert["subject"]["locality"].is_null());
+        assert!(cert["issuer"]["organization"].is_null());
+        assert_eq!(cert["subject"]["common_name"], "test.example.com");
+    }
+
+    #[test]
+    fn test_json_timestamps_and_version() {
+        let output = JsonFormat.format(&reports(vec![make_test_tls()]));
+        let cert = &serde_json::from_str::<serde_json::Value>(&output).unwrap()["results"][0]
+            ["certificate"];
+        assert_eq!(cert["not_before"], "2025-01-01T00:00:00Z");
+        assert_eq!(cert["not_before_unix"], 1_735_689_600);
+        assert_eq!(cert["chain"][0]["not_after"], "2026-12-31T23:59:59Z");
+        // cert_ver "2" is X.509 v3.
+        assert_eq!(cert["version"], 3);
+        assert_eq!(cert["days_remaining"], 365);
+        assert_eq!(cert["revocation"]["status"], "not_checked");
+        assert_eq!(cert["trust"]["status"], "unknown");
     }
 
     // ── #207: two ports of one host must never share a label ──────────
@@ -2442,19 +2558,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_json_includes_port_and_still_deserializes() {
+    fn test_json_distinguishes_ports_of_one_host() {
         let output = JsonFormat.format(&two_port_reports());
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed[0]["port"], 8443);
-        assert_eq!(parsed[1]["port"], 9443);
-        // Additive: the array is still a valid `Vec<TLS>`.
-        assert!(serde_json::from_str::<Vec<TLS>>(&output).is_ok());
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let r = &v["results"];
+        assert_eq!((&r[0]["port"], &r[1]["port"]), (&8443.into(), &9443.into()));
+        assert_eq!(r[0]["target"], "test.example.com:8443");
+        assert_eq!(r[1]["target"], "test.example.com:9443");
+        assert_eq!(r[1]["input"], "https://test.example.com:9443");
     }
 
     #[test]
     fn test_json_format_empty_input() {
-        let output = JsonFormat.format(&[]);
-        assert_eq!(output, "[]");
+        let v: serde_json::Value = serde_json::from_str(&JsonFormat.format(&[])).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"schema_version": json::SCHEMA_VERSION, "results": []})
+        );
     }
 
     #[test]
@@ -2596,17 +2716,20 @@ pub(crate) mod tests {
             }],
         });
         let output = JsonFormat.format(&reports(vec![tls_entry]));
-        assert!(output.contains("\"scan\""));
-        assert!(output.contains("TLSv1.2"));
-        // fingerprints serialize; pem is skipped.
-        assert!(output.contains("cert_sha256"));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let protocol = &v["results"][0]["scan"]["protocols"][0];
+        assert_eq!(protocol["version"], "TLSv1.2");
+        assert_eq!(protocol["ciphers"][0], "ECDHE-RSA-AES256-GCM-SHA384");
+        // fingerprints serialize; pem is never part of the JSON.
+        assert!(v["results"][0]["certificate"]["fingerprints"]["sha256"].is_string());
         assert!(!output.contains("\"pem\""));
     }
 
     #[test]
-    fn test_json_format_omits_scan_when_absent() {
+    fn test_json_format_scan_is_null_when_absent() {
         let output = JsonFormat.format(&reports(vec![make_test_tls()]));
-        assert!(!output.contains("\"scan\""));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(v["results"][0]["scan"].is_null());
     }
 
     #[test]
@@ -3024,7 +3147,7 @@ pub(crate) mod tests {
             None,
             Some(HostOutcome::Checked(Box::new(mismatch_tls()))),
         ];
-        let (reports, tally) = collect(slots, &labels, &VerdictPolicy::default());
+        let (reports, _, tally) = collect(slots, &labels, &VerdictPolicy::default());
         assert_eq!(
             tally,
             RunTally {
@@ -3050,7 +3173,7 @@ pub(crate) mod tests {
             kind: "internal",
             detail: "panic".to_string(),
         })];
-        let (_, tally) = collect(slots, &["a".to_string()], &VerdictPolicy::default());
+        let (_, _, tally) = collect(slots, &["a".to_string()], &VerdictPolicy::default());
         assert_eq!((tally.unreachable, tally.invalid), (1, 0));
     }
 
@@ -3062,7 +3185,7 @@ pub(crate) mod tests {
         for (index, outcome) in spawn_checks_with(host_jobs(hosts), test_check_options(), check) {
             slots[index] = Some(outcome);
         }
-        let (_, tally) = collect(slots, &labels, &VerdictPolicy::default());
+        let (_, _, tally) = collect(slots, &labels, &VerdictPolicy::default());
         exit::exit_status(&tally, gate)
     }
 
@@ -3173,17 +3296,11 @@ pub(crate) mod tests {
     fn test_json_format_includes_status() {
         let output = JsonFormat.format(&reports(vec![mismatch_tls()]));
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();
-        let status = &value[0]["status"];
+        let status = &value["results"][0]["status"];
         assert_eq!(status["verdict"], "critical");
         assert_eq!(status["findings"][0]["code"], "hostname-mismatch");
         assert_eq!(status["findings"][0]["severity"], "critical");
         assert_eq!(status["findings"][0]["allowed"], false);
-        // Additive: the TLS fields stay at the top level of each element...
-        assert_eq!(value[0]["certificate"]["hostname"], "test.example.com");
-        // ...so the output still deserializes as v2's `Vec<TLS>`.
-        let parsed: Vec<TLS> = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].certificate.hostname, "test.example.com");
     }
 
     // ── Integration test (network-dependent) ─────────────────────────
