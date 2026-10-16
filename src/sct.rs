@@ -133,7 +133,12 @@ fn parse_one_sct(b: &[u8]) -> Option<Sct> {
 /// Formats milliseconds-since-epoch as an ISO 8601 UTC string, without pulling
 /// in a date/time dependency.
 fn format_timestamp_ms(ms: u64) -> String {
-    let secs = (ms / 1000) as i64;
+    format_unix_secs((ms / 1000) as i64)
+}
+
+/// Formats seconds-since-epoch as an RFC 3339 / ISO 8601 UTC string
+/// (`2024-01-05T12:00:00Z`). Negative values are dates before 1970.
+pub(crate) fn format_unix_secs(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);

@@ -425,6 +425,7 @@ mod tests {
 
     fn mismatch_report() -> HostReport {
         HostReport {
+            index: 0,
             label: "wrong.example".to_string(),
             port: 443,
             tls: crate::tests::make_test_tls(),

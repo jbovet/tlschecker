@@ -1385,7 +1385,7 @@ mod tests {
             assert_eq!(verdict, expected, "{name}: assess");
 
             // Summary table.
-            let (reports, tally) = crate::collect(
+            let (reports, _, tally) = crate::collect(
                 vec![Some(HostOutcome::Checked(Box::new(tls.clone())))],
                 std::slice::from_ref(&label),
                 policy,
@@ -1401,7 +1401,7 @@ mod tests {
             let json: serde_json::Value =
                 serde_json::from_str(&JsonFormat.format(&reports)).unwrap();
             assert_eq!(
-                json[0]["status"]["verdict"],
+                json["results"][0]["status"]["verdict"],
                 verdict.label().to_lowercase(),
                 "{name}: json"
             );

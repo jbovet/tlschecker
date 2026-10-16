@@ -269,7 +269,10 @@ fn test_unreachable_host_exits_3() {
 
     let output = check(&[&refused]);
     assert_exit(&output, 3);
-    assert_eq!(stdout(&output).trim(), "[]");
+    // The host is listed as an error entry, not dropped.
+    let json: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(json["results"][0]["outcome"], "error");
+    assert_eq!(json["results"][0]["error"]["kind"], "connection");
     assert!(stderr(&output).contains("no host could be checked"));
 
     // Nothing was checked, so neither control turns this into success.

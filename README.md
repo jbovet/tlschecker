@@ -274,6 +274,88 @@ The severity table is part of the public contract: raising a severity, or
 adding a Critical finding, is a breaking change; lowering a severity, or adding
 a Warning or Info finding, is a minor change.
 
+### JSON output
+
+`-o json` prints one document with a schema version and one entry per host,
+in input order — including hosts that could not be checked:
+
+```json
+{
+  "schema_version": 1,
+  "results": [
+    {
+      "input": "example.com:8443",
+      "target": "example.com:8443",
+      "host": "example.com",
+      "port": 8443,
+      "outcome": "checked",
+      "error": null,
+      "status": { "verdict": "warning", "findings": [
+        { "code": "untrusted", "severity": "warning", "allowed": false,
+          "message": "Certificate chain is not trusted: self-signed certificate" } ] },
+      "connection": { "protocol": "TLSv1.3", "cipher": "TLS_AES_256_GCM_SHA384",
+                      "cipher_bits": 256, "alpn": null },
+      "certificate": {
+        "subject": { "common_name": "example.com", "organization": null, "...": "..." },
+        "issuer": { "common_name": "Example CA", "organization": null, "country": null },
+        "not_before": "2026-10-15T19:19:49Z", "not_after": "2027-05-03T19:19:49Z",
+        "not_before_unix": 1792091989, "not_after_unix": 1809371989,
+        "days_remaining": 199, "hours_remaining": 4794, "expired": false,
+        "serial": "0B:C9:…", "version": 3, "signature_algorithm": "sha256WithRSAEncryption",
+        "key": { "algorithm": "RSA", "bits": 2048 },
+        "fingerprints": { "sha256": "FB:F0:…", "sha1": "2F:97:…" },
+        "sans": ["example.com"],
+        "trust": { "status": "untrusted", "reason": "self-signed certificate" },
+        "revocation": { "status": "not_checked", "reason": null, "detail": null },
+        "urls": { "ocsp": [], "ca_issuers": [], "crl": [] },
+        "chain": [ { "subject": "example.com", "issuer": "Example CA",
+                     "not_before": "…", "not_after": "…", "…": "…" } ],
+        "…": "…"
+      },
+      "grade": null,
+      "scan": null,
+      "ct": null
+    },
+    {
+      "input": "down.example.com",
+      "target": "down.example.com",
+      "host": "down.example.com",
+      "port": 443,
+      "outcome": "error",
+      "error": { "kind": "dns", "message": "failed to lookup address information: …" },
+      "status": null, "connection": null, "certificate": null,
+      "grade": null, "scan": null, "ct": null
+    }
+  ]
+}
+```
+
+- **Every key is always present.** A value that does not apply is `null`, never
+  the string `"None"`; `grade`, `scan` and `ct` are `null` unless `--grade`,
+  `--scan` or `--ct-check` produced them.
+- **`outcome`** is `checked` or `error`. An error entry carries
+  `error.kind` (`dns`, `connection`, `handshake`, `certificate`, `invalid`,
+  `internal` or `error`) and a `message`; an invalid address has `null` `host`, `port`
+  and `target`.
+- **`target`** is how every output names the host: `host` on 443, `host:port`
+  otherwise. `input` is exactly what you typed.
+- **`status`** is the same verdict and findings the summary, dashboard,
+  Prometheus and exit code use (see *Status & exit codes*).
+- **Timestamps** are RFC 3339 UTC strings with the Unix seconds alongside;
+  `chain` lists every certificate the server presented, leaf first.
+- **Stability:** from `schema_version` 1 on, changes are additive (new keys).
+  Renaming, removing or retyping a key bumps the version.
+
+```sh
+# Hosts whose certificate expires within 30 days
+tlschecker -o json --fail-on never $(cat hosts.txt) \
+  | jq -r '.results[] | select(.certificate.days_remaining < 30) | .target'
+
+# Hosts that could not be checked, with the reason
+tlschecker -o json --fail-on never --allow-unreachable $(cat hosts.txt) \
+  | jq -r '.results[] | select(.outcome == "error") | "\(.input): \(.error.message)"'
+```
+
 ## Examples
 
 Basic usage:
@@ -294,7 +376,7 @@ You can specify the port in three ways:
 
 ### Trust Validation
 
-TLSChecker verifies that the presented certificate chain builds to a trusted root in your operating system's trust store — the same authoritative check a browser performs. This runs automatically for every host (it is offline and adds no latency) and is reported as a `Trust:` line and, in JSON, a `trust` field:
+TLSChecker verifies that the presented certificate chain builds to a trusted root in your operating system's trust store — the same authoritative check a browser performs. This runs automatically for every host (it is offline and adds no latency) and is reported as a `Trust:` line and, in JSON, as `certificate.trust` (`status` + `reason`):
 
 - **Trusted**: the chain builds to a system root CA
 - **Untrusted (reason)**: the chain does not verify — the reason is the underlying error, e.g. `self-signed certificate`, `unable to get local issuer certificate`, or `certificate has expired`
@@ -342,7 +424,7 @@ When you enable revocation checking, TLSChecker will:
 The revocation status is shown the same way in every output (summary, text, and the dashboard):
 - **Not revoked**: confirmed by OCSP or CRL
 - **Revoked**: the certificate has been revoked, with how or when when available, e.g. `Revoked (via CRL)`
-- **Unknown**: the status could not be determined. The reason — each OCSP responder and CRL distribution point that failed — is shown in `text` output, in JSON as `revocation_detail`, and in the dashboard's *Not verified* block
+- **Unknown**: the status could not be determined. The reason — each OCSP responder and CRL distribution point that failed — is shown in `text` output, in JSON as `certificate.revocation.detail`, and in the dashboard's *Not verified* block
 - **Not checked**: revocation was not requested (the default without the flag; in the dashboard, press `r` to check the selected host)
 
 Example with a revoked certificate:
@@ -475,7 +557,7 @@ This performs a network request to an external service (crt.sh), so it is opt-in
 
 - **Logged** — the exact certificate was found in CT. The `text`/`json` output include a direct `crt.sh` link; the summary table shows `✓`.
 - **Not logged** — crt.sh has no record of the certificate *and* it carries no embedded SCTs, so absence from CT is plausible. Reported as an informational `NOT IN CT LOG` finding (see below) and shown as `✗` in the summary. A publicly-trusted certificate that is not logged will be rejected by modern browsers.
-- **Unknown** — crt.sh was unreachable or rate-limited, or it has no record of a certificate that carries embedded SCTs (crt.sh is an aggregator and misses some certificates the logs do include), so the status could not be determined (`?` in the summary). This is kept distinct from "not logged" so an outage is never mistaken for a problem. The reason — together with any embedded-SCT evidence — is logged to **stderr** (stdout stays clean for `… -o json | jq`), kept in JSON as `ct_detail`, and shown in `text` output and the dashboard.
+- **Unknown** — crt.sh was unreachable or rate-limited, or it has no record of a certificate that carries embedded SCTs (crt.sh is an aggregator and misses some certificates the logs do include), so the status could not be determined (`?` in the summary). This is kept distinct from "not logged" so an outage is never mistaken for a problem. The reason — together with any embedded-SCT evidence — is logged to **stderr** (stdout stays clean for `… -o json | jq`), kept in JSON as `ct.detail`, and shown in `text` output and the dashboard.
 
 When `--ct-check` is used, the summary table gains a `CT` column (`✓`/`✗`/`?`); without it the column is hidden. Being absent from CT does **not** affect the status or the grade — many legitimate internal/private certificates are intentionally absent from public CT logs, so what that means is left to you rather than the grade.
 

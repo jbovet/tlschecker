@@ -34,6 +34,20 @@ pub mod probe;
 pub mod sct;
 pub mod verdict;
 
+/// Formats a Unix timestamp (seconds) as an RFC 3339 UTC string, e.g.
+/// `2026-10-25T19:19:58Z`, without a date/time dependency. Pairs with the
+/// `*_unix` fields of [`CertificateInfo`] and [`Chain`].
+///
+/// # Example
+///
+/// ```
+/// assert_eq!(tlschecker::rfc3339_from_unix(0), "1970-01-01T00:00:00Z");
+/// assert_eq!(tlschecker::rfc3339_from_unix(1_700_000_000), "2023-11-14T22:13:20Z");
+/// ```
+pub fn rfc3339_from_unix(secs: i64) -> String {
+    sct::format_unix_secs(secs)
+}
+
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -170,6 +184,13 @@ pub struct Chain {
     pub valid_from: String,
     /// Certificate expiration date
     pub valid_to: String,
+    /// Validity start as a Unix timestamp (seconds; 0 if it could not be
+    /// computed)
+    #[serde(default)]
+    pub valid_from_unix: i64,
+    /// Expiration as a Unix timestamp (seconds; 0 if it could not be computed)
+    #[serde(default)]
+    pub valid_to_unix: i64,
     /// Signature algorithm used by the certificate
     pub signature_algorithm: String,
 }
@@ -1691,6 +1712,8 @@ impl TLS {
                 subject: from_entries(chain.subject_name().entries_by_nid(Nid::COMMONNAME)),
                 valid_to: chain.not_after().to_string(),
                 valid_from: chain.not_before().to_string(),
+                valid_from_unix: asn1_time_to_unix(chain.not_before()),
+                valid_to_unix: asn1_time_to_unix(chain.not_after()),
                 issuer: from_entries(chain.issuer_name().entries_by_nid(Nid::COMMONNAME)),
                 signature_algorithm: chain.signature_algorithm().object().to_string(),
             })
@@ -2672,6 +2695,8 @@ mod tests {
                     issuer: "Test CA Root".to_string(),
                     valid_from: "Jan  1 00:00:00 2025 GMT".to_string(),
                     valid_to: "Dec 31 23:59:59 2026 GMT".to_string(),
+                    valid_from_unix: 1_735_689_600,
+                    valid_to_unix: 1_798_761_599,
                     signature_algorithm: "sha256WithRSAEncryption".to_string(),
                 }]),
                 revocation_status: RevocationStatus::NotChecked,
