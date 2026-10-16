@@ -129,10 +129,11 @@ pub enum SecurityWarning {
     HostnameMismatch(String),
     /// An intermediate certificate in the chain has expired or is expiring soon
     ExpiringIntermediate(String),
-    /// The server supports an obsolete or deprecated TLS protocol version
-    /// (discovered via `--scan`)
+    /// An obsolete or deprecated TLS protocol version: negotiated on the
+    /// connection, or (with `--scan`) supported by the server
     WeakProtocol(String),
-    /// The server accepts a weak cipher suite (discovered via `--scan`)
+    /// A weak cipher suite: negotiated on the connection, or (with `--scan`)
+    /// accepted by the server
     WeakCipher(String),
     /// The presented certificate was not found in any public Certificate
     /// Transparency log (discovered via `--ct-check`)
@@ -913,6 +914,38 @@ fn scan_accepts_weak_cipher(scan: &probe::TlsScan) -> bool {
     scan.protocols
         .iter()
         .any(|p| p.supported && p.ciphers.iter().any(|c| is_weak_cipher(c)))
+}
+
+/// Derives security warnings from the connection that was actually
+/// negotiated: an obsolete (SSLv2/SSLv3) or deprecated (TLS 1.0/1.1) protocol
+/// version, or a weak cipher suite ([`is_weak_cipher`]).
+///
+/// Runs on every check, unlike [`analyze_scan`], which reports what the server
+/// *supports* and needs `--scan`. Without it, a host reachable only through
+/// the legacy-protocol retry was graded D but had no finding, so its status
+/// read Healthy (#217). The grade is unaffected: `build_grading_input` already
+/// caps on the negotiated protocol and cipher and does not read these
+/// warnings.
+fn analyze_negotiated(cipher: &Cipher) -> Vec<SecurityWarning> {
+    let mut warnings = Vec::new();
+    match cipher.version.as_str() {
+        "SSLv2" | "SSLv3" => warnings.push(SecurityWarning::WeakProtocol(format!(
+            "Connection negotiated obsolete protocol {} (known to be insecure)",
+            cipher.version
+        ))),
+        "TLSv1" | "TLSv1.1" => warnings.push(SecurityWarning::WeakProtocol(format!(
+            "Connection negotiated deprecated protocol {}",
+            cipher.version
+        ))),
+        _ => {}
+    }
+    if is_weak_cipher(&cipher.name) {
+        warnings.push(SecurityWarning::WeakCipher(format!(
+            "Connection negotiated weak cipher {}",
+            cipher.name
+        )));
+    }
+    warnings
 }
 
 /// Derives security warnings from protocol/cipher enumeration results.
@@ -1744,6 +1777,7 @@ impl TLS {
         let cert_chain: Vec<openssl::x509::X509> =
             peer_cert_chain.iter().map(|cert| cert.to_owned()).collect();
         let mut security_warnings = analyze_certificate_chain(&x509_ref, &cert_chain);
+        security_warnings.extend(analyze_negotiated(&cipher));
 
         // Check that the certificate is actually valid for the host we connected to.
         if !cert_matches_hostname(host, &x509_ref) {
@@ -4387,6 +4421,52 @@ mod tests {
         assert!(!super::is_weak_cipher("ECDHE-RSA-AES256-GCM-SHA384"));
         assert!(!super::is_weak_cipher("AES128-GCM-SHA256"));
         assert!(!super::is_weak_cipher("TLS_AES_256_GCM_SHA384"));
+    }
+
+    // ── #217: weaknesses of the negotiated connection ───────────────
+
+    fn negotiated_cipher(version: &str, name: &str) -> super::Cipher {
+        super::Cipher {
+            name: name.to_string(),
+            version: version.to_string(),
+            bits: 128,
+            alpn: None,
+        }
+    }
+
+    #[test]
+    fn test_analyze_negotiated_flags_old_protocols() {
+        for version in ["SSLv3", "TLSv1", "TLSv1.1"] {
+            let w = super::analyze_negotiated(&negotiated_cipher(version, "AES128-SHA"));
+            assert!(
+                matches!(&w[..], [super::SecurityWarning::WeakProtocol(m)] if m.contains(version)),
+                "{version}: {w:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_analyze_negotiated_modern_connection_is_clean() {
+        for (version, name) in [
+            ("TLSv1.2", "ECDHE-RSA-AES128-GCM-SHA256"),
+            ("TLSv1.3", "TLS_AES_256_GCM_SHA384"),
+        ] {
+            assert!(super::analyze_negotiated(&negotiated_cipher(version, name)).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_analyze_negotiated_flags_weak_cipher() {
+        for name in ["RC4-SHA", "DES-CBC3-SHA"] {
+            let w = super::analyze_negotiated(&negotiated_cipher("TLSv1.2", name));
+            assert!(
+                matches!(&w[..], [super::SecurityWarning::WeakCipher(m)] if m.contains(name)),
+                "{name}: {w:?}"
+            );
+        }
+        // Both at once: one warning each.
+        let w = super::analyze_negotiated(&negotiated_cipher("TLSv1", "RC4-MD5"));
+        assert_eq!(w.len(), 2, "{w:?}");
     }
 
     #[test]

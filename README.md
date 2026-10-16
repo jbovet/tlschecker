@@ -196,8 +196,8 @@ there are none):
 | Chain not in issuer order | `invalid-chain-order` | Warning | `INVALID CHAIN ORDER` | yes |
 | SHA-1 / MD5 signature | `weak-signature` | Warning | `WEAK ALGORITHM` | yes |
 | Intermediate expired or expiring | `expiring-intermediate` | Warning | `EXPIRING INTERMEDIATE` | yes |
-| Obsolete protocol supported (`--scan`) | `weak-protocol` | Warning | `WEAK PROTOCOL` | yes |
-| Weak cipher accepted (`--scan`) | `weak-cipher` | Warning | `WEAK CIPHER` | yes |
+| Obsolete protocol negotiated, or supported (`--scan`) | `weak-protocol` | Warning | `WEAK PROTOCOL` | yes |
+| Weak cipher negotiated, or accepted (`--scan`) | `weak-cipher` | Warning | `WEAK CIPHER` | yes |
 | Issuance best-practice violation | `misissuance` | Warning | `MISISSUANCE` | yes |
 | Not in public CT logs (`--ct-check`) | `not-in-ct` | Info | `NOT IN CT LOG` | yes |
 
@@ -572,8 +572,8 @@ In addition to revocation and grading, tlschecker surfaces certificate problems 
 - **Invalid chain order** (Warning) — the chain is not in issuer order (each certificate should be followed by the one that issued it)
 - **Invalid chain signature** (Warning) — a presented certificate is not validly signed by the issuer found for it in the chain (forged or corrupted certificate); caps the grade at C
 - **Expiring intermediate** (Warning) — an intermediate certificate in the chain has expired or expires within 30 days
-- **Weak protocol** (Warning, `--scan`) — the server still supports an obsolete (SSLv3) or deprecated (TLS 1.0/1.1) protocol version
-- **Weak cipher** (Warning, `--scan`) — the server accepts a weak cipher suite (RC4, DES/3DES, NULL, EXPORT, anonymous, ...)
+- **Weak protocol** (Warning) — the connection negotiated an obsolete (SSLv3) or deprecated (TLS 1.0/1.1) protocol version, or, with `--scan`, the server still supports one
+- **Weak cipher** (Warning) — the connection negotiated a weak cipher suite (RC4, DES/3DES, NULL, EXPORT, anonymous, ...), or, with `--scan`, the server accepts one
 - **Misissuance** (Warning) — the leaf deviates from issuance best practice (see *Certificate Metadata*)
 - **Not in CT log** (Info, `--ct-check`) — the presented certificate was not found in any public Certificate Transparency log
 
