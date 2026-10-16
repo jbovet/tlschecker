@@ -426,6 +426,7 @@ mod tests {
     fn mismatch_report() -> HostReport {
         HostReport {
             label: "wrong.example".to_string(),
+            port: 443,
             tls: crate::tests::make_test_tls(),
             status: Assessment {
                 verdict: Verdict::Critical,

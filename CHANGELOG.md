@@ -41,6 +41,10 @@ README's *Status & exit codes* section for the full rules.
    opt out.
 7. **`--export-pem` follows the same exit rules.** Extraction scripts need
    `--fail-on never`.
+8. **Prometheus `instance` includes the port when it is not 443** (#207):
+   `example.com:8443` instead of `example.com`. Hosts on 443 keep their series.
+   Before, two ports of one host shared a grouping key and each push replaced
+   the other's series.
 
 ### Added
 
@@ -58,6 +62,7 @@ README's *Status & exit codes* section for the full rules.
 - A stderr explanation of every non-zero exit, naming the findings, the counts
   and the flag that changes the outcome.
 - The exit-status table in `--help`.
+- A `port` field in each JSON element and a `Port:` line in text output.
 - The `tlschecker::verdict` library module and `SecurityWarning::message()`.
 
 ### Fixed
@@ -65,6 +70,8 @@ README's *Status & exit codes* section for the full rules.
 - #205: the summary table, dashboard and exit code disagreed about the same
   host.
 - #206: a run where every host was unreachable exited 0.
+- #207: checking several ports of one host printed identical `host` labels in
+  the summary table and findings; they now read `host:port`.
 - Config errors now print the actual error, not only the usage hints.
 - `--fail-on-error` alone used to do nothing (it needed `--exit-code`).
 - `--exit-code 256` silently exited 0.

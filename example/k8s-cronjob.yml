@@ -113,7 +113,7 @@ spec:
 # Pattern 3: scheduled check that PUSHES metrics to a Prometheus Pushgateway
 # instead of signalling via exit code. Alert in Prometheus on the pushed gauges
 # (e.g. tlschecker_verdict == 2). Each host is pushed under
-# instance="<host>" and joined to labels via tlschecker_certificate_info.
+# instance="<host>" (or "<host>:<port>" off 443) and joined to labels via tlschecker_certificate_info.
 # --fail-on never: the metrics carry the certificate signal; the Job still fails
 # (exit 3) when hosts cannot be checked, e.g. broken egress. Replace the gateway
 # address with your own.
