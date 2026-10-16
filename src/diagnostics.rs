@@ -135,7 +135,9 @@ where
 /// (an OpenSSL error stack or an OS error) is one of the common ones.
 ///
 /// Matching is on lowercase substrings, most specific first. `None` means the
-/// raw error is shown as is.
+/// raw error is shown as is. Windows words its socket errors differently and
+/// in the system's language, so they are also matched by their WSA code
+/// (`os error 10061`), which every locale shares.
 pub(crate) fn failure_hint(detail: &str) -> Option<&'static str> {
     const HINTS: &[(&[&str], &str)] = &[
         (
@@ -170,9 +172,12 @@ pub(crate) fn failure_hint(detail: &str) -> Option<&'static str> {
             &["unexpected eof", "unexpected end of file"],
             "the server closed the connection during the TLS handshake",
         ),
-        (&["connection reset"], "the server reset the connection"),
         (
-            &["connection refused"],
+            &["connection reset", "forcibly closed", "os error 10054"],
+            "the server reset the connection",
+        ),
+        (
+            &["connection refused", "actively refused", "os error 10061"],
             "connection refused (nothing is listening on that port)",
         ),
         (
@@ -180,6 +185,8 @@ pub(crate) fn failure_hint(detail: &str) -> Option<&'static str> {
                 "timed out",
                 "would block",
                 "resource temporarily unavailable",
+                "did not properly respond",
+                "os error 10060",
             ],
             "timed out (raise --connect-timeout for slow links)",
         ),
@@ -190,15 +197,24 @@ pub(crate) fn failure_hint(detail: &str) -> Option<&'static str> {
                 "no address associated",
                 "nodename nor servname",
                 "temporary failure in name resolution",
+                "no such host is known",
+                "os error 11001",
+                "os error 11002",
+                "os error 11004",
             ],
             "DNS lookup failed: the host name does not resolve",
         ),
         (
-            &["address family not supported"],
+            &["address family not supported", "os error 10047"],
             "address family not supported (an IPv6 address on an IPv4-only network?)",
         ),
         (
-            &["network is unreachable", "no route to host"],
+            &[
+                "network is unreachable",
+                "no route to host",
+                "os error 10051",
+                "os error 10065",
+            ],
             "network unreachable (no route to the host)",
         ),
     ];
@@ -292,6 +308,38 @@ mod tests {
             (
                 "Connection error: Address family not supported by protocol (os error 97)",
                 "IPv6",
+            ),
+            // Windows, as Rust prints its socket errors.
+            (
+                "Connection error: No connection could be made because the target machine \
+                 actively refused it. (os error 10061)",
+                "connection refused",
+            ),
+            (
+                "Connection error: No such host is known. (os error 11001)",
+                "DNS lookup failed",
+            ),
+            (
+                "Connection error: A connection attempt failed because the connected party did \
+                 not properly respond after a period of time, or established connection failed \
+                 because connected host has failed to respond. (os error 10060)",
+                "timed out",
+            ),
+            (
+                "TLS Handshake error: An existing connection was forcibly closed by the remote \
+                 host. (os error 10054)",
+                "reset the connection",
+            ),
+            (
+                "Connection error: A socket operation was attempted to an unreachable network. \
+                 (os error 10051)",
+                "network unreachable",
+            ),
+            // A non-English Windows: only the code is recognizable.
+            (
+                "Connection error: No se puede establecer una conexión ya que el equipo de \
+                 destino denegó expresamente dicha conexión. (os error 10061)",
+                "connection refused",
             ),
         ];
         for (detail, expected) in cases {
