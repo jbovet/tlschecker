@@ -115,6 +115,10 @@ output* sections for the full rules.
   certificate required, …); the raw error is shown with `-v`.
 - Running `tlschecker` with no arguments (and no `tlschecker.toml` in the
   current directory) prints the help instead of an error. The "no hosts" error is one line.
+- **README first screen rewritten** (#213): what tlschecker does in one
+  sentence, the dashboard demo, and a quick start (install → check → JSON →
+  CI gate) with real output. "Experimental" is gone from the README, the crate
+  description and `--help`.
 - **Slimmer summary table** (#214): `Host | Days left | Issuer | Protocol |
   Revocation | Status` (+ Grade / CT). The Expired and Self-Signed columns are
   gone — the Status column and the Findings section say both, with the reason

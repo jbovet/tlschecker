@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`tlschecker` is an experimental TLS/SSL certificate checker. It connects to remote hosts, inspects the X.509 certificates they present, and reports expiry, chain, revocation status, and a configuration grade. It ships as **both a library and a binary from one package** (`[[bin]]` + `lib.rs`).
+`tlschecker` is a TLS/SSL certificate checker. It connects to remote hosts, inspects the X.509 certificates they present, and reports expiry, chain, revocation status, and a configuration grade. It ships as **both a library and a binary from one package** (`[[bin]]` + `lib.rs`).
 
 ## Commands
 

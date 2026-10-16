@@ -1,43 +1,22 @@
-# TLSChecker
+# tlschecker
 
-Experimental TLS/SSL certificate command-line checker
+Check the TLS certificates of every host you run, in one command: expiry,
+revocation (OCSP and CRL), hostname and chain trust. Each host gets one status,
+and the run one exit code your CI can gate on. A single binary for Linux, macOS
+and Windows.
 
-[![codecov](https://codecov.io/gh/jbovet/tlschecker/branch/main/graph/badge.svg?token=MN4EE3WYQ6)](https://codecov.io/gh/jbovet/tlschecker)
+[![CI](https://github.com/jbovet/tlschecker/actions/workflows/minimal.yml/badge.svg?branch=main)](https://github.com/jbovet/tlschecker/actions/workflows/minimal.yml)
+[![Release](https://img.shields.io/github/v/release/jbovet/tlschecker)](https://github.com/jbovet/tlschecker/releases/latest)
+[![Docker](https://img.shields.io/docker/v/josebovet/tlschecker?label=docker&sort=semver)](https://hub.docker.com/r/josebovet/tlschecker)
+[![License](https://img.shields.io/github/license/jbovet/tlschecker)](LICENSE)
+<!-- crates.io badge: add once the crate is published (#21). -->
 
-## Docker run
+![The dashboard checking six hosts, then opening one certificate in the explorer](img/demo.gif)
 
-[DockerHub](https://hub.docker.com/repository/docker/josebovet/tlschecker)
+## Quick start
 
-Build the image locally:
-
-```sh
-docker build -t tlschecker:local .
-```
-
-Run the CLI from the container:
-
-```sh
-docker run --rm tlschecker:local example.com
-```
-
-For the interactive TUI, run the container with a pseudo-TTY and stdin attached:
-
-```sh
-docker run --rm -it tlschecker:local example.com
-```
-
-The TUI is only used when stdout is an interactive terminal. In non-interactive environments (pipelines, redirected output, CI), the container falls back to the classic text output.
-
-The published image runs natively on amd64 and arm64 (Apple Silicon included):
-
-```sh
-docker run --rm josebovet/tlschecker example.com
-```
-
-## Install
-
-One line per channel; every release archive has a `.sha256` next to it on the
-[releases page](https://github.com/jbovet/tlschecker/releases).
+**1. Install** — one line per channel; every release archive has a `.sha256`
+next to it on the [releases page](https://github.com/jbovet/tlschecker/releases).
 
 ```sh
 # Homebrew (macOS, Linux) — also installs bash/zsh/fish completions
@@ -58,11 +37,90 @@ cargo install --locked --git https://github.com/jbovet/tlschecker
 Invoke-WebRequest https://github.com/jbovet/tlschecker/releases/latest/download/tlschecker-windows-x86_64.zip -OutFile tlschecker.zip; Expand-Archive tlschecker.zip .
 ```
 
-## How to use
+**2. Check your hosts.** `tlschecker example.com` opens the dashboard above in
+a terminal. Piped, or with `--no-dashboard`, it prints a summary, the findings
+behind each status, and why the run failed:
+
+```console
+$ tlschecker --no-dashboard shop.example.com api.example.com legacy.example.com old.example.com
+┌────────────────────┬───────────┬─────────────┬──────────┬─────────────┬──────────┐
+│ Host               ┆ Days left ┆ Issuer      ┆ Protocol ┆ Revocation  ┆ Status   │
+╞════════════════════╪═══════════╪═════════════╪══════════╪═════════════╪══════════╡
+│ shop.example.com   ┆     62    ┆ Example CA  ┆ TLSv1.3  ┆ Not checked ┆  Healthy │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┤
+│ api.example.com    ┆     8     ┆ Example CA  ┆ TLSv1.3  ┆ Not checked ┆ Critical │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┤
+│ legacy.example.com ┆    264    ┆ Internal CA ┆ TLSv1.3  ┆ Not checked ┆  Warning │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┤
+│ old.example.com    ┆     -5    ┆ Example CA  ┆ TLSv1.3  ┆ Not checked ┆ Critical │
+└────────────────────┴───────────┴─────────────┴──────────┴─────────────┴──────────┘
+
+Findings:
+
+  Host: api.example.com (Critical)
+    [critical] EXPIRES SOON: 8 days left (below 15 days)
+
+  Host: legacy.example.com (Warning)
+    [warning] UNTRUSTED: Certificate chain is not trusted: unable to get local issuer certificate
+
+  Host: old.example.com (Critical)
+    [critical] EXPIRED: Certificate expired on Oct 11 12:39:02 2026 GMT
+    [warning] UNTRUSTED: Certificate chain is not trusted: certificate has expired
+error: api.example.com: Critical - EXPIRES SOON: 8 days left (below 15 days)
+error: old.example.com: Critical - EXPIRED: Certificate expired on Oct 11 12:39:02 2026 GMT
+error: 4 host(s): 2 critical, 1 warning, 1 healthy, 0 not checked -> exit 1 (certificate problem at --fail-on critical; report only: --fail-on never; accept one finding: --allow <finding>)
+```
+
+Add `--check-revocation` to ask each CA over OCSP (CRL as the fallback),
+`--hosts-file hosts.txt` or `-` (stdin) for long lists, and `--grade`, `--scan`
+or `--ct-check` for more (see [How to use](#how-to-use)).
+
+**3. Script it.** `-o json` prints one versioned document, every host included
+— see [JSON output](#json-output):
+
+```console
+$ tlschecker -o json --fail-on never shop.example.com api.example.com legacy.example.com old.example.com \
+    | jq -c '.results[] | {target, verdict: .status.verdict, days: .certificate.days_remaining}'
+{"target":"shop.example.com","verdict":"healthy","days":62}
+{"target":"api.example.com","verdict":"critical","days":8}
+{"target":"legacy.example.com","verdict":"warning","days":264}
+{"target":"old.example.com","verdict":"critical","days":-5}
+```
+
+**4. Gate CI.** The exit code is the answer: `0` all good, `1` a certificate
+problem (Critical by default, `--fail-on warning` for stricter), `2` a usage
+error, `3` a host that could not be checked — see
+[Status & exit codes](#status--exit-codes). A daily check in GitHub Actions:
+
+```yaml
+on:
+  schedule: [{ cron: "0 6 * * *" }]
+jobs:
+  certificates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: curl -fsSL https://github.com/jbovet/tlschecker/releases/latest/download/tlschecker-linux-x86_64.tar.gz | tar -xz
+      - run: ./tlschecker --check-revocation --hosts-file hosts.txt
+```
+
+## Docker
+
+The published image [`josebovet/tlschecker`](https://hub.docker.com/r/josebovet/tlschecker)
+runs natively on amd64 and arm64 (Apple Silicon included):
 
 ```sh
-➜  tlschecker --help
+docker run --rm josebovet/tlschecker example.com        # summary table
+docker run --rm -it josebovet/tlschecker example.com    # interactive dashboard
 ```
+
+The dashboard needs a terminal, so it only opens with `-it`; without it the
+container prints the summary, as in pipelines and CI. To build the image
+yourself: `docker build -t tlschecker:local .`
+
+## How to use
+
+`tlschecker --help` lists every flag, with the exit codes at the end.
 
 Hosts can be given as arguments, read from a file, or piped in — one or more
 per line, with blank lines and `#` comments ignored:
@@ -366,12 +424,6 @@ tlschecker -o json --fail-on never --allow-unreachable --hosts-file hosts.txt \
 ```
 
 ## Examples
-
-Basic usage:
-```sh
-➜ tlschecker --check-revocation x.com revoked.badssl.com jpbd.dev expired.badssl.com 
-```
-![](/img/1-2.png)
 
 Using custom ports:
 ```sh
