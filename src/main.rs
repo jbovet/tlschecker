@@ -58,9 +58,15 @@ Exit status:
 struct Args {
     /// Hosts to check: host, host:port or a URL, e.g. example.com
     /// example.com:8443 https://example.com:9443. A written port is always
-    /// used; without one, 443 is checked (also for http:// URLs).
+    /// used; without one, 443 is checked (also for http:// URLs). `-` reads
+    /// the list from stdin (see --hosts-file).
     #[clap(value_parser)]
     addresses: Vec<String>,
+
+    /// Read hosts from a file (`-` for stdin), in addition to any given as
+    /// arguments: whitespace-separated, blank lines and `#` comments ignored.
+    #[arg(long, value_name = "PATH")]
+    hosts_file: Option<String>,
 
     /// Path to a TOML configuration file
     #[arg(short, long)]
@@ -71,8 +77,17 @@ struct Args {
     generate_config: bool,
 
     /// Output format for certificate results
-    #[arg(short, value_enum)]
+    #[arg(short, long, value_enum)]
     output: Option<OutFormat>,
+
+    /// Summary table: also show the cipher suite and the hours left.
+    #[arg(long)]
+    wide: bool,
+
+    /// Print a shell completion script to stdout and exit, e.g.
+    /// `tlschecker --completions bash > /etc/bash_completion.d/tlschecker`.
+    #[arg(long, value_name = "SHELL")]
+    completions: Option<clap_complete::Shell>,
 
     /// Show more on stderr: -v adds info (e.g. the raw error behind a hint),
     /// -vv debug. RUST_LOG, when set, overrides it.
@@ -246,10 +261,9 @@ fn parse_allowed_finding(s: &str) -> Result<FindingCode, String> {
 ///
 /// # Summary Format Columns
 ///
-/// The summary table includes:
-/// - Host, Cipher Suite, Protocol, Issuer
-/// - Expired, Self-Signed, Revocation Status
-/// - Days/Hours before expiration, Overall Status (Healthy/Warning/Critical)
+/// The summary table includes Host, Days left, Issuer, Protocol, Revocation
+/// and Status (Healthy/Warning/Critical), plus Grade / CT when they ran;
+/// `--wide` adds Hours left and Cipher Suite.
 ///
 /// # Status
 ///
@@ -494,9 +508,23 @@ struct JsonFormat;
 
 /// Summary formatter - outputs a colored table of certificate information.
 ///
-/// Displays certificate data in a tabular format with color-coded health indicators,
-/// making it easy to quickly assess the status of multiple certificates.
-struct SummaryFormat;
+/// One row per host — `Host | Days left | Issuer | Protocol | Revocation |
+/// Status`, plus Grade / CT when they ran — then a "Findings" section. `wide`
+/// (`--wide`) adds the cipher suite and the hours left; everything else is in
+/// text and JSON output.
+#[derive(Default)]
+struct SummaryFormat {
+    wide: bool,
+}
+
+/// The issuer to show in one cell: its organization, else its common name
+/// (many private and test CAs set only a CN), else `-`.
+fn issuer_name(issuer: &tlschecker::Issuer) -> &str {
+    [&issuer.organization, &issuer.common_name]
+        .into_iter()
+        .find(|v| !v.is_empty() && v.as_str() != "None")
+        .map_or("-", String::as_str)
+}
 
 impl Formatter for TextFormat {
     fn format(&self, reports: &[HostReport]) -> String {
@@ -765,18 +793,17 @@ impl Formatter for SummaryFormat {
 
         let mut output = String::new();
         let mut table = Table::new();
-        let mut header = vec![
-            "Host",
-            "Cipher Suite",
-            "Protocol",
-            "Issuer",
-            "Expired",
-            "Self-Signed",
-            "Revocation",
-            "Days before expired",
-            "Hours before expired",
-            "Status",
-        ];
+        // Expired / self-signed are not columns: the Status column and the
+        // Findings section below say both, with the reason.
+        let mut header = vec!["Host", "Days left"];
+        if self.wide {
+            header.push("Hours left");
+        }
+        header.extend(["Issuer", "Protocol"]);
+        if self.wide {
+            header.push("Cipher Suite");
+        }
+        header.extend(["Revocation", "Status"]);
         if show_grade {
             header.push("Grade");
         }
@@ -797,17 +824,6 @@ impl Formatter for SummaryFormat {
             let rs = &report.tls;
             let status_cell = verdict_cell(report.status.verdict);
 
-            let expired_cell = match rs.certificate.is_expired {
-                true => Cell::new("Yes")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Red)
-                    .set_alignment(CellAlignment::Center),
-                false => Cell::new("No")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Green)
-                    .set_alignment(CellAlignment::Center),
-            };
-
             // The table has no room for the detail; text/JSON carry it.
             let revocation = revocation_label(&rs.certificate);
             let revocation_cell = Cell::new(revocation.text)
@@ -820,37 +836,36 @@ impl Formatter for SummaryFormat {
                 })
                 .set_alignment(CellAlignment::Center);
 
-            let self_signed_cell = match rs.certificate.is_self_signed {
-                true => Cell::new("Yes")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Yellow)
-                    .set_alignment(CellAlignment::Center),
-                false => Cell::new("No")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Green)
-                    .set_alignment(CellAlignment::Center),
-            };
-
             let mut row = vec![
                 Cell::new(report.target())
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Green),
-                Cell::new(&rs.cipher.name)
+                Cell::new(rs.certificate.validity_days).set_alignment(CellAlignment::Center),
+            ];
+            if self.wide {
+                row.push(
+                    Cell::new(rs.certificate.validity_hours).set_alignment(CellAlignment::Center),
+                );
+            }
+            row.push(
+                Cell::new(issuer_name(&rs.certificate.issued))
                     .add_attribute(Attribute::Bold)
-                    .fg(Color::Green),
+                    .fg(Color::Blue),
+            );
+            row.push(
                 Cell::new(&rs.cipher.version)
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Green),
-                Cell::new(&rs.certificate.issued.organization)
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Blue),
-                expired_cell,
-                self_signed_cell,
-                revocation_cell,
-                Cell::new(rs.certificate.validity_days).set_alignment(CellAlignment::Center),
-                Cell::new(rs.certificate.validity_hours).set_alignment(CellAlignment::Center),
-                status_cell,
-            ];
+            );
+            if self.wide {
+                row.push(
+                    Cell::new(&rs.cipher.name)
+                        .add_attribute(Attribute::Bold)
+                        .fg(Color::Green),
+                );
+            }
+            row.push(revocation_cell);
+            row.push(status_cell);
 
             if show_grade {
                 let grade_cell = match &rs.grade {
@@ -958,11 +973,11 @@ impl FormatterFactory {
     /// # Returns
     ///
     /// A boxed trait object implementing the `Formatter` trait.
-    fn new_formatter(s: &OutFormat) -> Box<dyn Formatter> {
+    fn new_formatter(s: &OutFormat, wide: bool) -> Box<dyn Formatter> {
         match s {
             OutFormat::Json => Box::new(JsonFormat {}),
             OutFormat::Text => Box::new(TextFormat {}),
-            OutFormat::Summary => Box::new(SummaryFormat {}),
+            OutFormat::Summary => Box::new(SummaryFormat { wide }),
         }
     }
 }
@@ -1389,6 +1404,17 @@ fn main() -> std::process::ExitCode {
 /// check runs; an `Err` is a failure after the run started (e.g. a dashboard
 /// terminal error), which `main` reports as [`RunStatus::Internal`].
 fn run(cli: Args) -> Result<RunStatus> {
+    if let Some(shell) = cli.completions {
+        use clap::CommandFactory;
+        clap_complete::generate(
+            shell,
+            &mut Args::command(),
+            "tlschecker",
+            &mut std::io::stdout(),
+        );
+        return Ok(RunStatus::Ok);
+    }
+
     // Handle config generation
     if cli.generate_config {
         println!("# TLSChecker Configuration File");
@@ -1531,7 +1557,7 @@ fn run(cli: Args) -> Result<RunStatus> {
         }
     } else if !dashboard {
         // The dashboard already presented the results interactively.
-        let formatter = FormatterFactory::new_formatter(&final_config.output);
+        let formatter = FormatterFactory::new_formatter(&final_config.output, cli.wide);
         print!("{}", formatter.format_run(&reports, &failures));
     }
 
@@ -1614,6 +1640,57 @@ fn collect(
     (reports, failures, tally)
 }
 
+/// Hosts named on the command line: the positional addresses, where `-` is
+/// replaced by the list read from stdin, followed by those in `--hosts-file`
+/// (`-` is stdin there too). Stdin is read at most once.
+fn cli_hosts(addresses: &[String], hosts_file: Option<&str>) -> Result<Vec<String>, ConfigError> {
+    let mut stdin_hosts: Option<Vec<String>> = None;
+    let mut read_stdin = || -> Result<Vec<String>, ConfigError> {
+        if stdin_hosts.is_none() {
+            let text = std::io::read_to_string(std::io::stdin())
+                .map_err(|e| ConfigError::Io(format!("cannot read hosts from stdin: {e}")))?;
+            stdin_hosts = Some(parse_host_list(&text));
+            Ok(stdin_hosts.clone().unwrap_or_default())
+        } else {
+            Ok(Vec::new())
+        }
+    };
+
+    let mut hosts = Vec::new();
+    for address in addresses {
+        if address == "-" {
+            hosts.extend(read_stdin()?);
+        } else {
+            hosts.push(address.clone());
+        }
+    }
+    match hosts_file {
+        Some("-") => hosts.extend(read_stdin()?),
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| ConfigError::Io(format!("cannot read hosts file '{path}': {e}")))?;
+            hosts.extend(parse_host_list(&text));
+        }
+        None => {}
+    }
+    Ok(hosts)
+}
+
+/// Parses a host list: whitespace-separated hosts; blank lines and comments
+/// (`#` at the start of a line or after whitespace) are ignored.
+fn parse_host_list(text: &str) -> Vec<String> {
+    text.lines()
+        .flat_map(|line| {
+            let end = line
+                .char_indices()
+                .find(|&(i, c)| c == '#' && (i == 0 || line[..i].ends_with(char::is_whitespace)))
+                .map_or(line.len(), |(i, _)| i);
+            line[..end].split_whitespace()
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// Loads and merges configuration from multiple sources.
 ///
 /// Configuration is loaded and merged in priority order:
@@ -1659,11 +1736,8 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
     }
 
     // Merge with CLI arguments (CLI takes precedence)
-    let cli_addresses = if !cli.addresses.is_empty() {
-        Some(cli.addresses.clone())
-    } else {
-        None
-    };
+    let hosts = cli_hosts(&cli.addresses, cli.hosts_file.as_deref())?;
+    let cli_addresses = (!hosts.is_empty()).then_some(hosts);
 
     // Boolean flags are only forwarded when actually passed on the command
     // line: an absent flag must stay `None` so it does not override a value
@@ -2384,9 +2458,9 @@ pub(crate) mod tests {
     #[test]
     fn test_formatter_factory_creates_all_types() {
         // Verify factory produces formatters without panicking
-        let _json = FormatterFactory::new_formatter(&OutFormat::Json);
-        let _text = FormatterFactory::new_formatter(&OutFormat::Text);
-        let _summary = FormatterFactory::new_formatter(&OutFormat::Summary);
+        let _json = FormatterFactory::new_formatter(&OutFormat::Json, false);
+        let _text = FormatterFactory::new_formatter(&OutFormat::Text, false);
+        let _summary = FormatterFactory::new_formatter(&OutFormat::Summary, true);
     }
 
     // ── Formatter output tests ───────────────────────────────────────
@@ -2659,7 +2733,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_summary_distinguishes_ports_of_one_host() {
-        let output = SummaryFormat.format(&two_port_reports());
+        let output = SummaryFormat::default().format(&two_port_reports());
         assert!(output.contains("test.example.com:8443"), "{output}");
         assert!(output.contains("test.example.com:9443"), "{output}");
         // Findings headers too, each with its own verdict.
@@ -2675,7 +2749,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_summary_omits_default_port() {
-        let output = SummaryFormat.format(&reports(vec![make_test_tls()]));
+        let output = SummaryFormat::default().format(&reports(vec![make_test_tls()]));
         assert!(output.contains("test.example.com"));
         assert!(!output.contains("test.example.com:443"));
     }
@@ -2709,7 +2783,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_summary_format_empty_input_returns_empty() {
-        let output = SummaryFormat.format(&[]);
+        let output = SummaryFormat::default().format(&[]);
         assert!(output.is_empty());
     }
 
@@ -2737,12 +2811,117 @@ pub(crate) mod tests {
     #[test]
     fn test_summary_format_contains_host_data() {
         let tls = vec![make_test_tls()];
-        let output = SummaryFormat.format(&reports(tls));
+        let output = SummaryFormat::default().format(&reports(tls));
         assert!(output.contains("test.example.com"));
-        assert!(output.contains("TLS_AES_256_GCM_SHA384"));
         assert!(output.contains("TLSv1.3"));
         assert!(output.contains("Test CA"));
         assert!(output.contains("Healthy"));
+        // The cipher suite is a --wide column.
+        assert!(!output.contains("TLS_AES_256_GCM_SHA384"));
+    }
+
+    // ── #214: slimmer summary, --wide, issuer fallback ───────────────
+
+    /// The header row's cell texts, in order.
+    fn summary_header(output: &str) -> Vec<String> {
+        output
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split(['│', '┆'])
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn test_summary_default_columns() {
+        let output = SummaryFormat::default().format(&reports(vec![make_test_tls()]));
+        assert_eq!(
+            summary_header(&output),
+            [
+                "Host",
+                "Days left",
+                "Issuer",
+                "Protocol",
+                "Revocation",
+                "Status"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_summary_wide_adds_cipher_and_hours() {
+        let output = SummaryFormat { wide: true }.format(&reports(vec![make_test_tls()]));
+        assert_eq!(
+            summary_header(&output),
+            [
+                "Host",
+                "Days left",
+                "Hours left",
+                "Issuer",
+                "Protocol",
+                "Cipher Suite",
+                "Revocation",
+                "Status"
+            ]
+        );
+        assert!(output.contains("TLS_AES_256_GCM_SHA384"));
+        assert!(output.contains("8760"));
+    }
+
+    #[test]
+    fn test_issuer_name_falls_back_to_common_name() {
+        let issuer = |org: &str, cn: &str| tlschecker::Issuer {
+            country_or_region: "None".to_string(),
+            organization: org.to_string(),
+            common_name: cn.to_string(),
+        };
+        assert_eq!(issuer_name(&issuer("Let's Encrypt", "R3")), "Let's Encrypt");
+        assert_eq!(
+            issuer_name(&issuer("None", "Private Root CA")),
+            "Private Root CA"
+        );
+        assert_eq!(
+            issuer_name(&issuer("", "Private Root CA")),
+            "Private Root CA"
+        );
+        assert_eq!(issuer_name(&issuer("None", "None")), "-");
+    }
+
+    // ── #214: host lists ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_host_list() {
+        let text = "# production\nexample.com\n\n  api.example.com:8443   # API\n\
+                    a.example b.example\n#disabled.example\nhttps://c.example/#frag\n";
+        assert_eq!(
+            parse_host_list(text),
+            [
+                "example.com",
+                "api.example.com:8443",
+                "a.example",
+                "b.example",
+                // `#` inside a word is not a comment.
+                "https://c.example/#frag",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cli_hosts_appends_hosts_file() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"b.example\n# skip\nc.example:8443\n").unwrap();
+        let path = file.path().to_str().unwrap();
+        let hosts = cli_hosts(&["a.example".to_string()], Some(path)).unwrap();
+        assert_eq!(hosts, ["a.example", "b.example", "c.example:8443"]);
+    }
+
+    #[test]
+    fn test_cli_hosts_missing_file_is_an_io_error() {
+        let err = cli_hosts(&[], Some("/nonexistent/hosts.txt")).unwrap_err();
+        assert!(matches!(err, ConfigError::Io(ref m) if m.contains("/nonexistent/hosts.txt")));
     }
 
     #[test]
@@ -2885,7 +3064,7 @@ pub(crate) mod tests {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.is_expired = true;
         tls_entry.certificate.validity_days = -10;
-        let output = SummaryFormat.format(&reports(vec![tls_entry]));
+        let output = SummaryFormat::default().format(&reports(vec![tls_entry]));
         assert!(output.contains("Critical"));
     }
 
@@ -2893,7 +3072,7 @@ pub(crate) mod tests {
     fn test_summary_format_warning_threshold() {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.validity_days = 20;
-        let output = SummaryFormat.format(&reports(vec![tls_entry]));
+        let output = SummaryFormat::default().format(&reports(vec![tls_entry]));
         assert!(output.contains("Warning"));
     }
 
@@ -2901,7 +3080,7 @@ pub(crate) mod tests {
     fn test_summary_format_critical_threshold() {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.validity_days = 10;
-        let output = SummaryFormat.format(&reports(vec![tls_entry]));
+        let output = SummaryFormat::default().format(&reports(vec![tls_entry]));
         assert!(output.contains("Critical"));
     }
 
@@ -2910,7 +3089,7 @@ pub(crate) mod tests {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.revocation_status =
             RevocationStatus::Revoked("Key compromise".to_string());
-        let output = SummaryFormat.format(&reports(vec![tls_entry]));
+        let output = SummaryFormat::default().format(&reports(vec![tls_entry]));
         assert!(output.contains("Revoked"));
         // 365 days left, but revoked: the status must not read Healthy.
         assert!(output.contains("Critical"));
@@ -2922,8 +3101,10 @@ pub(crate) mod tests {
     fn test_summary_format_self_signed() {
         let mut tls_entry = make_test_tls();
         tls_entry.certificate.is_self_signed = true;
-        let output = SummaryFormat.format(&reports(vec![tls_entry]));
-        assert!(output.contains("Yes")); // self-signed = Yes
+        let output = SummaryFormat::default().format(&reports(vec![tls_entry]));
+        // No Self-Signed column: the status and the findings say it.
+        assert!(output.contains("Warning"));
+        assert!(output.contains("[warning] SELF-SIGNED"));
     }
 
     #[test]
@@ -2934,7 +3115,7 @@ pub(crate) mod tests {
             score: 0,
             categories: vec![],
         });
-        let output = SummaryFormat.format(&reports(vec![tls_entry]));
+        let output = SummaryFormat::default().format(&reports(vec![tls_entry]));
         assert!(output.contains("F"));
         // When a grade is present, the Grade column header is shown.
         assert!(output.contains("Grade"));
@@ -2944,7 +3125,7 @@ pub(crate) mod tests {
     fn test_summary_format_hides_grade_column_when_no_grade() {
         // Default (ungraded) run: the Grade column should be omitted entirely
         // rather than rendered as a column of "-".
-        let output = SummaryFormat.format(&reports(vec![make_test_tls()])); // grade: None
+        let output = SummaryFormat::default().format(&reports(vec![make_test_tls()])); // grade: None
         assert!(
             !output.contains("Grade"),
             "Grade column should be hidden when no result has a grade"
@@ -2962,7 +3143,7 @@ pub(crate) mod tests {
             score: 98,
             categories: vec![],
         });
-        let output = SummaryFormat.format(&reports(vec![ungraded, graded]));
+        let output = SummaryFormat::default().format(&reports(vec![ungraded, graded]));
         assert!(output.contains("Grade"));
         assert!(output.contains("A+"));
     }
@@ -2974,7 +3155,7 @@ pub(crate) mod tests {
             vec![tlschecker::SecurityWarning::WeakSignatureAlgorithm(
                 "SHA1 detected".to_string(),
             )];
-        let output = SummaryFormat.format(&reports(vec![tls_entry]));
+        let output = SummaryFormat::default().format(&reports(vec![tls_entry]));
         assert!(output.contains("Findings:"));
         assert!(output.contains("Host: test.example.com (Warning)"));
         assert!(output.contains("[warning] WEAK ALGORITHM: SHA1 detected"));
@@ -3034,7 +3215,7 @@ pub(crate) mod tests {
         assert!(TextFormat
             .format(&reports(vec![good.clone()]))
             .contains("Revocation Status: Not revoked"));
-        let summary = SummaryFormat.format(&reports(vec![good]));
+        let summary = SummaryFormat::default().format(&reports(vec![good]));
         // "Valid" read as "the certificate is valid"; Good only means "not revoked".
         assert!(summary.contains("Not revoked"));
         assert!(!summary.contains("Valid"));
@@ -3048,7 +3229,7 @@ pub(crate) mod tests {
         let text = TextFormat.format(&reports(vec![tls_entry.clone()]));
         assert!(text.contains("NOT IN CT LOG"));
         assert!(text.contains("Logged: no"));
-        let summary = SummaryFormat.format(&reports(vec![tls_entry]));
+        let summary = SummaryFormat::default().format(&reports(vec![tls_entry]));
         assert!(summary.contains("NOT IN CT LOG"));
         // Informational: it does not change the status.
         assert!(summary.contains("Healthy"));
@@ -3102,7 +3283,7 @@ pub(crate) mod tests {
             crtsh_id: 1,
             crtsh_url: "https://crt.sh/?id=1".to_string(),
         });
-        let output = SummaryFormat.format(&reports(vec![logged]));
+        let output = SummaryFormat::default().format(&reports(vec![logged]));
         // Column header present, and the logged ✓ marker rendered for a cert
         // that produces no warning (the summary-positive-case gap, now fixed).
         assert!(output.contains("CT"));
@@ -3112,7 +3293,7 @@ pub(crate) mod tests {
     #[test]
     fn test_summary_hides_ct_column_when_not_checked() {
         // Without --ct-check, ct is None and the column is omitted.
-        let output = SummaryFormat.format(&reports(vec![make_test_tls()]));
+        let output = SummaryFormat::default().format(&reports(vec![make_test_tls()]));
         assert!(
             !output.contains(" CT "),
             "CT column should be hidden when no host was CT-checked"
@@ -3363,7 +3544,7 @@ pub(crate) mod tests {
     #[test]
     fn test_summary_status_uses_the_verdict() {
         // #205: a mismatch with a year left used to read Healthy.
-        let output = SummaryFormat.format(&reports(vec![mismatch_tls()]));
+        let output = SummaryFormat::default().format(&reports(vec![mismatch_tls()]));
         assert!(output.contains("Critical"));
         assert!(!output.contains("Healthy"));
         assert!(output.contains("Host: test.example.com (Critical)"));
@@ -3371,7 +3552,7 @@ pub(crate) mod tests {
 
         let mut self_signed = make_test_tls();
         self_signed.certificate.is_self_signed = true;
-        let output = SummaryFormat.format(&reports(vec![self_signed]));
+        let output = SummaryFormat::default().format(&reports(vec![self_signed]));
         assert!(output.contains("Warning"));
         assert!(!output.contains("Healthy"));
         assert!(output.contains("[warning] SELF-SIGNED: Certificate is self-signed"));
@@ -3386,7 +3567,7 @@ pub(crate) mod tests {
             .push(tlschecker::SecurityWarning::Untrusted(
                 "Certificate chain is not trusted: self-signed certificate".to_string(),
             ));
-        let output = SummaryFormat.format(&reports(vec![untrusted.clone()]));
+        let output = SummaryFormat::default().format(&reports(vec![untrusted.clone()]));
         assert!(output.contains("Warning"));
         assert!(!output.contains("Healthy"));
 
@@ -3395,7 +3576,7 @@ pub(crate) mod tests {
             allow: vec![FindingCode::Untrusted],
             ..VerdictPolicy::default()
         };
-        let output = SummaryFormat.format(&reports_with(vec![untrusted], &policy));
+        let output = SummaryFormat::default().format(&reports_with(vec![untrusted], &policy));
         assert!(output.contains("Healthy"));
         assert!(output.contains("[allowed warning] UNTRUSTED"));
     }
@@ -3404,7 +3585,7 @@ pub(crate) mod tests {
     fn test_summary_lists_expiry_findings() {
         let mut tls = make_test_tls();
         tls.certificate.validity_days = 10;
-        let output = SummaryFormat.format(&reports(vec![tls]));
+        let output = SummaryFormat::default().format(&reports(vec![tls]));
         assert!(output.contains("[critical] EXPIRES SOON: 10 days left (below 15 days)"));
     }
 

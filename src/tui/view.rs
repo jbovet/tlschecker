@@ -1408,7 +1408,7 @@ mod tests {
                 std::slice::from_ref(&label),
                 policy,
             );
-            let summary = SummaryFormat.format(&reports);
+            let summary = SummaryFormat::default().format(&reports);
             let shown: Vec<&str> = ["Healthy", "Warning", "Critical"]
                 .into_iter()
                 .filter(|status| summary.contains(status))
