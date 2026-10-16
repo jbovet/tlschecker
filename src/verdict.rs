@@ -180,9 +180,9 @@ pub enum FindingCode {
     WeakSignature,
     /// An intermediate has expired or expires soon.
     ExpiringIntermediate,
-    /// The server supports an obsolete protocol version (found by `--scan`).
+    /// An obsolete protocol version: negotiated, or supported (`--scan`).
     WeakProtocol,
-    /// The server accepts a weak cipher suite (found by `--scan`).
+    /// A weak cipher suite: negotiated, or accepted (`--scan`).
     WeakCipher,
     /// The leaf deviates from issuance best practice.
     Misissuance,
@@ -964,6 +964,12 @@ mod tests {
     // 14
     #[test]
     fn test_grade_cap_implies_at_least_warning() {
+        fn negotiated(version: &str, cipher: &str) -> TLS {
+            let mut tls = make_test_tls();
+            tls.cipher.version = version.to_string();
+            tls.cipher.name = cipher.to_string();
+            tls
+        }
         fn scan(version: ProtoVersion, ciphers: &[&str]) -> TlsScan {
             TlsScan {
                 protocols: vec![ProtocolSupport {
@@ -999,9 +1005,23 @@ mod tests {
                 make_test_tls(),
                 Some(scan(ProtoVersion::Tls1_2, &["RC4-SHA"])),
             ),
+            (
+                "negotiated: TLS 1.0",
+                negotiated("TLSv1", "ECDHE-RSA-AES128-SHA"),
+                None,
+            ),
+            ("negotiated: SSLv3", negotiated("SSLv3", "AES128-SHA"), None),
+            (
+                "negotiated: weak cipher",
+                negotiated("TLSv1.2", "RC4-SHA"),
+                None,
+            ),
         ];
 
         for (name, tls, scan) in &mut fixtures {
+            // What `TLS::from` adds for the negotiated connection.
+            let mut negotiated = crate::analyze_negotiated(&tls.cipher);
+            tls.certificate.security_warnings.append(&mut negotiated);
             if let Some(scan) = scan {
                 // What `apply_scan` adds.
                 tls.certificate

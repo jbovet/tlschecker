@@ -86,6 +86,10 @@ output* sections for the full rules.
 - The `tlschecker::verdict` library module and `SecurityWarning::message()`.
 - `tlschecker::rfc3339_from_unix`, and `valid_from_unix` / `valid_to_unix` on
   `Chain`.
+- A `weak-protocol` / `weak-cipher` finding (Warning) for a weak protocol or
+  cipher **negotiated** on the connection, without `--scan` (#217). A host
+  reachable only through the legacy-protocol retry used to read Healthy while
+  graded D.
 
 ### Fixed
 
