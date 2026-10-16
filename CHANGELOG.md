@@ -99,6 +99,9 @@ output* sections for the full rules.
 - #207: checking several ports of one host printed identical `host` labels in
   the summary table and findings; they now read `host:port`.
 - #208: JSON silently dropped hosts that could not be checked.
+- #221: a port written out that equals the scheme's default (`http://host:80`)
+  was ignored and the host was checked on 443. A written port is now always
+  used; a URL without a port (`http://host`) is still checked on 443.
 - Config errors now print the actual error, not only the usage hints.
 - `--fail-on-error` alone used to do nothing (it needed `--exit-code`).
 - `--exit-code 256` silently exited 0.
