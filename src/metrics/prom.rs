@@ -20,11 +20,12 @@
 //! # Metric Labels
 //!
 //! Every metric carries the push **grouping key** — `job` and `instance` (the target:
-//! `host`, or `host:port` when the port is not 443) — and nothing else. Only these stable identity labels belong in the grouping
-//! key: a `PUT` to the push gateway replaces series under the exact grouping key, so
-//! putting volatile labels (grade, expired, cipher, …) there would orphan the previous
-//! run's series every time one of those values changed. Descriptive, changeable labels
-//! live on `tlschecker_certificate_info` instead:
+//! `host`, or `host:port` when the port is not 443) — and nothing else. Only these
+//! stable identity labels belong in the grouping key: a `PUT` to the push gateway
+//! replaces series under the exact grouping key, so putting volatile labels (grade,
+//! expired, cipher, …) there would orphan the previous run's series every time one of
+//! those values changed. Descriptive, changeable labels live on
+//! `tlschecker_certificate_info` instead:
 //! - `cipher` - TLS cipher suite name
 //! - `cipher_protocol_version` - TLS protocol version
 //! - `issuer` - Certificate issuer organization
@@ -176,7 +177,8 @@ pub(crate) fn host_metric_families(
 ///
 /// # Metrics Exported
 ///
-/// For each certificate (one push per host, keyed by `instance=<target>`, i.e. `host` or `host:port`):
+/// For each certificate (one push per host, keyed by `instance=<target>`, i.e.
+/// `host` or `host:port`):
 /// - Days and hours until expiration
 /// - Revocation status (0-3, see module documentation)
 /// - Grade score (only when grading was performed)
