@@ -83,6 +83,11 @@ output* sections for the full rules.
 - The exit-status table in `--help`.
 - `port`, `target` and `input` in each JSON result and a `Port:` line in text
   output.
+- **Windows binary and Homebrew tap** (#215): releases ship
+  `tlschecker-windows-x86_64.zip` (static C runtime, no Visual C++
+  redistributable needed), and `brew install jbovet/tap/tlschecker` installs
+  the macOS / Linux binary with shell completions. Connection-failure hints
+  also recognize Windows socket errors, in any system language.
 - `--output` as the long form of `-o`; `--hosts-file <PATH>` and `-` to read
   hosts from a file or stdin; `--wide` for the summary table; `--completions
   <SHELL>` to print a shell completion script (#214).

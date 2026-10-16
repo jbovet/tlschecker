@@ -23,6 +23,17 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  # Releases ship a Windows binary (#215): run the offline suite there too, so
+  # a Unix-only assumption fails the pull request instead of the release.
+  windows:
+
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v7
+    - name: Run tests
+      run: cargo test --locked
   read_msrv:
     name: Read MSRV
     uses: actions-rust-lang/msrv/.github/workflows/msrv.yml@main

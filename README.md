@@ -36,36 +36,26 @@ docker run --platform linux/x86_64 josebovet/tlschecker:2.0.2 jpbd.dev
 
 ## Install
 
-Linux (x86_64)
+One line per channel; every release archive has a `.sha256` next to it on the
+[releases page](https://github.com/jbovet/tlschecker/releases).
 
 ```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v2.0.2/tlschecker-linux-x86_64.tar.gz
-tar -xzf tlschecker-linux-x86_64.tar.gz
-sudo install tlschecker /usr/local/bin/tlschecker
+# Homebrew (macOS, Linux) — also installs bash/zsh/fish completions
+brew install jbovet/tap/tlschecker
+
+# Linux / macOS binary: use linux-x86_64, linux-aarch64, macos-x86_64 or macos-aarch64
+curl -fsSL https://github.com/jbovet/tlschecker/releases/latest/download/tlschecker-linux-x86_64.tar.gz | tar -xz && sudo install tlschecker /usr/local/bin/
+
+# Docker (linux/amd64, linux/arm64)
+docker run --rm josebovet/tlschecker example.com
+
+# From source (needs a C compiler and perl: OpenSSL is built in)
+cargo install --locked --git https://github.com/jbovet/tlschecker
 ```
 
-Linux (aarch64)
-
-```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v2.0.2/tlschecker-linux-aarch64.tar.gz
-tar -xzf tlschecker-linux-aarch64.tar.gz
-sudo install tlschecker /usr/local/bin/tlschecker
-```
-
-macOS (x86_64)
-
-```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v2.0.2/tlschecker-macos-x86_64.tar.gz
-tar -xzf tlschecker-macos-x86_64.tar.gz
-sudo install tlschecker /usr/local/bin/tlschecker
-```
-
-macOS (Apple Silicon)
-
-```sh
-curl -LO https://github.com/jbovet/tlschecker/releases/download/v2.0.2/tlschecker-macos-aarch64.tar.gz
-tar -xzf tlschecker-macos-aarch64.tar.gz
-sudo install tlschecker /usr/local/bin/tlschecker
+```powershell
+# Windows (x86_64, PowerShell): unpacks tlschecker.exe into the current directory
+Invoke-WebRequest https://github.com/jbovet/tlschecker/releases/latest/download/tlschecker-windows-x86_64.zip -OutFile tlschecker.zip; Expand-Archive tlschecker.zip .
 ```
 
 ## How to use
