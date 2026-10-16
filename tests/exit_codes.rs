@@ -417,3 +417,91 @@ fn test_allow_unreachable_needs_one_checked_host() {
     assert_exit(&output, 3);
     assert!(stderr(&output).contains("invalid host address"));
 }
+
+// ── #214: host lists, --output, completions ────────────────────────
+
+/// Runs the binary with `args` and `input` on stdin, from an empty directory.
+fn tlschecker_with_stdin(args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tlschecker"))
+        .args(args)
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run tlschecker");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().expect("wait for tlschecker")
+}
+
+fn json_inputs(output: &Output) -> Vec<String> {
+    let json: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
+    json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["input"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn test_hosts_from_stdin_dash() {
+    let (a, b) = (refused_host(), refused_host());
+    let input = format!("# list\n{a}\n\n{b}  # second\n");
+    let output = tlschecker_with_stdin(
+        &[
+            "--no-dashboard",
+            "--output",
+            "json",
+            "--connect-timeout",
+            "5",
+            "-",
+        ],
+        &input,
+    );
+    assert_exit(&output, 3);
+    assert_eq!(json_inputs(&output), [a, b]);
+}
+
+#[test]
+fn test_hosts_file_dash_reads_stdin_after_arguments() {
+    let (a, b) = (refused_host(), refused_host());
+    let output = tlschecker_with_stdin(
+        &[
+            "--no-dashboard",
+            "-o",
+            "json",
+            "--connect-timeout",
+            "5",
+            "--hosts-file",
+            "-",
+            &a,
+        ],
+        &format!("{b}\n"),
+    );
+    assert_exit(&output, 3);
+    assert_eq!(json_inputs(&output), [a, b]);
+}
+
+#[test]
+fn test_missing_hosts_file_is_a_usage_error() {
+    let output = tlschecker(&["--hosts-file", "/nonexistent/hosts.txt"]);
+    assert_exit(&output, 2);
+    assert!(stderr(&output).contains("cannot read hosts file '/nonexistent/hosts.txt'"));
+}
+
+#[test]
+fn test_completions_print_a_script() {
+    let output = tlschecker(&["--completions", "bash"]);
+    assert_exit(&output, 0);
+    let script = stdout(&output);
+    assert!(script.contains("_tlschecker"), "{script}");
+    assert!(script.contains("--hosts-file"), "{script}");
+}

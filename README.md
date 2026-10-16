@@ -74,6 +74,23 @@ sudo install tlschecker /usr/local/bin/tlschecker
 ➜  tlschecker --help
 ```
 
+Hosts can be given as arguments, read from a file, or piped in — one or more
+per line, with blank lines and `#` comments ignored:
+
+```sh
+➜ tlschecker example.com api.example.com:8443
+➜ tlschecker --hosts-file hosts.txt
+➜ kubectl get ingress -A -o jsonpath='{..host}' | tlschecker -
+```
+
+The summary table (the non-interactive default) shows `Host | Days left |
+Issuer | Protocol | Revocation | Status` (plus `Grade` / `CT` when they ran);
+`--wide` adds the hours left and the cipher suite. `-o text` and `-o json`
+(also `--output`) carry every field.
+
+Shell completions: `tlschecker --completions bash|zsh|fish|elvish|powershell`,
+e.g. `tlschecker --completions zsh > ~/.zfunc/_tlschecker`.
+
 ### Interactive dashboard
 
 When run in an interactive terminal, tlschecker opens a live dashboard by
@@ -350,11 +367,11 @@ in input order — including hosts that could not be checked:
 
 ```sh
 # Hosts whose certificate expires within 30 days
-tlschecker -o json --fail-on never $(cat hosts.txt) \
+tlschecker -o json --fail-on never --hosts-file hosts.txt \
   | jq -r '.results[] | select(.certificate.days_remaining < 30) | .target'
 
 # Hosts that could not be checked, with the reason
-tlschecker -o json --fail-on never --allow-unreachable $(cat hosts.txt) \
+tlschecker -o json --fail-on never --allow-unreachable --hosts-file hosts.txt \
   | jq -r '.results[] | select(.outcome == "error") | "\(.input): \(.error.message)"'
 ```
 
@@ -498,7 +515,7 @@ It is deliberately named for what it bounds: it does **not** cap the whole check
 Hosts are checked 32 at a time by default. Use `--concurrency` to change that (1–128):
 
 ```sh
-➜ tlschecker --concurrency 64 $(cat hosts.txt)
+➜ tlschecker --concurrency 64 --hosts-file hosts.txt
 ```
 
 A check spends its time waiting on the network, not the CPU, so the default does not depend on the machine's cores: a container limited to a single CPU checks as many hosts at once as a large server. Raise it for large host lists; lower it to go easy on a shared network or on many hosts behind a single address.
