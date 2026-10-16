@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 mod config;
+mod diagnostics;
 mod exit;
 mod json;
 mod metrics;
@@ -25,7 +26,11 @@ use anyhow::Result;
 use config::{Config, ConfigError};
 use exit::{FailOn, Gate, RunStatus, RunTally};
 use tlschecker::TLSError;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
+
+/// The config file read from the current directory when `--config` is not
+/// given.
+const DEFAULT_CONFIG_FILE: &str = "tlschecker.toml";
 
 /// The exit-status table appended to `--help`.
 const EXIT_STATUS_HELP: &str = "\
@@ -68,6 +73,15 @@ struct Args {
     /// Output format for certificate results
     #[arg(short, value_enum)]
     output: Option<OutFormat>,
+
+    /// Show more on stderr: -v adds info (e.g. the raw error behind a hint),
+    /// -vv debug. RUST_LOG, when set, overrides it.
+    #[arg(short, long, action = clap::ArgAction::Count, conflicts_with = "quiet")]
+    verbose: u8,
+
+    /// Show only errors on stderr (no warnings).
+    #[arg(short, long)]
+    quiet: bool,
 
     /// Disable the interactive dashboard and use the classic formatter.
     ///
@@ -997,9 +1011,9 @@ impl FinalConfig {
 
         if addresses.is_empty() {
             return Err(ConfigError::Validation(
-                "No hosts specified. Please provide at least one host via command line or config file.\n\
-                 Usage: tlschecker <hosts...> [OPTIONS]\n\
-                 Example: tlschecker example.com another.com:8443".to_string()
+                "No hosts specified: pass them as arguments (tlschecker example.com \
+                 host:8443) or set `hosts` in the config file"
+                    .to_string(),
             ));
         }
 
@@ -1352,14 +1366,14 @@ fn use_dashboard(
 }
 
 fn main() -> std::process::ExitCode {
-    // Initialize tracing. Diagnostics (errors, warnings) go to stderr so stdout
-    // stays a clean machine-readable stream — e.g. `-o json ... | jq` is not
-    // corrupted by log lines. (While the dashboard runs, they are discarded —
-    // see `tracing_writer`.)
-    tracing_subscriber::fmt().with_writer(tracing_writer).init();
-
     // clap exits on its own: 2 for usage errors, 0 for --help / --version.
     let cli = Args::parse();
+
+    // Diagnostics (errors, warnings) go to stderr so stdout stays a clean
+    // machine-readable stream — e.g. `-o json ... | jq` is not corrupted by
+    // log lines. (While the dashboard runs, they are discarded — see
+    // `tracing_writer`.) After parsing, so -v / -q choose the level.
+    diagnostics::init(cli.verbose, cli.quiet);
     match run(cli) {
         Ok(status) => status.into(),
         Err(e) => {
@@ -1386,13 +1400,30 @@ fn run(cli: Args) -> Result<RunStatus> {
         return Ok(RunStatus::Ok);
     }
 
+    // `tlschecker` on its own, with no `tlschecker.toml` to read hosts from:
+    // show the help rather than an error about a missing argument. Decided
+    // before loading the config so a broken tlschecker.toml still reports its
+    // own error instead of being hidden behind the help.
+    if std::env::args_os().len() <= 1 && !std::path::Path::new(DEFAULT_CONFIG_FILE).exists() {
+        use clap::CommandFactory;
+        eprint!("{}", Args::command().render_help());
+        return Ok(RunStatus::Usage);
+    }
+
     // Load configuration
     let final_config = match load_config(&cli) {
         Ok(config) => config,
         Err(e) => {
-            error!("{e}");
-            error!("Try running with --help for usage information");
-            error!("Or use --generate-config to create a sample configuration file");
+            // A validation message reads on its own; keep the I/O and parse
+            // prefixes, which say what went wrong with the file.
+            let message = match &e {
+                ConfigError::Validation(msg) => msg.clone(),
+                other => other.to_string(),
+            };
+            error!(
+                "{message}\n  run 'tlschecker --help' for usage, or 'tlschecker --generate-config' \
+                 for a sample configuration file"
+            );
             return Ok(RunStatus::Usage);
         }
     };
@@ -1477,7 +1508,14 @@ fn run(cli: Args) -> Result<RunStatus> {
         let mut slots: Vec<Option<HostOutcome>> = (0..hosts_len).map(|_| None).collect();
         for (index, outcome) in rx.iter() {
             if let HostOutcome::Failed { detail, .. } = &outcome {
-                error!("Failed to check '{}': {}", labels[index], detail);
+                let label = &labels[index];
+                match diagnostics::failure_hint(detail) {
+                    Some(hint) => {
+                        error!("{label}: {hint}");
+                        info!("{label}: {detail}");
+                    }
+                    None => error!("{label}: {detail}"),
+                }
             }
             slots[index] = Some(outcome);
         }
@@ -1611,12 +1649,13 @@ fn load_config(cli: &Args) -> Result<FinalConfig, ConfigError> {
         let file_config = Config::from_file(config_path)?;
         output_explicit |= file_config.output.is_some();
         config = config.merge_with(file_config);
-    } else {
-        // Try to load from default tlschecker.toml if it exists
-        if let Ok(file_config) = Config::from_file("tlschecker.toml") {
-            output_explicit |= file_config.output.is_some();
-            config = config.merge_with(file_config);
-        }
+    } else if std::path::Path::new(DEFAULT_CONFIG_FILE).exists() {
+        // The default tlschecker.toml is optional, but once it exists its
+        // errors are reported: silently ignoring a file that fails to parse
+        // dropped the user's whole configuration without a word.
+        let file_config = Config::from_file(DEFAULT_CONFIG_FILE)?;
+        output_explicit |= file_config.output.is_some();
+        config = config.merge_with(file_config);
     }
 
     // Merge with CLI arguments (CLI takes precedence)

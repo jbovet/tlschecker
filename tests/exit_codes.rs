@@ -204,7 +204,82 @@ fn assert_exit(output: &Output, expected: i32) {
 fn test_no_hosts_is_a_usage_error() {
     let output = check(&[]);
     assert_exit(&output, 2);
-    assert!(stderr(&output).contains("No hosts specified"));
+    assert!(stderr(&output).contains("error: No hosts specified"));
+}
+
+// ── #209: stderr reads like a CLI, not a log ───────────────────────
+
+#[test]
+fn test_bare_invocation_prints_help() {
+    let output = tlschecker(&[]);
+    assert_exit(&output, 2);
+    let err = stderr(&output);
+    assert!(err.contains("Usage: tlschecker"), "{err}");
+    assert!(!err.contains("error:"), "{err}");
+}
+
+#[test]
+fn test_bare_invocation_with_broken_config_reports_it() {
+    // A tlschecker.toml in the CWD makes a bare run valid, so its error must
+    // be shown, not hidden behind the help.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("tlschecker.toml"), "hosts = [").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tlschecker"))
+        .current_dir(dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run tlschecker");
+    assert_exit(&output, 2);
+    let err = stderr(&output);
+    assert!(err.contains("error: Parse Error"), "{err}");
+    assert!(!err.contains("Usage: tlschecker"), "{err}");
+}
+
+#[test]
+fn test_failure_is_a_plain_hint_on_stderr() {
+    let refused = refused_host();
+    let err = stderr(&check(&[&refused]));
+    assert!(
+        err.contains(&format!(
+            "error: {refused}: connection refused (nothing is listening on that port)"
+        )),
+        "{err}"
+    );
+    // Piped stderr: no colour escapes, no timestamps, no log noise.
+    assert!(!err.contains('\x1b'), "{err}");
+    assert!(!err.contains("ERROR") && !err.contains(" INFO "), "{err}");
+    // The raw OS error is only shown with -v.
+    assert!(!err.contains("os error"), "{err}");
+    let verbose = stderr(&check(&["-v", &refused]));
+    assert!(
+        verbose.contains("info: ") && verbose.contains("os error"),
+        "{verbose}"
+    );
+}
+
+#[test]
+fn test_quiet_hides_warnings() {
+    let refused = refused_host();
+    // --exit-code 1 is deprecated: a warning, shown by default...
+    let loud = stderr(&check(&["--exit-code", "1", &refused]));
+    assert!(loud.contains("warning: "), "{loud}");
+    // ...and hidden by -q, which still shows errors.
+    let quiet = stderr(&check(&["-q", "--exit-code", "1", &refused]));
+    assert!(!quiet.contains("warning: "), "{quiet}");
+    assert!(quiet.contains("error: "), "{quiet}");
+}
+
+#[test]
+fn test_json_error_carries_the_hint() {
+    let refused = refused_host();
+    let output = check(&[&refused]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let error = &json["results"][0]["error"];
+    assert_eq!(
+        error["hint"],
+        "connection refused (nothing is listening on that port)"
+    );
+    assert!(error["message"].as_str().unwrap().contains("os error"));
 }
 
 #[test]

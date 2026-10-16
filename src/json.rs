@@ -145,6 +145,7 @@ impl Entry {
             error: Some(ErrorInfo {
                 kind: failure.kind.to_ascii_lowercase(),
                 message: failure.detail.clone(),
+                hint: crate::diagnostics::failure_hint(&failure.detail),
             }),
             status: None,
             connection: None,
@@ -161,7 +162,11 @@ struct ErrorInfo {
     /// `dns`, `connection`, `handshake`, `certificate`, `invalid`, `internal`
     /// or `error`.
     kind: String,
+    /// The raw error (OpenSSL error stack, OS error, …).
     message: String,
+    /// A plain-language explanation of a common error (the line stderr
+    /// shows), or `null`.
+    hint: Option<&'static str>,
 }
 
 #[derive(Serialize)]
