@@ -104,6 +104,17 @@ jobs:
         shell: bash
         run: target/${{ matrix.target }}/release/tlschecker${{ matrix.exe }} --version
 
+      # The runner has the Visual C++ redistributable, so the smoke test can't
+      # catch a dynamic CRT; its import of VCRUNTIME140.dll can.
+      - name: Check the C runtime is static
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if grep -aqi 'vcruntime140' target/${{ matrix.target }}/release/tlschecker.exe; then
+            echo "::error::tlschecker.exe imports the Visual C++ runtime (VCRUNTIME140.dll)"
+            exit 1
+          fi
+
       # A tarball keeps the executable bit and is the name the README's
       # install instructions download.
       - name: Package (tar.gz)

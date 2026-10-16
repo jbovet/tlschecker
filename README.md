@@ -28,10 +28,10 @@ docker run --rm -it tlschecker:local example.com
 
 The TUI is only used when stdout is an interactive terminal. In non-interactive environments (pipelines, redirected output, CI), the container falls back to the classic text output.
 
-If you are utilizing M1 or higher, please add the option --platform linux/x86_64.
+The published image runs natively on amd64 and arm64 (Apple Silicon included):
 
 ```sh
-docker run --platform linux/x86_64 josebovet/tlschecker:2.0.2 jpbd.dev
+docker run --rm josebovet/tlschecker example.com
 ```
 
 ## Install
