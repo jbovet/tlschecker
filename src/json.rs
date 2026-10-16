@@ -48,6 +48,16 @@ pub(crate) fn render(reports: &[HostReport], failures: &[HostFailure]) -> String
     serde_json::to_string_pretty(&output).expect("JSON output is always serializable")
 }
 
+/// The bare host: an IPv6 literal can arrive bracketed (`parse_host_port`
+/// keeps the URL parser's `[::1]`), but brackets are authority syntax, not
+/// part of the address. `target` keeps them where they belong (`[::1]:8443`).
+fn bare_host(host: &str) -> String {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_string()
+}
+
 /// The library fills missing name attributes with the literal `"None"`;
 /// the schema reports them as `null`.
 fn opt(value: &str) -> Option<String> {
@@ -101,7 +111,7 @@ impl Entry {
         Entry {
             input: report.label.clone(),
             target: Some(report.target()),
-            host: Some(tls.certificate.hostname.clone()),
+            host: Some(bare_host(&tls.certificate.hostname)),
             port: Some(report.port),
             outcome: Outcome::Checked,
             error: None,
@@ -129,7 +139,7 @@ impl Entry {
                 .as_ref()
                 .zip(port)
                 .map(|(hp, p)| display_target(&hp.host, p)),
-            host: parsed.map(|hp| hp.host),
+            host: parsed.map(|hp| bare_host(&hp.host)),
             port,
             outcome: Outcome::Error,
             error: Some(ErrorInfo {

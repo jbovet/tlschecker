@@ -2455,6 +2455,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_json_host_is_bare_ipv6_address() {
+        let mut tls = make_test_tls();
+        tls.certificate.hostname = "[::1]".to_string();
+        let labels = vec!["[::1]:8443".to_string(), "[::1]:9443".to_string()];
+        let slots = vec![
+            Some(HostOutcome::Checked(Box::new(tls))),
+            Some(HostOutcome::Failed {
+                kind: "connection",
+                detail: "refused".to_string(),
+            }),
+        ];
+        let (reports, failures, _) = collect(slots, &labels, &VerdictPolicy::default());
+        let r =
+            &serde_json::from_str::<serde_json::Value>(&JsonFormat.format_run(&reports, &failures))
+                .unwrap()["results"];
+        for (entry, port) in [(&r[0], 8443), (&r[1], 9443)] {
+            assert_eq!(entry["host"], "::1");
+            assert_eq!(entry["target"], format!("[::1]:{port}"));
+        }
+    }
+
+    #[test]
     fn test_json_uses_null_not_none_strings() {
         // The library stores a missing name attribute as the literal "None".
         let mut tls = make_test_tls();
