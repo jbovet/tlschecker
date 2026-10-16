@@ -6,9 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-One status for every frontend (#205), meaningful exit codes (#206) and a
-versioned JSON schema (#208). See the README's *Status & exit codes* and *JSON
-output* sections for the full rules.
+## [3.0.0] - 2026-10-16
+
+One status for every host and an exit code you can gate CI on (#205, #206), a
+versioned JSON schema (#208), and binaries for Windows plus a Homebrew tap
+(#215). See the README's *Status & exit codes* and *JSON output* sections for
+the full rules, and *Migration* below to upgrade from v2.
+
+**What v3 keeps stable.** From 3.0.0 on, the command line follows semver:
+flags, exit codes, the status and severity table, and JSON `schema_version` 1
+change incompatibly only in a major version. The Rust library API
+(`tlschecker::TLS` and the rest of the crate) is not covered yet: it may still
+change in 3.x minor releases until the crate is published on crates.io (#21).
 
 ### Breaking
 
@@ -143,6 +152,12 @@ output* sections for the full rules.
 - `--fail-on-error` alone used to do nothing (it needed `--exit-code`).
 - `--exit-code 256` silently exited 0.
 
+### Security
+
+- rustls 0.23.46 (#204) fixes RUSTSEC-2026-0346, -0347, -0348 and -0349.
+  rustls is only used for the crt.sh, OCSP and CRL downloads and none of the
+  four is reachable from tlschecker, but `cargo audit` is clean again.
+
 ### Migration
 
 | v2 | v3 |
@@ -271,6 +286,8 @@ scanning, and Certificate Transparency support.
 
 See the Git history for changes in 1.1.1 and earlier.
 
+[Unreleased]: https://github.com/jbovet/tlschecker/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/jbovet/tlschecker/compare/v2.0.2...v3.0.0
 [2.0.1]: https://github.com/jbovet/tlschecker/compare/v2.0.0...v2.0.1
 [2.0.2]: https://github.com/jbovet/tlschecker/compare/v2.0.1...v2.0.2
 [2.0.0]: https://github.com/jbovet/tlschecker/compare/v1.1.1...v2.0.0
