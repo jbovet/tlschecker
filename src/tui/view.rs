@@ -168,6 +168,24 @@ fn status_text(label: &StatusLabel) -> String {
 
 /// One list row: state symbol + label + grade letter, plus a `?` when a
 /// requested check could not be verified.
+/// Why a host could not be checked: the plain-language hint for a common
+/// error (bold), then the raw error (dimmed), or just the raw error.
+fn failure_lines(detail: &str) -> Vec<Line<'static>> {
+    match crate::diagnostics::failure_hint(detail) {
+        Some(hint) => vec![
+            Line::from(Span::styled(
+                hint,
+                Style::new().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                detail.to_string(),
+                Style::new().fg(Color::DarkGray),
+            )),
+        ],
+        None => vec![Line::from(detail.to_string())],
+    }
+}
+
 fn host_row(app: &App, index: usize) -> Line<'_> {
     let label = app.labels[index].as_str();
     match &app.slots[index] {
@@ -261,14 +279,14 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
         Some(HostOutcome::Failed { kind, detail }) => {
-            let lines = vec![
+            let mut lines = vec![
                 Line::from(Span::styled(
                     format!("✗ Could not check ({})", kind),
                     Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )),
                 Line::default(),
-                Line::from(detail.as_str()),
             ];
+            lines.extend(failure_lines(detail));
             frame.render_widget(
                 Paragraph::new(lines)
                     .wrap(Wrap { trim: true })
@@ -522,7 +540,7 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                 Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::default());
-            lines.push(Line::from(detail.clone()));
+            lines.extend(failure_lines(detail));
         }
         Some(HostOutcome::Checked(tls)) => {
             let cert = &tls.certificate;

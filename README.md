@@ -322,7 +322,8 @@ in input order — including hosts that could not be checked:
       "host": "down.example.com",
       "port": 443,
       "outcome": "error",
-      "error": { "kind": "dns", "message": "failed to lookup address information: …" },
+      "error": { "kind": "dns", "message": "failed to lookup address information: …",
+                 "hint": "DNS lookup failed: the host name does not resolve" },
       "status": null, "connection": null, "certificate": null,
       "grade": null, "scan": null, "ct": null
     }
@@ -335,7 +336,8 @@ in input order — including hosts that could not be checked:
   `--scan` or `--ct-check` produced them.
 - **`outcome`** is `checked` or `error`. An error entry carries
   `error.kind` (`dns`, `connection`, `handshake`, `certificate`, `invalid`,
-  `internal` or `error`) and a `message`; an invalid address has `null` `host`, `port`
+  `internal` or `error`), the raw `message`, and a plain-language `hint` for
+  common errors (`null` otherwise); an invalid address has `null` `host`, `port`
   and `target`.
 - **`target`** is how every output names the host: `host` on 443, `host:port`
   otherwise. `input` is exactly what you typed.
@@ -581,22 +583,31 @@ A hostname mismatch, an untrusted chain, an invalid chain signature, support for
 
 ### Troubleshooting Connection Issues
 
-If you encounter connection problems, here are some common error messages and solutions:
+A host that cannot be checked is reported on stderr as one line, with the
+common errors explained in plain language:
 
-1. **"Cannot resolve hostname"**
-   - Check that the hostname is spelled correctly
-   - Verify your network and DNS configuration
-   - Try using an IP address instead if DNS resolution is not available
+```
+error: example.com:8080: the port does not speak TLS (plain HTTP or another protocol?)
+error: 10.0.0.5: connection refused (nothing is listening on that port)
+error: typo.example: DNS lookup failed: the host name does not resolve
+```
 
-2. **"Connection refused"**
-   - Verify the host is running a TLS service on the specified port
-   - Check if a firewall might be blocking the connection
-   - Confirm the service is publicly accessible
+| Message | What to check |
+|---|---|
+| `DNS lookup failed` | Spelling of the hostname, your DNS configuration; try the IP address |
+| `connection refused` | That a TLS service listens on that port; firewalls |
+| `timed out` | Network path and firewalls; raise `--connect-timeout` for slow links |
+| `the port does not speak TLS` | The port: e.g. `:80` is plain HTTP — use the TLS port |
+| `no TLS version in common` / `rejected the TLS handshake` | The server only offers protocols or ciphers too old (or too new) for a handshake |
+| `requires a client certificate` | The service uses mutual TLS |
+| `does not recognize this hostname (SNI)` | The name you checked is not configured on that server |
 
-3. **"TLS handshake failed"**
-   - The server might be using an unsupported TLS version
-   - There might be an issue with the server's certificate configuration
-   - Your network might be intercepting the TLS connection
+Add `-v` to also see the raw error (OpenSSL's error stack or the OS error) and
+informational messages, `-vv` for debug output, or `-q` to show errors only.
+`RUST_LOG` (e.g. `RUST_LOG=debug` or `RUST_LOG=tlschecker=debug,reqwest=warn`)
+overrides both. Colours are used only when stderr is a terminal and
+[`NO_COLOR`](https://no-color.org) is not set. In JSON output, the same
+explanation is `error.hint` next to the raw `error.message`.
 
 ### Configuration File Support
 

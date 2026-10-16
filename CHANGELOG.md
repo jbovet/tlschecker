@@ -83,9 +83,25 @@ output* sections for the full rules.
 - The exit-status table in `--help`.
 - `port`, `target` and `input` in each JSON result and a `Port:` line in text
   output.
+- `-v` / `-vv` / `-q` to choose how much is shown on stderr, and `RUST_LOG`
+  support (#209).
+- `error.hint` in JSON error entries: the same plain-language explanation
+  stderr shows. The dashboard shows it above the raw error.
 - The `tlschecker::verdict` library module and `SecurityWarning::message()`.
 - `tlschecker::rfc3339_from_unix`, and `valid_from_unix` / `valid_to_unix` on
   `Chain`.
+
+### Changed
+
+- **stderr reads like a CLI, not a log** (#209). Lines are `error: …` /
+  `warning: …` with no timestamp, module path or span fields, and colour only
+  when stderr is a terminal and `NO_COLOR` is unset. Info-level messages (e.g.
+  the legacy-protocol retry) are no longer shown by default. A host that could
+  not be checked reads `error: <host>: <plain-language reason>` for common
+  errors (wrong port, refused, DNS, timeout, handshake rejected, client
+  certificate required, …); the raw error is shown with `-v`.
+- Running `tlschecker` with no arguments (and no config providing hosts)
+  prints the help instead of an error. The "no hosts" error is one line.
 
 ### Fixed
 
