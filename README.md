@@ -646,7 +646,7 @@ In addition to revocation and grading, tlschecker surfaces certificate problems 
 - **Misissuance** (Warning) — the leaf deviates from issuance best practice (see *Certificate Metadata*)
 - **Not in CT log** (Info, `--ct-check`) — the presented certificate was not found in any public Certificate Transparency log
 
-A hostname mismatch, an untrusted chain, an invalid chain signature, support for an obsolete protocol (SSLv3/TLS 1.0), or acceptance of a weak cipher (scanned or negotiated) each cap the TLS grade at C, the same as a self-signed certificate.
+A hostname mismatch, an untrusted chain, an invalid chain signature, support for an obsolete protocol (SSLv3, TLS 1.0 or TLS 1.1, which RFC 8996 deprecates), or acceptance of a weak cipher (scanned or negotiated) each cap the TLS grade at C, the same as a self-signed certificate. Negotiating one of those protocols caps it at D.
 
 ### Troubleshooting Connection Issues
 

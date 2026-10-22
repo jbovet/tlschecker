@@ -8,7 +8,7 @@
 // The binary needs the default `tui` feature (`[[bin]] required-features`).
 #![cfg(feature = "tui")]
 
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,7 +18,9 @@ use openssl::ec::{EcGroup, EcKey};
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 use openssl::pkey::{PKey, Private};
-use openssl::ssl::{SslAcceptor, SslMethod};
+use openssl::ssl::{
+    SslAcceptor, SslAcceptorBuilder, SslMethod, SslOptions, SslVerifyMode, SslVersion,
+};
 use openssl::x509::extension::SubjectAlternativeName;
 use openssl::x509::{X509Builder, X509NameBuilder, X509};
 
@@ -85,11 +87,21 @@ fn make_cert(san: San, not_before: i64, not_after: i64) -> (X509, PKey<Private>)
 /// Serves `cert` on a loopback port until the test process exits, and
 /// returns the port. Handshakes are served one at a time on a detached
 /// thread — enough for one check per host.
-fn spawn_server((cert, key): (X509, PKey<Private>)) -> u16 {
+fn spawn_server(cert: (X509, PKey<Private>)) -> u16 {
+    spawn_server_with(cert, |_| {})
+}
+
+/// [`spawn_server`], with `configure` applied to the acceptor last, so it can
+/// override any of the defaults (Mozilla intermediate settings, certificate).
+fn spawn_server_with(
+    (cert, key): (X509, PKey<Private>),
+    configure: impl FnOnce(&mut SslAcceptorBuilder),
+) -> u16 {
     let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
     acceptor.set_private_key(&key).unwrap();
     acceptor.set_certificate(&cert).unwrap();
     acceptor.check_private_key().unwrap();
+    configure(&mut acceptor);
     let acceptor = acceptor.build();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -97,11 +109,28 @@ fn spawn_server((cert, key): (X509, PKey<Private>)) -> u16 {
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let raw = stream.try_clone();
             // The client drops the connection after reading the certificate.
-            let _ = acceptor.accept(stream);
+            if acceptor.accept(stream).is_err() {
+                if let Ok(raw) = raw {
+                    close_gracefully(raw);
+                }
+            }
         }
     });
     port
+}
+
+/// Closes the server's side of a failed handshake with a FIN, not an RST.
+/// Dropping a socket that still holds unread client data (the client's second
+/// flight, when the server alerts after its certificate) makes the OS reset
+/// the connection, and Windows then discards the alert the client has not
+/// read yet, so the client would report "connection reset" instead. The
+/// drain only needs what has already arrived, hence the short timeout.
+fn close_gracefully(mut stream: TcpStream) {
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = std::io::copy(&mut stream, &mut std::io::sink());
 }
 
 /// A loopback server whose certificate is valid for 127.0.0.1 with 300 days
@@ -135,6 +164,44 @@ fn expired_host() -> String {
         now - 400 * DAY,
         now - 10 * DAY,
     ));
+    format!("127.0.0.1:{port}")
+}
+
+/// A loopback server that speaks at most TLS 1.2 and requires a client
+/// certificate, like a Mosquitto listener with `require_certificate true`
+/// on a TLS 1.2-only stack. tlschecker presents none, so the handshake fails.
+fn client_cert_tls12_host() -> String {
+    let now = now();
+    let port = spawn_server_with(
+        make_cert(San::Ip("127.0.0.1"), now - 65 * DAY, now + 300 * DAY),
+        |acceptor| {
+            acceptor
+                .set_max_proto_version(Some(SslVersion::TLS1_2))
+                .unwrap();
+            acceptor.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        },
+    );
+    format!("127.0.0.1:{port}")
+}
+
+/// A loopback server that speaks only TLS 1.0, which the default security
+/// level refuses, so tlschecker reaches it through the legacy retry.
+fn tls10_only_host() -> String {
+    let now = now();
+    let port = spawn_server_with(
+        make_cert(San::Ip("127.0.0.1"), now - 65 * DAY, now + 300 * DAY),
+        |acceptor| {
+            acceptor.clear_options(SslOptions::NO_TLSV1);
+            acceptor.set_security_level(0);
+            acceptor
+                .set_min_proto_version(Some(SslVersion::TLS1))
+                .unwrap();
+            acceptor
+                .set_max_proto_version(Some(SslVersion::TLS1))
+                .unwrap();
+            acceptor.set_cipher_list("ECDHE-ECDSA-AES128-SHA").unwrap();
+        },
+    );
     format!("127.0.0.1:{port}")
 }
 
@@ -280,6 +347,55 @@ fn test_json_error_carries_the_hint() {
         "connection refused (nothing is listening on that port)"
     );
     assert!(error["message"].as_str().unwrap().contains("os error"));
+}
+
+#[test]
+fn test_tls12_client_certificate_requirement_is_in_the_hint() {
+    // Below TLS 1.3 a missing client certificate draws the generic handshake
+    // failure alert, so the hint must not blame the cipher suites alone.
+    let host = client_cert_tls12_host();
+    let output = check(&[&host]);
+    assert_exit(&output, 3);
+    let hint = "the server rejected the TLS handshake (no protocol or cipher suite in common, \
+                or it requires a client certificate)";
+    let err = stderr(&output);
+    assert!(err.contains(&format!("error: {host}: {hint}")), "{err}");
+    let json: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let error = &json["results"][0]["error"];
+    assert_eq!(error["hint"], hint);
+    // The unenforced verification result is not part of the reason.
+    assert!(
+        !error["message"].as_str().unwrap().contains("self-signed"),
+        "{error}"
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("alert handshake failure"),
+        "{error}"
+    );
+    // The server sent its certificate before rejecting us, so the legacy
+    // retry is skipped: it cannot help and would double the failed attempts.
+    let verbose = stderr(&check(&["-v", &host]));
+    assert!(verbose.contains(hint), "{verbose}");
+    assert!(!verbose.contains("retrying with legacy"), "{verbose}");
+}
+
+#[test]
+fn test_legacy_only_server_is_reached_through_the_retry() {
+    // The positive control for the "no retry" check above: a server that
+    // refuses the default handshake is retried, and -v says so.
+    let host = tls10_only_host();
+    let output = check(&["-v", &host]);
+    assert_exit(&output, 0);
+    let err = stderr(&output);
+    assert!(err.contains("retrying with legacy"), "{err}");
+    assert!(
+        stdout(&output).contains("\"protocol\": \"TLSv1\""),
+        "{}",
+        stdout(&output)
+    );
 }
 
 #[test]
