@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- TLS 1.1 now caps the grade like TLS 1.0, since RFC 8996 deprecates both:
+  negotiating it caps the grade at D, and a `--scan` that finds it supported
+  caps it at C. A TLS 1.1-only server used to score C (67) and one that still
+  accepted TLS 1.1 next to TLS 1.3 could score A+. Statuses, findings and exit
+  codes do not change: TLS 1.1 was already a `weak-protocol` Warning.
+
+### Fixed
+
+- `--scan` no longer reports TLS 1.2 and older as unsupported on servers that
+  require a client certificate (an MQTT broker with `require_certificate true`,
+  for example). Below TLS 1.3 such a server rejects the handshake only after
+  agreeing to the version and cipher, so a rejection that comes after the
+  server sent its certificate now counts as supported. The scan could hide a
+  TLS 1.0 or 1.1 still enabled on those servers. A handshake that times out
+  after the certificate still counts as unsupported: a server that stops
+  answering has not been seen to accept anything.
+- The hint for a TLS handshake-failure alert now also says the server may
+  require a client certificate. Below TLS 1.3, a server that wants one (a
+  Mosquitto listener with `require_certificate true`, for example) sends the
+  same alert as one with no cipher suite in common, so the old hint pointed
+  only at ciphers.
+- A server that rejects the handshake after sending its certificate (one that
+  requires a client certificate, below TLS 1.3), whether with an alert or by
+  closing the connection, is no longer retried with legacy protocols. It had
+  already accepted the default version and cipher, so the retry could not
+  succeed and only doubled the failed connections the server logs. The result
+  and exit code are unchanged. A server our side rejects after its
+  certificate (a DH group below the default security level, for example) is
+  still retried and inspected.
+- Handshake error messages (JSON `error.message`, the `-v` detail and the
+  dashboard's failed-host pane) no longer end with a certificate verification
+  result such as ": self-signed certificate". The `openssl` crate appends it,
+  but tlschecker does not enforce verification during the handshake, so it
+  never explained the failure. Trust is still reported for every checked host,
+  as the `untrusted` finding.
+
 ## [3.0.0] - 2026-10-16
 
 One status for every host and an exit code you can gate CI on (#205, #206), a

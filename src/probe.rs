@@ -63,6 +63,17 @@ impl ProtoVersion {
             ProtoVersion::Tls1_3 => "TLSv1.3",
         }
     }
+
+    /// Whether this version is older than TLS 1.2: SSLv3, or TLS 1.0/1.1,
+    /// which RFC 8996 deprecates. The single rule behind both the scan's
+    /// `WeakProtocol` findings (`analyze_scan`) and its grade cap
+    /// (`scan_supports_obsolete_protocol`), so the two cannot drift.
+    pub fn is_deprecated(self) -> bool {
+        matches!(
+            self,
+            ProtoVersion::Ssl3 | ProtoVersion::Tls1_0 | ProtoVersion::Tls1_1
+        )
+    }
 }
 
 impl std::fmt::Display for ProtoVersion {
@@ -236,8 +247,16 @@ fn can_offer(version: SslVersion) -> bool {
 /// Attempts a single handshake restricted to one protocol version (and
 /// optionally one cipher / TLS 1.3 ciphersuite).
 ///
-/// Returns the negotiated cipher name on success, or `None` if the version /
-/// cipher could not be set or the handshake failed for any reason.
+/// Returns the negotiated cipher name when the server accepted the version and
+/// cipher, or `None` if they could not be set or the server refused them.
+///
+/// A handshake that fails after the server has sent its certificate still
+/// counts as accepted: a server that requires a client certificate (an MQTT
+/// broker with `require_certificate true`) rejects us below TLS 1.3 only
+/// after its ServerHello, when it has already agreed to this version and
+/// cipher. A refused version or cipher fails before any certificate arrives.
+/// A timeout does not count, even after the certificate: a server that stops
+/// answering has not been seen to accept anything.
 fn try_handshake(
     host: &str,
     addr: std::net::SocketAddr,
@@ -254,8 +273,28 @@ fn try_handshake(
     tcp.set_read_timeout(Some(timeout)).ok()?;
     tcp.set_write_timeout(Some(timeout)).ok()?;
 
-    let stream = ssl.connect(tcp).ok()?;
-    stream.ssl().current_cipher().map(|c| c.name().to_string())
+    let cipher = |ssl: &openssl::ssl::SslRef| ssl.current_cipher().map(|c| c.name().to_string());
+    match ssl.connect(tcp) {
+        Ok(stream) => cipher(stream.ssl()),
+        Err(HandshakeError::Failure(mid)) if !timed_out(mid.error()) => {
+            mid.ssl().peer_certificate()?;
+            cipher(mid.ssl())
+        }
+        Err(_) => None,
+    }
+}
+
+/// Whether a handshake gave up waiting for the server. Unix reports the read
+/// timeout as `WouldBlock`, which surfaces as [`HandshakeError::WouldBlock`]
+/// and never gets here; Windows reports it as `TimedOut`, an I/O error inside
+/// a [`HandshakeError::Failure`].
+fn timed_out(err: &openssl::ssl::Error) -> bool {
+    err.io_error().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        )
+    })
 }
 
 /// Probes a server for supported TLS protocol versions and cipher suites.

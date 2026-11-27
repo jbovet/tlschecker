@@ -164,9 +164,12 @@ pub(crate) fn failure_hint(detail: &str) -> Option<&'static str> {
             ],
             "no TLS version in common with the server",
         ),
+        // Below TLS 1.3 there is no "certificate required" alert: a server
+        // that wants a client certificate sends this same generic alert.
         (
             &["alert handshake failure", "no shared cipher"],
-            "the server rejected the TLS handshake (no protocol or cipher suite in common)",
+            "the server rejected the TLS handshake (no protocol or cipher suite in common, \
+             or it requires a client certificate)",
         ),
         (
             &["unexpected eof", "unexpected end of file"],
@@ -289,9 +292,11 @@ mod tests {
                 "Connection error: connection timed out before any address could be tried",
                 "timed out",
             ),
+            // A TLS 1.2 server that wants a client certificate sends the same
+            // alert as one with no cipher in common, so the hint names both.
             (
-                "TLS Handshake error: ... ssl3_read_bytes:sslv3 alert handshake failure ...",
-                "rejected the TLS handshake",
+                "TLS Handshake error: ... ssl3_read_bytes:ssl/tls alert handshake failure ...",
+                "or it requires a client certificate",
             ),
             (
                 "TLS Handshake error: ... ssl3_read_bytes:tlsv1 alert protocol version ...",

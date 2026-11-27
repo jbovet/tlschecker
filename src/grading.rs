@@ -45,7 +45,8 @@ pub struct GradingInput {
     /// A presented certificate's signature does not verify against the key of
     /// the issuer found for it in the chain.
     pub has_invalid_chain_signature: bool,
-    /// Server supports an obsolete protocol (SSLv3 / TLS 1.0), via `--scan`.
+    /// Server supports an obsolete protocol (SSLv3 / TLS 1.0 / TLS 1.1), via
+    /// `--scan`.
     pub supports_obsolete_protocol: bool,
     /// Server accepts a weak cipher suite, via `--scan`.
     pub accepts_weak_cipher: bool,
@@ -71,6 +72,19 @@ fn score_protocol(version: &str) -> (u8, String) {
     } else {
         (0, format!("Unknown protocol: {}", version))
     }
+}
+
+/// Whether a negotiated protocol (OpenSSL's `version_str`, e.g. `"TLSv1.1"`)
+/// is older than TLS 1.2: SSLv2/SSLv3, or TLS 1.0/1.1, which RFC 8996
+/// deprecates. A version it does not recognize counts too, since it cannot be
+/// shown to be TLS 1.2 or later.
+///
+/// The single rule behind both the grade's D cap and the negotiated
+/// `WeakProtocol` finding (`analyze_negotiated` in `lib.rs`), so a version
+/// cannot be capped without a finding (#217) or the other way round. It reads
+/// the version the way [`score_protocol`] does.
+pub(crate) fn is_deprecated_protocol(version: &str) -> bool {
+    !(version.contains("TLSv1.3") || version.contains("TLSv1.2"))
 }
 
 /// Score the cipher suite bit strength.
@@ -189,7 +203,8 @@ fn score_to_letter(score: u8) -> String {
     }
 }
 
-/// Ceiling applied when the *negotiated* protocol is TLS 1.0 or SSLv3.
+/// Ceiling applied when the *negotiated* protocol is TLS 1.1, TLS 1.0 or SSLv3
+/// (RFC 8996 deprecates TLS 1.0 and 1.1 alike).
 ///
 /// Set to the top of the D band in [`score_to_letter`] so the cap means
 /// "D at best" — keep this in lockstep with that band if it ever changes.
@@ -213,7 +228,7 @@ const CAP_TRUST_OR_WEAKNESS: u8 = 69; // C max
 ///
 /// **Hard caps:**
 /// - Expired or Revoked cert: score forced to 0 (F)
-/// - SSLv3 or TLS 1.0 negotiated: score capped at 54 (D max)
+/// - SSLv3, TLS 1.0 or TLS 1.1 negotiated: score capped at 54 (D max)
 /// - Self-signed cert: score capped at 69 (C max)
 /// - Untrusted chain (does not build to a system root): score capped at 69 (C max)
 /// - Hostname mismatch: score capped at 69 (C max)
@@ -221,7 +236,8 @@ const CAP_TRUST_OR_WEAKNESS: u8 = 69; // C max
 ///   chain, which it usually also is; capping on the signature itself keeps
 ///   the grade honest when no system trust store is available (trust `Unknown`)
 /// - Accepts a weak cipher (negotiated, or discovered via `--scan`) or supports
-///   an obsolete protocol (SSLv3/TLS 1.0, via `--scan`): score capped at 69 (C max)
+///   an obsolete protocol (SSLv3/TLS 1.0/TLS 1.1, via `--scan`): score capped
+///   at 69 (C max)
 pub fn calculate_grade(input: &GradingInput) -> TLSGrade {
     let (protocol_score, protocol_reason) = score_protocol(&input.protocol_version);
     let (cipher_score, cipher_reason) = score_cipher_bits(input.cipher_bits);
@@ -269,7 +285,7 @@ pub fn calculate_grade(input: &GradingInput) -> TLSGrade {
     if input.is_expired || input.is_revoked {
         composite = 0;
     }
-    if protocol_score <= 20 {
+    if is_deprecated_protocol(&input.protocol_version) {
         composite = composite.min(CAP_NEGOTIATED_OBSOLETE_PROTOCOL);
     }
     if input.is_self_signed {
@@ -735,18 +751,53 @@ mod tests {
     }
 
     #[test]
-    fn test_tls11_deprecated_but_not_capped_at_d() {
+    fn test_tls11_ceiling_is_exactly_d() {
+        // RFC 8996 deprecates TLS 1.1 with TLS 1.0, so an otherwise-strong
+        // config negotiating it (82 uncapped) lands at the top of the D band.
         let input = make_input(|i| {
+            i.cert_key_bits = 4096;
             i.protocol_version = "TLSv1.1".into();
+            i.cipher_name = "ECDHE-RSA-AES256-SHA".into();
+            i.cipher_bits = 256;
+        });
+        let grade = calculate_grade(&input);
+        assert_eq!(grade.grade, "D", "TLS 1.1 ceiling should be D");
+        assert_eq!(grade.score, 54);
+    }
+
+    #[test]
+    fn test_d_cap_follows_is_deprecated_protocol() {
+        // The cap is decided by the protocol, not by its score: every version
+        // older than TLS 1.2, and an unrecognized one, is capped; TLS 1.2 and
+        // 1.3 are not. An otherwise-perfect config scores well above 54.
+        for (version, deprecated) in [
+            ("SSLv2", true),
+            ("SSLv3", true),
+            ("TLSv1", true),
+            ("TLSv1.1", true),
+            ("unknown", true),
+            ("TLSv1.2", false),
+            ("TLSv1.3", false),
+        ] {
+            assert_eq!(is_deprecated_protocol(version), deprecated, "{version}");
+            let grade = calculate_grade(&make_input(|i| {
+                i.cert_key_bits = 4096;
+                i.protocol_version = version.into();
+            }));
+            assert_eq!(grade.score <= 54, deprecated, "{version}: {grade:?}");
+        }
+    }
+
+    #[test]
+    fn test_tls12_is_not_capped_at_d() {
+        // The D cap stops at TLS 1.1: TLS 1.2 keeps its uncapped score.
+        let input = make_input(|i| {
+            i.cert_key_bits = 4096;
+            i.protocol_version = "TLSv1.2".into();
             i.cipher_name = "ECDHE-RSA-AES256-GCM-SHA384".into();
         });
         let grade = calculate_grade(&input);
-        // TLS 1.1 protocol_score is 40, which is > 20, so D cap does NOT apply
-        assert!(
-            grade.score > 35,
-            "TLS 1.1 should not be capped at D, got score {}",
-            grade.score
-        );
+        assert_eq!(grade.score, 94, "{grade:?}");
     }
 
     #[test]

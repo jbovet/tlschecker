@@ -901,12 +901,12 @@ fn is_weak_cipher(name: &str) -> bool {
 }
 
 /// Returns true if the scan shows support for an obsolete protocol that should
-/// cap the grade (SSLv3 or TLS 1.0).
+/// cap the grade (SSLv3, TLS 1.0 or TLS 1.1, which RFC 8996 deprecates
+/// together with TLS 1.0).
 fn scan_supports_obsolete_protocol(scan: &probe::TlsScan) -> bool {
-    use probe::ProtoVersion;
     scan.protocols
         .iter()
-        .any(|p| p.supported && matches!(p.version, ProtoVersion::Ssl3 | ProtoVersion::Tls1_0))
+        .any(|p| p.supported && p.version.is_deprecated())
 }
 
 /// Returns true if the scan shows the server accepting any weak cipher.
@@ -918,26 +918,27 @@ fn scan_accepts_weak_cipher(scan: &probe::TlsScan) -> bool {
 
 /// Derives security warnings from the connection that was actually
 /// negotiated: an obsolete (SSLv2/SSLv3) or deprecated (TLS 1.0/1.1) protocol
-/// version, or a weak cipher suite ([`is_weak_cipher`]).
+/// version (or one it does not recognize), or a weak cipher suite
+/// ([`is_weak_cipher`]).
 ///
 /// Runs on every check, unlike [`analyze_scan`], which reports what the server
 /// *supports* and needs `--scan`. Without it, a host reachable only through
 /// the legacy-protocol retry was graded D but had no finding, so its status
 /// read Healthy (#217). The grade is unaffected: `build_grading_input` already
 /// caps on the negotiated protocol and cipher and does not read these
-/// warnings.
+/// warnings. Which protocols count is [`grading::is_deprecated_protocol`], the
+/// same rule as the grade's D cap.
 fn analyze_negotiated(cipher: &Cipher) -> Vec<SecurityWarning> {
     let mut warnings = Vec::new();
-    match cipher.version.as_str() {
-        "SSLv2" | "SSLv3" => warnings.push(SecurityWarning::WeakProtocol(format!(
-            "Connection negotiated obsolete protocol {} (known to be insecure)",
-            cipher.version
-        ))),
-        "TLSv1" | "TLSv1.1" => warnings.push(SecurityWarning::WeakProtocol(format!(
-            "Connection negotiated deprecated protocol {}",
-            cipher.version
-        ))),
-        _ => {}
+    let version = cipher.version.as_str();
+    if grading::is_deprecated_protocol(version) {
+        warnings.push(SecurityWarning::WeakProtocol(
+            if version.starts_with("SSL") {
+                format!("Connection negotiated obsolete protocol {version} (known to be insecure)")
+            } else {
+                format!("Connection negotiated deprecated protocol {version}")
+            },
+        ));
     }
     if is_weak_cipher(&cipher.name) {
         warnings.push(SecurityWarning::WeakCipher(format!(
@@ -964,20 +965,21 @@ fn analyze_negotiated(cipher: &Cipher) -> Vec<SecurityWarning> {
 pub fn analyze_scan(scan: &probe::TlsScan) -> Vec<SecurityWarning> {
     let mut warnings = Vec::new();
 
-    for proto in scan.protocols.iter().filter(|p| p.supported) {
-        match proto.version {
-            probe::ProtoVersion::Ssl3 => warnings.push(SecurityWarning::WeakProtocol(format!(
-                "Server supports obsolete protocol {} (known to be insecure)",
-                proto.version
-            ))),
-            probe::ProtoVersion::Tls1_0 | probe::ProtoVersion::Tls1_1 => {
-                warnings.push(SecurityWarning::WeakProtocol(format!(
-                    "Server supports deprecated protocol {}",
+    for proto in scan
+        .protocols
+        .iter()
+        .filter(|p| p.supported && p.version.is_deprecated())
+    {
+        warnings.push(SecurityWarning::WeakProtocol(
+            if proto.version == probe::ProtoVersion::Ssl3 {
+                format!(
+                    "Server supports obsolete protocol {} (known to be insecure)",
                     proto.version
-                )))
-            }
-            _ => {}
-        }
+                )
+            } else {
+                format!("Server supports deprecated protocol {}", proto.version)
+            },
+        ));
     }
 
     // Collect distinct weak ciphers across all supported versions to avoid
@@ -1659,7 +1661,12 @@ impl TLS {
     /// speaks TLS 1.0, which OpenSSL's default security level refuses) is
     /// retried once with legacy protocols enabled, on a new connection with
     /// its own `timeout` — so it is inspected and graded rather than reported
-    /// as a failure. The negotiated `cipher.version` shows the outcome.
+    /// as a failure. The negotiated `cipher.version` shows the outcome. A
+    /// server that rejects us only after sending its certificate (one that
+    /// requires a client certificate, below TLS 1.3), with an alert or by
+    /// hanging up, is not retried: it has already accepted the default version
+    /// and cipher. A failure our side raises at that point still is (see
+    /// `is_protocol_rejection`).
     ///
     /// # Example
     ///
@@ -2082,11 +2089,41 @@ fn inspecting_handshake(
 /// protocol level (an alert, or no common version/cipher) — the case a legacy
 /// retry can fix. Timeouts and socket errors carry an I/O error and are not
 /// retried: a second attempt would only cost another `timeout`.
+///
+/// Once the server's certificate has arrived, only a failure *our* side
+/// raised is retried (a DH group or signature algorithm the default security
+/// level refuses): level 0 is exactly what fixes it. The server, by then, has
+/// accepted the default version and cipher, so however it rejects us — an
+/// alert, or hanging up — lowering the security level cannot change its
+/// answer. That is how a server requiring a client certificate rejects us
+/// below TLS 1.3, and a retry would only double the failed connections it
+/// logs.
 fn is_protocol_rejection(err: &TLSError) -> bool {
-    matches!(
-        err,
-        TLSError::Handshake(HandshakeError::Failure(mid)) if mid.error().io_error().is_none()
-    )
+    match err {
+        TLSError::Handshake(HandshakeError::Failure(mid)) => {
+            mid.error().io_error().is_none()
+                && (mid.ssl().peer_certificate().is_none() || is_local_failure(mid.error()))
+        }
+        _ => false,
+    }
+}
+
+/// Whether our side raised a handshake failure. OpenSSL's `SSLfatal` always
+/// queues an SSL-library error with the local reason (e.g.
+/// `SSL_R_DH_KEY_TOO_SMALL`, below 1000); a fatal alert from the peer is
+/// queued as `SSL_AD_REASON_OFFSET` (1000) plus the alert number, and a hang-up
+/// (EOF, `close_notify`) queues nothing. The one local reason above 1000,
+/// `SSL_R_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE`, needs OCSP stapling, which
+/// tlschecker never requests.
+fn is_local_failure(err: &openssl::ssl::Error) -> bool {
+    const ERR_LIB_SSL: std::ffi::c_int = 20;
+    const SSL_AD_REASON_OFFSET: std::ffi::c_int = 1000;
+    err.ssl_error().is_some_and(|stack| {
+        stack
+            .errors()
+            .iter()
+            .any(|e| e.library_code() == ERR_LIB_SSL && e.reason_code() < SSL_AD_REASON_OFFSET)
+    })
 }
 
 /// Extracts the first entry from X.509 name entries and converts it to a string.
@@ -2415,12 +2452,27 @@ pub enum TLSError {
     Connection(#[from] std::io::Error),
     #[error("OpenSSL error: {0}")]
     OpenSSL(#[from] ErrorStack),
-    #[error("TLS Handshake error: {0}")]
+    #[error("TLS Handshake error: {}", handshake_failure(.0))]
     Handshake(#[from] HandshakeError<std::net::TcpStream>),
     #[error("Certificate error: {0}")]
     Certificate(String),
     #[error("Unknown error: {0}")]
     Unknown(String),
+}
+
+/// A [`HandshakeError`]'s message without the certificate verification result
+/// the `openssl` crate appends to it ("…: self-signed certificate"). The
+/// handshake does not enforce verification (see [`TLS::from_with_timeout`]),
+/// so that result never explains why it failed and only misleads; trust is
+/// judged after inspection instead (the `UNTRUSTED` finding).
+fn handshake_failure(err: &HandshakeError<TcpStream>) -> String {
+    match err {
+        HandshakeError::SetupFailure(e) => format!("stream setup failed: {e}"),
+        HandshakeError::Failure(mid) => format!("the handshake failed: {}", mid.error()),
+        HandshakeError::WouldBlock(mid) => {
+            format!("the handshake was interrupted: {}", mid.error())
+        }
+    }
 }
 
 /// Determines whether a certificate is self-signed.
@@ -2506,7 +2558,22 @@ mod tests {
         max: openssl::ssl::SslVersion,
         cipher_list: &str,
     ) -> u16 {
+        spawn_tls_server_with(min, max, cipher_list, |_| {}).0
+    }
+
+    /// [`spawn_tls_server`], with `configure` applied to the context last, so
+    /// it can override any of the defaults above (versions, ciphers, security
+    /// level, certificate). Also returns the number of connections accepted so
+    /// far, which counts a check's handshake attempts.
+    fn spawn_tls_server_with(
+        min: openssl::ssl::SslVersion,
+        max: openssl::ssl::SslVersion,
+        cipher_list: &str,
+        configure: impl FnOnce(&mut openssl::ssl::SslContextBuilder),
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use openssl::ssl::{Ssl, SslContext, SslMethod};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         let (cert, key) = make_test_x509("localhost");
         let mut ctx = SslContext::builder(SslMethod::tls_server()).unwrap();
@@ -2516,21 +2583,86 @@ mod tests {
         ctx.set_cipher_list(cipher_list).unwrap();
         ctx.set_certificate(&cert).unwrap();
         ctx.set_private_key(&key).unwrap();
+        configure(&mut ctx);
         let ctx = ctx.build();
 
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
         let (listener, addr) = live_addr();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                accepted.fetch_add(1, Ordering::SeqCst);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 if let Ok(ssl) = Ssl::new(&ctx) {
+                    let raw = stream.try_clone();
                     // Failures are expected: the scan offers versions and
                     // ciphers the server rejects, and connect_first_available
                     // opens a plain TCP connection first.
-                    let _ = ssl.accept(stream);
+                    if ssl.accept(stream).is_err() {
+                        if let Ok(raw) = raw {
+                            close_gracefully(raw);
+                        }
+                    }
                 }
             }
         });
-        addr.port()
+        (addr.port(), connections)
+    }
+
+    /// Closes a test server's side of a failed handshake with a FIN, not an
+    /// RST. Dropping a socket that still holds unread client data (the
+    /// client's second flight, when the server alerts after its certificate)
+    /// makes the OS reset the connection, and Windows then discards the alert
+    /// the client has not read yet, so the client would see "connection
+    /// reset" instead of the alert. The drain only needs what has already
+    /// arrived, hence the short timeout: a client may keep the socket open
+    /// (`TLS::from` holds the first error while it retries).
+    fn close_gracefully(mut stream: std::net::TcpStream) {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        let _ = std::io::copy(&mut stream, &mut std::io::sink());
+    }
+
+    #[test]
+    fn test_failed_handshake_ends_with_fin_not_reset() {
+        // After the server's alert the client still reads a clean EOF, which
+        // an RST would turn into ECONNRESET.
+        use openssl::ssl::{SslVerifyMode, SslVersion};
+        use std::io::Read;
+        let (port, _) =
+            spawn_tls_server_with(SslVersion::TLS1_2, SslVersion::TLS1_2, "DEFAULT", |ctx| {
+                ctx.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+            });
+        let addrs = resolve_addrs("127.0.0.1", port).unwrap();
+        let Err(TLSError::Handshake(openssl::ssl::HandshakeError::Failure(mid))) =
+            super::inspecting_handshake("127.0.0.1", &addrs, Duration::from_secs(5), false)
+        else {
+            panic!("the server requires a client certificate");
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let mut byte = [0u8; 1];
+        let mut client = mid.get_ref();
+        let read = client.read(&mut byte);
+        assert!(matches!(read, Ok(0)), "expected EOF, got {read:?}");
+    }
+
+    #[test]
+    fn test_spawn_tls_server_with_configure_overrides_defaults() {
+        // `configure` runs last: capping the version there wins over `max`.
+        use openssl::ssl::SslVersion;
+        let (port, _) =
+            spawn_tls_server_with(SslVersion::TLS1_2, SslVersion::TLS1_3, "DEFAULT", |ctx| {
+                ctx.set_max_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+            });
+        let tls = TLS::from_with_timeout(
+            "127.0.0.1",
+            Some(port),
+            false,
+            false,
+            Duration::from_secs(5),
+        )
+        .expect("loopback handshake");
+        assert_eq!(tls.cipher.version, "TLSv1.2");
     }
 
     #[test]
@@ -2572,6 +2704,294 @@ mod tests {
             "TLS 1.0 caps the grade at D, got {}",
             grade.score
         );
+    }
+
+    #[test]
+    fn test_handshake_error_omits_the_unenforced_verification_result() {
+        // The `openssl` crate appends the certificate verification result to
+        // a handshake error ("self-signed certificate"). Verification is not
+        // enforced, so it never explains the failure and must not read as if
+        // it did: here the server wanted a client certificate.
+        use openssl::ssl::{SslVerifyMode, SslVersion};
+        let (port, _) =
+            spawn_tls_server_with(SslVersion::TLS1_2, SslVersion::TLS1_2, "DEFAULT", |ctx| {
+                ctx.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+            });
+        let message = TLS::from_with_timeout(
+            "127.0.0.1",
+            Some(port),
+            false,
+            false,
+            Duration::from_secs(5),
+        )
+        .err()
+        .expect("no client certificate to present")
+        .to_string();
+
+        assert!(
+            message.starts_with("TLS Handshake error: the handshake failed: "),
+            "{message}"
+        );
+        assert!(message.contains("alert handshake failure"), "{message}");
+        assert!(!message.contains("self-signed"), "{message}");
+    }
+
+    #[test]
+    fn test_client_certificate_rejection_is_not_retried() {
+        // A TLS 1.2 server that requires a client certificate alerts after
+        // sending its own: it already accepted the default version and cipher,
+        // so a legacy retry cannot help and would only double the failed
+        // connections the server logs.
+        use openssl::ssl::{SslVerifyMode, SslVersion};
+        use std::sync::atomic::Ordering;
+        let (port, connections) =
+            spawn_tls_server_with(SslVersion::TLS1_2, SslVersion::TLS1_2, "DEFAULT", |ctx| {
+                ctx.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+            });
+
+        let err = TLS::from_with_timeout(
+            "127.0.0.1",
+            Some(port),
+            false,
+            false,
+            Duration::from_secs(5),
+        )
+        .err()
+        .expect("no client certificate to present");
+
+        assert!(err.to_string().contains("alert handshake failure"), "{err}");
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "retried: {err}");
+    }
+
+    /// What [`spawn_alert_dropping_relay`] does instead of passing on an alert
+    /// the server sends after its first flight.
+    #[derive(Clone, Copy)]
+    enum InsteadOfAlert {
+        /// Close the client side with a FIN: a server that hangs up.
+        HangUp,
+        /// Keep the connection open until the client gives up: a server that
+        /// sends its certificate and then stalls.
+        Stall,
+    }
+
+    /// A relay to the loopback port `backend` that forwards both directions,
+    /// except that an alert record (content type 21) the server sends after
+    /// its first flight is replaced by `instead`. An alert that is the
+    /// server's first record (a refused version or cipher) passes through.
+    fn spawn_alert_dropping_relay(backend: u16, instead: InsteadOfAlert) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpStream};
+
+        fn relay(client: TcpStream, backend: u16, instead: InsteadOfAlert) {
+            let Ok(server) = TcpStream::connect(("127.0.0.1", backend)) else {
+                return;
+            };
+            let (mut client_in, mut server_out) =
+                (client.try_clone().unwrap(), server.try_clone().unwrap());
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut client_in, &mut server_out);
+                // Pass the client's EOF on, so the (sequential) server moves
+                // to its next connection.
+                let _ = server_out.shutdown(Shutdown::Write);
+            });
+            let (mut server_in, mut client_out) = (server, client);
+            let mut header = [0u8; 5];
+            let mut forwarded = false;
+            while server_in.read_exact(&mut header).is_ok() {
+                let mut body = vec![0; u16::from_be_bytes([header[3], header[4]]).into()];
+                if server_in.read_exact(&mut body).is_err() {
+                    break;
+                }
+                if header[0] == 21 && forwarded {
+                    if let InsteadOfAlert::Stall = instead {
+                        let _ = std::io::copy(&mut client_out, &mut std::io::sink());
+                    }
+                    break;
+                }
+                if client_out
+                    .write_all(&header)
+                    .and_then(|()| client_out.write_all(&body))
+                    .is_err()
+                {
+                    break;
+                }
+                forwarded = true;
+            }
+            let _ = client_out.shutdown(Shutdown::Write);
+        }
+
+        let (listener, addr) = live_addr();
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                std::thread::spawn(move || relay(client, backend, instead));
+            }
+        });
+        addr.port()
+    }
+
+    #[test]
+    fn test_scan_does_not_count_a_handshake_that_stalls_after_the_certificate() {
+        // A server that sends its certificate and then never answers has not
+        // been seen to accept the version: the probe timed out, which proves
+        // nothing. Only a rejection after the certificate (an alert, a
+        // hang-up) counts, as for a server requiring a client certificate.
+        use openssl::ssl::{SslVerifyMode, SslVersion};
+        let (backend, _) =
+            spawn_tls_server_with(SslVersion::TLS1_2, SslVersion::TLS1_2, "DEFAULT", |ctx| {
+                ctx.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+            });
+        let supported = |instead| {
+            let port = spawn_alert_dropping_relay(backend, instead);
+            let scan = crate::probe::scan_tls_with_timeout(
+                "127.0.0.1",
+                Some(port),
+                Duration::from_millis(500),
+            )
+            .expect("loopback scan");
+            scan.protocols
+                .iter()
+                .find(|p| p.version == ProtoVersion::Tls1_2)
+                .unwrap()
+                .supported
+        };
+        assert!(
+            !supported(InsteadOfAlert::Stall),
+            "a timeout counted as acceptance"
+        );
+        assert!(
+            supported(InsteadOfAlert::HangUp),
+            "a hang-up after the certificate is a rejection"
+        );
+    }
+
+    #[test]
+    fn test_hang_up_after_certificate_is_not_retried() {
+        // Same as an alert: a server that closes the connection once its
+        // certificate is out has accepted the default version and cipher.
+        use openssl::ssl::{SslVerifyMode, SslVersion};
+        use std::sync::atomic::Ordering;
+        let (backend, connections) =
+            spawn_tls_server_with(SslVersion::TLS1_2, SslVersion::TLS1_2, "DEFAULT", |ctx| {
+                ctx.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+            });
+        let port = spawn_alert_dropping_relay(backend, InsteadOfAlert::HangUp);
+
+        let err = TLS::from_with_timeout(
+            "127.0.0.1",
+            Some(port),
+            false,
+            false,
+            Duration::from_secs(5),
+        )
+        .err()
+        .expect("no client certificate to present");
+
+        assert!(
+            !err.to_string().contains("alert"),
+            "alert not dropped: {err}"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "retried: {err}");
+    }
+
+    #[test]
+    fn test_client_side_rejection_after_certificate_is_still_retried() {
+        // Our side can also abort after the server's certificate: a 1024-bit
+        // DH group is below the default security level (2) but fine at the
+        // legacy retry's level 0, so this server must still be inspected.
+        use openssl::dh::Dh;
+        use openssl::ssl::{SslContext, SslMethod, SslVersion};
+        use std::sync::atomic::Ordering;
+        // An OPENSSL_CONF that lowers the default level accepts the group on
+        // the first attempt, leaving nothing to retry.
+        let level = SslContext::builder(SslMethod::tls())
+            .unwrap()
+            .build()
+            .security_level();
+        if level < 2 {
+            eprintln!("skipped: the default security level is {level}, not 2 or higher");
+            return;
+        }
+        let (port, connections) = spawn_tls_server_with(
+            SslVersion::TLS1_2,
+            SslVersion::TLS1_2,
+            "DHE-RSA-AES128-GCM-SHA256",
+            |ctx| {
+                ctx.set_tmp_dh(&Dh::get_1024_160().unwrap()).unwrap();
+            },
+        );
+
+        let tls = TLS::from_with_timeout(
+            "127.0.0.1",
+            Some(port),
+            false,
+            false,
+            Duration::from_secs(5),
+        )
+        .expect("a weak-DH server should be inspected through the legacy retry");
+
+        assert_eq!(tls.cipher.name, "DHE-RSA-AES128-GCM-SHA256");
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_tls11_only_server_caps_the_grade_at_d() {
+        // Like a Mosquitto 1.6 listener with `tls_version tlsv1.1`.
+        use openssl::ssl::SslVersion;
+        let port = spawn_tls_server(SslVersion::TLS1_1, SslVersion::TLS1_1, "DEFAULT");
+
+        let tls =
+            TLS::from_with_timeout("127.0.0.1", Some(port), false, true, Duration::from_secs(5))
+                .expect("a TLS 1.1-only server should still be inspected");
+
+        assert_eq!(tls.cipher.version, "TLSv1.1");
+        let grade = tls.grade.unwrap();
+        assert!(
+            grade.score <= 54,
+            "TLS 1.1 caps the grade at D, got {}",
+            grade.score
+        );
+    }
+
+    #[test]
+    fn test_scan_counts_versions_rejected_for_a_missing_client_certificate() {
+        // A broker with `require_certificate true`: below TLS 1.3 it rejects
+        // the handshake after its ServerHello, having already agreed to the
+        // version and cipher, so those must still count as supported.
+        use openssl::ssl::{SslVerifyMode, SslVersion};
+        let (port, _) = spawn_tls_server_with(
+            SslVersion::TLS1_1,
+            SslVersion::TLS1_3,
+            "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA",
+            |ctx| {
+                ctx.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+            },
+        );
+
+        let scan =
+            crate::probe::scan_tls_with_timeout("127.0.0.1", Some(port), Duration::from_secs(5))
+                .expect("loopback scan");
+        let version = |v: ProtoVersion| scan.protocols.iter().find(|p| p.version == v).unwrap();
+
+        for v in [
+            ProtoVersion::Tls1_1,
+            ProtoVersion::Tls1_2,
+            ProtoVersion::Tls1_3,
+        ] {
+            assert!(version(v).supported, "{v} is accepted but was not detected");
+        }
+        // Only the server's own ciphers: one it refuses fails before its
+        // certificate is sent, so it is not counted.
+        assert_eq!(
+            version(ProtoVersion::Tls1_2).ciphers,
+            ["ECDHE-RSA-AES256-GCM-SHA384", "ECDHE-RSA-AES256-SHA"]
+        );
+        assert_eq!(
+            version(ProtoVersion::Tls1_1).ciphers,
+            ["ECDHE-RSA-AES256-SHA"]
+        );
+        assert!(!version(ProtoVersion::Tls1_3).ciphers.is_empty());
+        // A version the server refuses outright is still unsupported.
+        assert!(!version(ProtoVersion::Tls1_0).supported);
     }
 
     #[test]
@@ -4446,6 +4866,98 @@ mod tests {
     }
 
     #[test]
+    fn test_negotiated_finding_and_grade_cap_share_one_rule() {
+        // #217: a version the grade caps at D must also carry a finding, and
+        // one with a finding must be capped, so the status never reads
+        // Healthy for a D-capped connection.
+        for version in [
+            "SSLv2", "SSLv3", "TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3", "unknown",
+        ] {
+            let cipher = negotiated_cipher(version, "ECDHE-RSA-AES256-GCM-SHA384");
+            let flagged = super::analyze_negotiated(&cipher)
+                .iter()
+                .any(|w| matches!(w, super::SecurityWarning::WeakProtocol(_)));
+            let mut tls = make_test_tls();
+            tls.cipher = cipher;
+            tls.certificate.cert_key_bits = 4096;
+            let input = crate::build_grading_input(&tls.cipher, &tls.certificate, None);
+            let capped = grading::calculate_grade(&input).score <= 54;
+            assert_eq!(
+                flagged,
+                grading::is_deprecated_protocol(version),
+                "{version}"
+            );
+            assert_eq!(flagged, capped, "{version}: finding and D cap disagree");
+        }
+    }
+
+    #[test]
+    fn test_weak_protocol_messages_name_obsolete_and_deprecated() {
+        use crate::probe::ProtoVersion;
+        let messages = |warnings: Vec<super::SecurityWarning>| {
+            warnings
+                .into_iter()
+                .filter_map(|w| match w {
+                    super::SecurityWarning::WeakProtocol(m) => Some(m),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let negotiated = |version| {
+            messages(super::analyze_negotiated(&negotiated_cipher(
+                version,
+                "AES128-SHA",
+            )))
+        };
+        let supported = |version| {
+            messages(super::analyze_scan(&crate::probe::TlsScan {
+                protocols: vec![proto(version, true, &[])],
+            }))
+        };
+        assert_eq!(
+            negotiated("SSLv3"),
+            ["Connection negotiated obsolete protocol SSLv3 (known to be insecure)"]
+        );
+        assert_eq!(
+            negotiated("TLSv1.1"),
+            ["Connection negotiated deprecated protocol TLSv1.1"]
+        );
+        assert_eq!(
+            supported(ProtoVersion::Ssl3),
+            ["Server supports obsolete protocol SSLv3 (known to be insecure)"]
+        );
+        assert_eq!(
+            supported(ProtoVersion::Tls1_0),
+            ["Server supports deprecated protocol TLSv1.0"]
+        );
+    }
+
+    #[test]
+    fn test_scan_finding_and_grade_cap_share_one_rule() {
+        use crate::probe::ProtoVersion;
+        for version in [
+            ProtoVersion::Ssl3,
+            ProtoVersion::Tls1_0,
+            ProtoVersion::Tls1_1,
+            ProtoVersion::Tls1_2,
+            ProtoVersion::Tls1_3,
+        ] {
+            let scan = crate::probe::TlsScan {
+                protocols: vec![proto(version, true, &["ECDHE-RSA-AES256-GCM-SHA384"])],
+            };
+            let flagged = super::analyze_scan(&scan)
+                .iter()
+                .any(|w| matches!(w, super::SecurityWarning::WeakProtocol(_)));
+            assert_eq!(flagged, version.is_deprecated(), "{version}");
+            assert_eq!(
+                flagged,
+                super::scan_supports_obsolete_protocol(&scan),
+                "{version}: finding and grade cap disagree"
+            );
+        }
+    }
+
+    #[test]
     fn test_analyze_negotiated_modern_connection_is_clean() {
         for (version, name) in [
             ("TLSv1.2", "ECDHE-RSA-AES128-GCM-SHA256"),
@@ -4560,6 +5072,41 @@ mod tests {
             "expected grade capped at C (69), got {}",
             tls.grade.as_ref().unwrap().score
         );
+    }
+
+    #[test]
+    fn test_apply_scan_tls11_support_caps_grade() {
+        // A server that negotiates TLS 1.3 but still accepts TLS 1.1 (the
+        // eclipse-mosquitto:1.6 default) caps at C, like one accepting TLS 1.0.
+        let mut tls = make_test_tls_with_grade();
+        assert!(tls.grade.as_ref().unwrap().score > 69);
+
+        let scan = crate::probe::TlsScan {
+            protocols: vec![
+                proto(ProtoVersion::Tls1_0, false, &[]),
+                proto(ProtoVersion::Tls1_1, true, &["ECDHE-RSA-AES256-SHA"]),
+                proto(ProtoVersion::Tls1_2, true, &["ECDHE-RSA-AES256-GCM-SHA384"]),
+                proto(ProtoVersion::Tls1_3, true, &["TLS_AES_256_GCM_SHA384"]),
+            ],
+        };
+        assert!(super::scan_supports_obsolete_protocol(&scan));
+        tls.apply_scan(scan);
+        assert_eq!(tls.grade.as_ref().unwrap().score, 69);
+        assert_eq!(tls.grade.as_ref().unwrap().grade, "C");
+    }
+
+    #[test]
+    fn test_scan_with_only_tls12_and_up_is_not_obsolete() {
+        let scan = crate::probe::TlsScan {
+            protocols: vec![
+                proto(ProtoVersion::Ssl3, false, &[]),
+                proto(ProtoVersion::Tls1_0, false, &[]),
+                proto(ProtoVersion::Tls1_1, false, &[]),
+                proto(ProtoVersion::Tls1_2, true, &["ECDHE-RSA-AES256-GCM-SHA384"]),
+                proto(ProtoVersion::Tls1_3, true, &["TLS_AES_256_GCM_SHA384"]),
+            ],
+        };
+        assert!(!super::scan_supports_obsolete_protocol(&scan));
     }
 
     #[test]
